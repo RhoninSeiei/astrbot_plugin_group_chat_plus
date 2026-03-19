@@ -14,10 +14,13 @@ import asyncio
 
 from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
+from astrbot.core.star.star_handler import EventType
+from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
 from astrbot.core.provider.entities import ProviderRequest
+from astrbot.core.message.message_event_result import ResultContentType
 
 # 🆕 v1.2.0: 标记键名，用于标识请求来自本插件
 PLUGIN_REQUEST_MARKER = "_group_chat_plus_request"
@@ -35,6 +38,11 @@ PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 # event.request_llm() 的 prompt 参数传此短字符串，其他插件做向量检索时用的是短消息而不是完整历史
 # group_chat_plus 自身的 on_llm_request 钩子（priority=-1，最后执行）再把 req.prompt 换回完整 full_prompt
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
+# 🔧 存储空回复兜底所需的最终提示词信息
+PLUGIN_FALLBACK_PAYLOAD = "_group_chat_plus_fallback_payload"
+# 🔧 存储回复成功后再记账所需的上下文
+PLUGIN_REPLY_EFFECT_CONTEXT = "_group_chat_plus_reply_effect_context"
+PLUGIN_DIRECT_REPLY_MODE = "_group_chat_plus_direct_reply_mode"
 
 
 class ReplyHandler:
@@ -149,6 +157,7 @@ class ReplyHandler:
         include_timestamp: bool = True,
         history_messages: list = None,
         conversation_fatigue_info: dict = None,
+        reply_provider_id: str = "",
     ) -> ProviderRequest:
         """
         生成AI回复
@@ -166,7 +175,7 @@ class ReplyHandler:
             conversation_fatigue_info: 对话疲劳信息（用于生成收尾话语提示）
 
         Returns:
-            ProviderRequest对象
+            MessageEventResult对象
         """
         # 如果image_urls为None，初始化为空列表
         if image_urls is None:
@@ -334,69 +343,205 @@ class ReplyHandler:
                         for i, url in enumerate(image_urls):
                             logger.info(f"  图片 {i}: {url}")
 
-            # 🆕 v1.2.0: 设置标记，让 main.py 的 on_llm_request 钩子能识别这是来自本插件的请求
+            # 保存插件上下文后手动触发 on_llm_request 钩子，再直连 Provider。
+            # 这样可以保留其他插件的提示词注入，同时绕开框架的 ToolLoopAgentRunner。
             event.set_extra(PLUGIN_REQUEST_MARKER, True)
-            # 存储插件自定义的上下文（用于替换平台 LTM 注入的上下文）
             event.set_extra(PLUGIN_CUSTOM_CONTEXTS, contexts)
-            # 存储插件自定义的系统提示词
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, system_prompt)
-            # 存储插件自定义的完整 prompt（含历史上下文），供 on_llm_request 钩子恢复使用
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
-            # 存储图片 URL 列表
             event.set_extra(PLUGIN_IMAGE_URLS, image_urls)
-            # 🔧 存储插件自身的工具集（ToolSet），用于在 on_llm_request 钩子中恢复
-            # 新版 AstrBot 的 build_main_agent 会注入框架工具（shell/cron等），需要用插件的工具集替换
             event.set_extra(PLUGIN_FUNC_TOOL, plugin_tool_set)
 
-            # 🔧 提取当前用户消息原文（不含历史上下文），作为向量检索类插件的召回查询词
-            # 问题背景：本插件把完整群聊历史（可能 5000+ 字符）拼入 full_prompt 后传给
-            #           event.request_llm(prompt=...)，而向量记忆插件（如 livingmemory）
-            #           会在 on_llm_request 钩子中直接用 req.prompt 做向量检索。
-            #           完整历史作为查询词会触发 embedding API token 超限警告并被截断。
-            # 解决方案：event.request_llm() 的 prompt 参数只传当前用户消息的短文本。
-            #           本插件的 on_llm_request 钩子（priority=-1，最后执行）会把
-            #           req.prompt 换回完整 full_prompt，对 AI 的推理行为无任何影响。
-            #           其他插件（livigmemory 等，priority=0）先执行，此时 req.prompt
-            #           是短的当前消息，向量检索正常工作。
             current_message_for_retrieval = event.get_message_str() or ""
-            # 🔧 修复：空@消息时 get_message_str() 返回 ""，部分平台/框架收到空 prompt 会
-            # 跳过 LLM 调用，导致 on_llm_request 钩子不触发、AI 无回复。
-            # 用占位符替代空字符串；on_llm_request 钩子(-1优先级)会把 req.prompt 换回
-            # 完整的 full_prompt，此占位符不会被 AI 看到。
             prompt_for_request = current_message_for_retrieval or "[空消息]"
             event.set_extra(PLUGIN_CURRENT_MESSAGE, current_message_for_retrieval)
+            event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
+
+            req = ProviderRequest(
+                prompt=prompt_for_request,
+                session_id=event.session_id,
+                image_urls=image_urls,
+                func_tool=plugin_tool_set,
+                contexts=contexts,
+                system_prompt=system_prompt,
+            )
+
+            try:
+                from astrbot.core.pipeline.context_utils import call_event_hook
+
+                await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+            except ImportError as e:
+                if DEBUG_MODE:
+                    logger.warning(f"无法导入 LLM 请求钩子模块: {e}，继续使用原始请求")
+            except Exception as e:
+                logger.warning(f"触发 on_llm_request 钩子失败: {e}，继续使用原始请求")
+
+            if not req.prompt and not req.contexts:
+                req.prompt = full_prompt
+
+            llm_resp, primary_provider_id, provider_id, fallback_count = await ReplyHandler._request_with_astrbot_fallback(
+                event,
+                context,
+                req,
+            )
+
+            if llm_resp is None:
+                raise RuntimeError("未找到可用的AI提供商")
 
             if DEBUG_MODE:
-                logger.info(
-                    f"🔧 [兼容模式] 已设置插件标记，将通过 event.request_llm() 调用 AI"
-                )
-                logger.info(f"  - contexts 数量: {len(contexts)}")
-                logger.info(f"  - system_prompt 长度: {len(system_prompt)}")
-                logger.info(f"  - full_prompt 长度: {len(full_prompt)}")
-                logger.info(f"  - image_urls 数量: {len(image_urls)}")
+                logger.info("🔧 [直连模式] 已手动触发 on_llm_request，将直连 AstrBot 默认 Provider 生成回复")
+                logger.info(f"  - primary_provider: {primary_provider_id or 'default'}")
+                logger.info(f"  - final_provider: {provider_id or primary_provider_id or 'default'}")
+                logger.info(f"  - fallback_count: {fallback_count}")
+                logger.info(f"  - req.contexts 数量: {len(req.contexts or [])}")
+                logger.info(f"  - req.system_prompt 长度: {len(req.system_prompt or '')}")
+                logger.info(f"  - req.prompt 长度: {len(req.prompt or '')}")
+                logger.info(f"  - req.image_urls 数量: {len(req.image_urls or [])}")
                 logger.info(
                     f"  - 向量检索用短消息长度: {len(current_message_for_retrieval)}"
                 )
 
-            # 🆕 v1.2.0: 使用 event.request_llm() 发起请求
-            # 这会触发平台的 on_llm_request 钩子，让其他插件能注入提示词
-            # main.py 的 on_llm_request 钩子（priority=-1）会检测标记并把 req.prompt 换回完整 full_prompt
-            # 🔧 兼容说明：func_tool_manager 在旧版 AstrBot (<=4.13) 中生效，
-            # 在新版 (>=4.14) 中被静默忽略。保留此参数以确保旧版兼容。
-            # 新版的工具注入问题由 on_llm_request 钩子中恢复 plugin_tool_set 来解决。
-            return event.request_llm(
-                prompt=prompt_for_request,
-                func_tool_manager=func_tools_mgr,
-                session_id=event.session_id,
-                image_urls=image_urls,
-                contexts=contexts,
-                system_prompt=system_prompt,
+            result_chain = getattr(llm_resp, "result_chain", None)
+            if result_chain and getattr(result_chain, "chain", None):
+                plain_text = ""
+                try:
+                    plain_text = (result_chain.get_plain_text() or "").strip()
+                except Exception:
+                    plain_text = ""
+                has_non_text_component = any(
+                    getattr(comp.__class__, "__name__", "") != "Plain"
+                    for comp in result_chain.chain
+                )
+                if plain_text or has_non_text_component:
+                    event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
+                    reply_result = event.chain_result(result_chain.chain)
+                    reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
+                    return reply_result
+
+            completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
+            if completion_text:
+                event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
+                reply_result = event.plain_result(completion_text)
+                reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
+                return reply_result
+
+            logger.error(
+                f"直连 Provider {provider_id or 'default'} 返回空回复，prompt长度={len(req.prompt or '')}"
             )
+            return event.make_result()
 
         except Exception as e:
             logger.error(f"生成AI回复时发生错误: {e}")
             # 返回错误消息
             return event.plain_result(f"生成回复时发生错误: {str(e)}")
+
+    @staticmethod
+    def _llm_response_has_sendable_content(llm_resp: object | None) -> bool:
+        if not llm_resp:
+            return False
+
+        result_chain = getattr(llm_resp, "result_chain", None)
+        if result_chain and getattr(result_chain, "chain", None):
+            plain_text = ""
+            try:
+                plain_text = (result_chain.get_plain_text() or "").strip()
+            except Exception:
+                plain_text = ""
+            has_non_text_component = any(
+                getattr(comp.__class__, "__name__", "") != "Plain"
+                for comp in result_chain.chain
+            )
+            if plain_text or has_non_text_component:
+                return True
+
+        completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
+        return bool(completion_text)
+
+    @staticmethod
+    async def _request_with_astrbot_fallback(
+        event: AstrMessageEvent,
+        context: Context,
+        req: ProviderRequest,
+    ) -> tuple[object | None, str, str, int]:
+        provider = _select_provider(event, context)
+        if not provider:
+            return None, "", "", 0
+
+        primary_provider_id = str(provider.provider_config.get("id", "default"))
+        provider_settings = context.get_config(event.unified_msg_origin).get(
+            "provider_settings", {}
+        )
+        fallback_providers = _get_fallback_chat_providers(
+            provider, context, provider_settings
+        )
+        candidates = [provider, *fallback_providers]
+        last_exception = None
+        last_err_response = None
+        last_provider_id = primary_provider_id
+
+        for idx, candidate in enumerate(candidates):
+            candidate_id = str(candidate.provider_config.get("id", "default"))
+            if idx > 0:
+                logger.warning(
+                    "Switched from %s to fallback chat provider: %s",
+                    primary_provider_id,
+                    candidate_id,
+                )
+            try:
+                llm_resp = await candidate.text_chat(
+                    prompt=req.prompt,
+                    session_id=req.session_id,
+                    image_urls=req.image_urls,
+                    contexts=req.contexts,
+                    system_prompt=req.system_prompt,
+                    tool_calls_result=req.tool_calls_result,
+                    model=req.model if idx == 0 else None,
+                    extra_user_content_parts=req.extra_user_content_parts,
+                )
+                last_provider_id = candidate_id
+                if (
+                    llm_resp
+                    and getattr(llm_resp, "role", "assistant") == "err"
+                    and idx < len(candidates) - 1
+                ):
+                    last_err_response = llm_resp
+                    logger.warning(
+                        "Chat Model %s returns error response, trying fallback to next provider.",
+                        candidate_id,
+                    )
+                    continue
+                if not ReplyHandler._llm_response_has_sendable_content(llm_resp):
+                    if idx < len(candidates) - 1:
+                        logger.warning(
+                            "Chat Model %s returned empty response, trying fallback to next provider.",
+                            candidate_id,
+                        )
+                        continue
+                    logger.warning(
+                        "Chat Model %s returned empty response and no more fallback chat providers are available.",
+                        candidate_id,
+                    )
+                return llm_resp, primary_provider_id, candidate_id, len(fallback_providers)
+            except Exception as exc:  # noqa: BLE001
+                last_exception = exc
+                logger.warning(
+                    "Chat Model %s request error: %s",
+                    candidate_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+
+        if last_err_response is not None:
+            return (
+                last_err_response,
+                primary_provider_id,
+                last_provider_id,
+                len(fallback_providers),
+            )
+        if last_exception is not None:
+            raise last_exception
+        return None, primary_provider_id, last_provider_id, len(fallback_providers)
 
     @staticmethod
     def check_if_already_replied(event: AstrMessageEvent) -> bool:

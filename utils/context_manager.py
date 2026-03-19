@@ -1348,7 +1348,7 @@ class ContextManager:
                         if formatted_parts and len(formatted_parts) == 1:
                             if DEBUG_MODE:
                                 logger.info(
-                                    f"[上下文格式化] 机器人ID: {bot_id}, 当前消息发送者ID: {sender_id}, 是否为机器人: {is_bot}"
+                                    f"[上下文格式化] 机器人ID: {bot_id}, 首条历史消息发送者ID: {sender_id}, 是否为机器人: {is_bot}"
                                 )
 
                     # 如果还没有判定为bot，尝试通过 self_id 判断

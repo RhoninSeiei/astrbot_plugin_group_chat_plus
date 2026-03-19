@@ -93,7 +93,7 @@ from astrbot.core.star.star_tools import StarTools
 
 # 导入消息组件类型
 from astrbot.core.message.components import Plain, Poke, At, AtAll, Forward
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
 # 导入 ProviderRequest 类型用于类型判断
 from astrbot.core.provider.entities import ProviderRequest
@@ -142,6 +142,11 @@ from .utils.image_description_cache import (
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
+from .utils.reply_handler import (
+    PLUGIN_DIRECT_REPLY_MODE,
+    PLUGIN_FALLBACK_PAYLOAD,
+    PLUGIN_REPLY_EFFECT_CONTEXT,
+)
 
 
 @register(
@@ -4645,11 +4650,15 @@ class ChatPlus(Star):
                 _log_msgs("历史-统一获取（官方优先+缓存）", history_messages)
 
         # 🆕 v1.2.0: 官方历史已在 get_history_messages_with_fallback 中处理
-        # 以下为兼容性代码：尝试从 conversation_manager 获取额外的对话历史
+        # 以下为兼容性代码：仅当统一历史接口未返回结果时，才从 conversation_manager 兜底读取
         # 注意：message_history_manager 和 conversation_manager 是两个不同的存储
         # - message_history_manager: 存储平台消息历史（platform_message_history 表）
         # - conversation_manager: 存储 LLM 对话历史（conversations 表）
-        if not (isinstance(max_context, int) and max_context == 0):
+        should_load_conversation_fallback = (
+            not (isinstance(max_context, int) and max_context == 0)
+            and not history_messages
+        )
+        if should_load_conversation_fallback:
             try:
                 cm = self.context.conversation_manager
                 if cm:
@@ -4859,7 +4868,10 @@ class ChatPlus(Star):
                 pass
         else:
             if self.debug_mode:
-                logger.info("  跳过官方历史读取: max_context_messages=0")
+                if isinstance(max_context, int) and max_context == 0:
+                    logger.info("  跳过官方历史读取: max_context_messages=0")
+                else:
+                    logger.info("  跳过官方历史兼容补充: 统一历史接口已返回结果")
 
         # 🆕 v1.2.0: 使用缓存管理器统一处理缓存读取和合并
         cached_count = 0
@@ -5115,6 +5127,24 @@ class ChatPlus(Star):
             final_message = self.mood_tracker.inject_mood_to_prompt(
                 chat_id, final_message, formatted_context
             )
+
+        reply_state_hint = self._build_lightweight_reply_state_hint(
+            is_at_message,
+            has_trigger_keyword,
+            conversation_fatigue_info,
+        )
+        if reply_state_hint:
+            final_message += reply_state_hint
+            if self.debug_mode:
+                logger.info("【步骤12.8】已注入轻量回复状态")
+
+        event.set_extra(
+            PLUGIN_REPLY_EFFECT_CONTEXT,
+            {
+                "message_text": message_text or "",
+                "wait_window_extra_count": int(wait_window_extra_count or 0),
+            },
+        )
 
         # 调用AI生成回复
         if self.debug_mode:
@@ -5420,9 +5450,11 @@ class ChatPlus(Star):
                     f"【步骤13.9】准备发送回复，类型: {type(reply_result).__name__}"
                 )
 
-            # 🔧 修复：当插件发起 LLM 请求时，标记已调用 LLM，
+            # 🔧 修复：当插件已经接管本次 LLM 回复时，标记已调用 LLM，
             # 阻止框架 ProcessStage 对 @消息触发第二次默认 LLM 调用路径
-            if isinstance(reply_result, ProviderRequest):
+            if isinstance(reply_result, ProviderRequest) or bool(
+                event.get_extra(PLUGIN_DIRECT_REPLY_MODE, False)
+            ):
                 event.call_llm = True
 
             yield reply_result
@@ -5432,8 +5464,10 @@ class ChatPlus(Star):
             # 但极少数边界情况下（如工具直接发送结果给用户，agent跳过on_agent_done），
             # on_llm_response 不会触发，累积的回复就不会被保存。此处作为安全网兜底。
             message_id = self._get_message_id(event)
+            is_direct_reply_mode = bool(event.get_extra(PLUGIN_DIRECT_REPLY_MODE, False))
             if (
-                message_id in self._pending_bot_replies
+                not is_direct_reply_mode
+                and message_id in self._pending_bot_replies
                 and self._pending_bot_replies[message_id]
             ):
                 logger.warning(
@@ -5487,294 +5521,8 @@ class ChatPlus(Star):
                     f"【消息过滤】已记录回复到缓存，当前缓存数: {len(self.recent_replies_cache[chat_id])}"
                 )
 
-        # 🆕 v1.1.0: 记录AI回复（用于主动对话功能）
-        if self.proactive_enabled:
-            chat_key = ProbabilityManager.get_chat_key(
-                platform_name, is_private, chat_id
-            )
-            # 在实际记录回复前，若处于主动对话临时提升阶段，则在此时机取消临时提升（AI已决定回复）
-            ProactiveChatManager.check_and_handle_reply_after_proactive(
-                chat_key, self.config, force=True
-            )
-            ProactiveChatManager.record_bot_reply(chat_key, is_proactive=False)
-            if self.debug_mode:
-                logger.info(f"[主动对话] 已记录AI回复（普通回复）")
-
-        # 🆕 v1.2.1: 记录回复到密度管理器
-        if self.enable_reply_density_limit:
-            try:
-                density_chat_key = ProbabilityManager.get_chat_key(
-                    platform_name, is_private, chat_id
-                )
-                await ReplyDensityManager.record_reply(density_chat_key)
-            except Exception as e:
-                if self.debug_mode:
-                    logger.warning(f"[回复密度] 记录回复失败: {e}")
-
-        # 调整概率 / 记录注意力（二选一）
-        attention_enabled = self.enable_attention_mechanism
-
-        if attention_enabled:
-            # 启用注意力机制：使用注意力机制，不使用传统概率提升
-            if self.debug_mode:
-                logger.info("【步骤15】跳过传统概率调整，使用注意力机制")
-                logger.info("【步骤16】记录被回复用户信息（注意力机制-增强版）")
-
-            # 获取被回复的用户信息
-            replied_user_id = event.get_sender_id()
-            replied_user_name = event.get_sender_name()
-
-            # 获取消息预览（用于注意力机制的上下文记录）
-            message_preview = message_text[:50] if message_text else ""
-
-            await AttentionManager.record_replied_user(
-                platform_name,
-                is_private,
-                chat_id,
-                replied_user_id,
-                replied_user_name,
-                message_preview=message_preview,
-                message_text=message_text,  # v1.1.2: 传递完整消息用于情感检测
-                attention_boost_step=self.attention_boost_step,  # 🔧 始终使用原始配置值，不做缩放
-                attention_decrease_step=self.attention_decrease_step,
-                emotion_boost_step=self.emotion_boost_step,
-                extra_interaction_count=wait_window_extra_count,  # 🔧 传递窗口额外消息数（用于独立的窗口修正衰减）
-                window_decay_per_msg=self.group_wait_window_attention_decay_per_msg,  # 🔧 每条额外消息的修正衰减值
-            )
-
-            # 注意：疲劳重置已移至 AI 决策确认回复后、生成回复前执行
-            # 这样可以确保：1. 重置在 record_replied_user 之前 2. 不受跳过逻辑影响
-
-            if self.debug_mode:
-                logger.info(
-                    f"【步骤16】已记录: {replied_user_name}(ID: {replied_user_id}), 消息预览: {message_preview}"
-                )
-        else:
-            # 未启用注意力机制：使用传统概率提升
-            if self.debug_mode:
-                logger.info("【步骤15】调整读空气概率（传统模式）")
-
-            await ProbabilityManager.boost_probability(
-                platform_name,
-                is_private,
-                chat_id,
-                self.after_reply_probability,
-                self.probability_duration,
-            )
-
-            if self.debug_mode:
-                logger.info("【步骤15】概率调整完成")
-
-        # 🆕 v1.0.2: 频率动态调整检查
-        if self.frequency_adjuster_enabled and self.frequency_adjuster:
-            try:
-                # 使用完整的会话标识，确保不同会话的状态隔离
-                chat_key = ProbabilityManager.get_chat_key(
-                    platform_name, is_private, chat_id
-                )
-
-                # 检查是否需要进行频率调整
-                message_count = self.frequency_adjuster.get_message_count(chat_key)
-
-                if self.frequency_adjuster.should_check_frequency(
-                    chat_key, message_count
-                ):
-                    if self.debug_mode:
-                        _freq_start = time.time()
-                        logger.info("【步骤17】开始频率动态调整检查")
-
-                    # 获取最近的消息用于分析（使用配置的数量）
-                    analysis_msg_count = self.frequency_analysis_message_count
-
-                    # 🔧 配置矫正：处理异常值
-                    if isinstance(analysis_msg_count, int) and analysis_msg_count < -1:
-                        logger.warning(
-                            f"⚠️ [频率调整-配置矫正] frequency_analysis_message_count 配置值 {analysis_msg_count} 小于 -1，已矫正为 -1（不限制）"
-                        )
-                        analysis_msg_count = -1
-
-                    # 🆕 v1.2.0: 使用新的统一方法获取历史消息（优先官方存储，回退自定义存储）
-                    # 根据配置决定是否获取历史
-                    if isinstance(analysis_msg_count, int) and analysis_msg_count == 0:
-                        # 配置为0，不进行频率分析
-                        if self.debug_mode:
-                            logger.info("[频率调整] 配置为0，跳过频率分析")
-                        recent_messages = []
-                    else:
-                        # 准备缓存消息
-                        cached_astrbot_messages_for_freq = []
-                        if (
-                            chat_id in self.pending_messages_cache
-                            and self.pending_messages_cache[chat_id]
-                        ):
-                            # 🔧 修复：过滤过期的缓存消息，避免使用已过期但未清理的消息
-                            cached_messages_raw = (
-                                ProactiveChatManager.filter_expired_cached_messages(
-                                    self.pending_messages_cache[chat_id]
-                                )
-                            )
-                            # 过滤掉窗口缓冲消息（频率分析只关注普通缓存）
-                            cached_messages_raw = [
-                                msg
-                                for msg in cached_messages_raw
-                                if not (
-                                    isinstance(msg, dict)
-                                    and msg.get("window_buffered", False)
-                                )
-                            ]
-                            for cached_msg in cached_messages_raw:
-                                if isinstance(cached_msg, dict):
-                                    try:
-                                        msg_obj = AstrBotMessage()
-                                        msg_obj.message_str = cached_msg.get(
-                                            "content", ""
-                                        )
-                                        msg_obj.platform_name = (
-                                            event.get_platform_name()
-                                        )
-                                        msg_obj.timestamp = cached_msg.get(
-                                            "message_timestamp"
-                                        ) or cached_msg.get("timestamp", time.time())
-                                        msg_obj.type = (
-                                            MessageType.GROUP_MESSAGE
-                                            if not event.is_private_chat()
-                                            else MessageType.FRIEND_MESSAGE
-                                        )
-                                        if not event.is_private_chat():
-                                            msg_obj.group_id = event.get_group_id()
-                                        msg_obj.self_id = event.get_self_id()
-                                        msg_obj.session_id = (
-                                            event.session_id
-                                            if hasattr(event, "session_id")
-                                            else chat_id
-                                        )
-                                        msg_obj.message_id = f"cached_{cached_msg.get('timestamp', time.time())}"
-                                        sender_id = cached_msg.get("sender_id", "")
-                                        sender_name = cached_msg.get(
-                                            "sender_name", "未知用户"
-                                        )
-                                        if sender_id:
-                                            msg_obj.sender = MessageMember(
-                                                user_id=sender_id, nickname=sender_name
-                                            )
-                                        cached_astrbot_messages_for_freq.append(msg_obj)
-                                    except Exception as e:
-                                        if self.debug_mode:
-                                            logger.warning(
-                                                f"[频率调整] 转换缓存消息失败: {e}"
-                                            )
-                                elif isinstance(cached_msg, AstrBotMessage):
-                                    cached_astrbot_messages_for_freq.append(cached_msg)
-
-                        # 使用新的统一方法获取历史消息
-                        recent_messages = (
-                            await ContextManager.get_history_messages_with_fallback(
-                                event=event,
-                                max_messages=analysis_msg_count,
-                                context=self.context,
-                                cached_messages=cached_astrbot_messages_for_freq,
-                            )
-                        )
-
-                        if self.debug_mode and cached_astrbot_messages_for_freq:
-                            logger.info(f"[频率调整] 缓存消息已在统一方法中合并")
-
-                    if self.debug_mode:
-                        expected_desc = (
-                            "不限制"
-                            if analysis_msg_count == -1
-                            else f"{analysis_msg_count}条"
-                        )
-                        logger.info(
-                            f"[频率调整] 获取最近消息: 期望{expected_desc}, 实际{len(recent_messages) if recent_messages else 0}条"
-                        )
-
-                    if recent_messages:
-                        # 构建可读的消息文本
-                        # AstrBotMessage 对象的属性访问方式
-                        bot_id = event.get_self_id()
-                        recent_text_parts = []
-                        # 遍历所有消息（已经在上面根据配置截断过了）
-                        for msg in recent_messages:
-                            # 判断消息角色（用户还是bot）
-                            role = "user"
-                            if hasattr(msg, "sender") and msg.sender:
-                                sender_id = (
-                                    msg.sender.user_id
-                                    if hasattr(msg.sender, "user_id")
-                                    else ""
-                                )
-                                if str(sender_id) == str(bot_id):
-                                    role = "assistant"
-
-                            # 提取消息内容
-                            content = ""
-                            if hasattr(msg, "message_str"):
-                                content = msg.message_str[:100]
-
-                            recent_text_parts.append(f"{role}: {content}")
-
-                        recent_text = "\n".join(recent_text_parts)
-
-                        # 使用AI分析频率（使用配置的超时时间）
-                        analysis_timeout = self.frequency_analysis_timeout
-                        decision = await self.frequency_adjuster.analyze_frequency(
-                            self.context,
-                            event,
-                            recent_text,
-                            self.decision_ai_provider_id,
-                            analysis_timeout,
-                        )
-
-                        if decision:
-                            # 获取当前概率
-                            current_prob = (
-                                await ProbabilityManager.get_current_probability(
-                                    platform_name,
-                                    is_private,
-                                    chat_id,
-                                    self.initial_probability,
-                                )
-                            )
-
-                            # 调整概率
-                            new_prob = self.frequency_adjuster.adjust_probability(
-                                current_prob, decision
-                            )
-
-                            # 如果概率有变化，应用新概率（使用相对差值判断，避免小概率值时阈值过大）
-                            if (
-                                current_prob > 0
-                                and abs(new_prob - current_prob) / current_prob > 0.05
-                            ):
-                                # 通过概率管理器设置新的基础概率
-                                # 使用配置的持续时间
-                                duration = self.frequency_adjust_duration
-                                await ProbabilityManager.set_base_probability(
-                                    platform_name,
-                                    is_private,
-                                    chat_id,
-                                    new_prob,
-                                    duration,
-                                )
-                                logger.info(
-                                    f"[频率调整] ✅ 已应用概率调整: {current_prob:.2f} → {new_prob:.2f} (持续{duration}秒)"
-                                )
-
-                            # 更新检查状态（使用相同的chat_key确保状态一致）
-                            self.frequency_adjuster.update_check_state(chat_key)
-
-                    if self.debug_mode:
-                        _freq_elapsed = time.time() - _freq_start
-                        logger.info(
-                            f"【步骤17】频率调整检查完成，耗时: {_freq_elapsed:.2f}秒"
-                        )
-            except Exception as e:
-                logger.error(f"频率调整检查失败: {e}")
-
         if self.debug_mode:
-            logger.info("=" * 60)
-            logger.info("✓ 消息处理流程完成")
+            logger.info("【步骤15-18】回复后状态更新已延后到 after_message_sent")
 
         _process_total_time = time.time() - _process_start_time
         timeout_threshold = self.reply_timeout_warning_threshold
@@ -5785,15 +5533,7 @@ class ChatPlus(Star):
         elif self.debug_mode:
             logger.info(f"消息处理总耗时: {_process_total_time:.2f}秒")
 
-        logger.info("消息处理完成,已发送回复并保存历史")
-
-        # 🆕 回复后戳一戳功能
-        if self.poke_after_reply_enabled:
-            # 获取被回复的用户信息
-            replied_user_id = event.get_sender_id()
-
-            # 执行戳一戳（概率触发）
-            await self._do_poke_after_reply(event, replied_user_id, is_private, chat_id)
+        logger.info("消息处理主流程完成，等待发送确认")
 
     async def _do_poke_after_reply(
         self, event: AstrMessageEvent, user_id: str, is_private: bool, chat_id: str
@@ -6984,66 +6724,8 @@ class ChatPlus(Star):
                 if self.debug_mode:
                     logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
 
-        # 🆕 在读空气AI判定确认回复后，检查主动对话成功并重置计时器
-        # 关键逻辑：只有AI真正决定回复时，才判定主动对话成功
-        if should_reply and self.proactive_enabled:
-            chat_key = ProbabilityManager.get_chat_key(
-                platform_name, is_private, chat_id
-            )
-
-            # ✅ 在AI决定回复时，检查是否为主动对话成功
-            state = ProactiveChatManager.get_chat_state(chat_key)
-            proactive_active = state.get("proactive_active", False)
-            outcome_recorded = state.get("proactive_outcome_recorded", False)
-            last_proactive_time = state.get("last_proactive_time", 0)
-            current_time = time.time()
-
-            # 检查是否在提升期内
-            boost_duration = self.proactive_temp_boost_duration
-            in_boost_period = (current_time - last_proactive_time) <= boost_duration
-
-            # 只有主动对话活跃、未判定过、且在提升期内，才判定为成功
-            if proactive_active and not outcome_recorded and in_boost_period:
-                # 检测是否快速回复（30秒内）
-                is_quick_reply = (current_time - last_proactive_time) <= 30
-
-                # 检测是否多人回复（基于追踪器）
-                is_multi_user = False
-                if chat_key in self._proactive_reply_users:
-                    if (
-                        self._proactive_reply_users[chat_key]["proactive_time"]
-                        == last_proactive_time
-                    ):
-                        is_multi_user = (
-                            len(self._proactive_reply_users[chat_key]["users"]) >= 2
-                        )
-
-                # 记录成功互动（AI真正决定回复，才算成功）
-                ProactiveChatManager.record_proactive_success(
-                    chat_key, self.config, is_quick_reply, is_multi_user
-                )
-
-                if self.debug_mode:
-                    logger.info(
-                        f"✅ [主动对话成功] 群{chat_key} - "
-                        f"AI决定回复，快速回复={is_quick_reply}, 多人回复={is_multi_user}"
-                    )
-
-            # 取消主动对话的临时概率提升与连续尝试（AI已决定回复）
-            ProactiveChatManager.check_and_handle_reply_after_proactive(
-                chat_key, self.config, force=True
-            )
-            ProactiveChatManager.record_bot_reply(chat_key, is_proactive=False)
-            if self.debug_mode:
-                logger.info(f"[主动对话] 读空气AI判定确认回复，已重置主动对话计时器")
-
-            # 🆕 v1.2.1: 记录回复到密度管理器（主动对话确认回复）
-            if self.enable_reply_density_limit:
-                try:
-                    await ReplyDensityManager.record_reply(chat_key)
-                except Exception as e:
-                    if self.debug_mode:
-                        logger.warning(f"[回复密度] 记录回复失败: {e}")
+        # 🔧 成功回复相关的主动对话/回复密度状态已后移到 after_message_sent，
+        # 避免“判定通过但最终空回复”时提前污染状态。
 
         # 🆕 v1.2.0: 冷却解除检测 (Requirements 2.1, 2.2)
         # 当AI决定回复时，尝试解除用户的冷却状态
@@ -7198,6 +6880,219 @@ class ChatPlus(Star):
             wait_window_extra_count=_gww_extra_count,  # 🔧 等待窗口额外消息数（注意力补偿）
         ):
             yield result
+
+    def _build_lightweight_reply_state_hint(
+        self,
+        is_at_message: bool,
+        has_trigger_keyword: bool,
+        conversation_fatigue_info: dict | None,
+    ) -> str:
+        trigger_text = "自然接话"
+        if is_at_message:
+            trigger_text = "@提及"
+        elif has_trigger_keyword:
+            trigger_text = "关键词触发"
+
+        fatigue_level = (conversation_fatigue_info or {}).get("fatigue_level", "none")
+        if fatigue_level == "heavy":
+            pace_text = "尽量简短收尾"
+        elif fatigue_level == "medium":
+            pace_text = "可适当收尾"
+        else:
+            pace_text = "正常推进"
+
+        return (
+            "\n\n[系统信息-回复状态]\n"
+            f"- 触发来源: {trigger_text}\n"
+            f"- 对话节奏: {pace_text}\n"
+            "- 直接自然回应当前发送者，不要解释你为什么会回复。\n"
+        )
+
+    async def _try_recover_empty_llm_reply(
+        self, event: AstrMessageEvent, message_id: str
+    ) -> bool:
+        fallback_done_key = "_group_chat_plus_empty_reply_fallback_done"
+        if event.get_extra(fallback_done_key, False):
+            return False
+
+        payload = event.get_extra(PLUGIN_FALLBACK_PAYLOAD, None)
+        if not isinstance(payload, dict):
+            return False
+
+        event.set_extra(fallback_done_key, True)
+
+        try:
+            req = ProviderRequest(
+                prompt=payload.get("prompt") or "",
+                session_id=event.session_id,
+                image_urls=payload.get("image_urls") or [],
+                contexts=[],
+                system_prompt=payload.get("system_prompt") or "",
+            )
+            llm_resp, primary_provider_id, provider_id, fallback_count = (
+                await ReplyHandler._request_with_astrbot_fallback(
+                    event,
+                    self.context,
+                    req,
+                )
+            )
+            if not llm_resp:
+                logger.warning("[空回复兜底] AstrBot 默认 Provider 链路不可用，跳过兜底")
+                return False
+        except Exception as e:
+            logger.warning(f"[空回复兜底] 直接补发失败: {e}")
+            return False
+
+        if not llm_resp:
+            return False
+
+        fallback_text = ""
+        result_chain = getattr(llm_resp, "result_chain", None)
+        if result_chain and getattr(result_chain, "chain", None):
+            try:
+                fallback_text = (result_chain.get_plain_text() or "").strip()
+            except Exception:
+                fallback_text = "".join(
+                    [comp.text for comp in result_chain.chain if hasattr(comp, "text")]
+                ).strip()
+
+        completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
+        if not fallback_text and completion_text:
+            fallback_text = completion_text
+
+        if self.debug_mode:
+            logger.info(
+                f"[空回复兜底] primary_provider={primary_provider_id}, final_provider={provider_id}, fallback_count={fallback_count}, completion_len={len(completion_text)}, extracted_len={len(fallback_text)}"
+            )
+
+        if not fallback_text and event.is_at_or_wake_command:
+            short_msg = (event.get_message_str() or "").strip()
+            fallback_text = "？" if len(short_msg) <= 4 else "怎么了"
+            logger.warning(
+                f"[空回复兜底] Provider 仍为空，对@消息使用固定文本兜底: {fallback_text}"
+            )
+
+        if not fallback_text:
+            logger.warning("[空回复兜底] 直接补发仍为空，放弃发送")
+            return False
+
+        fallback_result = event.plain_result(fallback_text)
+        fallback_result.set_result_content_type(ResultContentType.LLM_RESULT)
+        event.set_result(fallback_result)
+        logger.warning(
+            f"[空回复兜底] message_id={message_id[:30]}... 已回退到直出 Provider 生成回复，文本长度={len(fallback_text)}"
+        )
+        return True
+
+    async def _apply_successful_reply_effects(
+        self,
+        event: AstrMessageEvent,
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+    ) -> None:
+        effect_ctx = event.get_extra(PLUGIN_REPLY_EFFECT_CONTEXT, {}) or {}
+        message_text = effect_ctx.get("message_text", "")
+        wait_window_extra_count = int(
+            effect_ctx.get("wait_window_extra_count", 0) or 0
+        )
+
+        chat_key = ProbabilityManager.get_chat_key(platform_name, is_private, chat_id)
+
+        if self.proactive_enabled:
+            try:
+                state = ProactiveChatManager.get_chat_state(chat_key)
+                proactive_active = state.get("proactive_active", False)
+                outcome_recorded = state.get("proactive_outcome_recorded", False)
+                last_proactive_time = state.get("last_proactive_time", 0)
+                current_time = time.time()
+                in_boost_period = (
+                    current_time - last_proactive_time
+                ) <= self.proactive_temp_boost_duration
+
+                if proactive_active and not outcome_recorded and in_boost_period:
+                    is_quick_reply = (current_time - last_proactive_time) <= 30
+                    is_multi_user = False
+                    if (
+                        hasattr(self, "_proactive_reply_users")
+                        and chat_key in self._proactive_reply_users
+                        and self._proactive_reply_users[chat_key].get(
+                            "proactive_time"
+                        )
+                        == last_proactive_time
+                    ):
+                        is_multi_user = (
+                            len(self._proactive_reply_users[chat_key].get("users", []))
+                            >= 2
+                        )
+
+                    ProactiveChatManager.record_proactive_success(
+                        chat_key, self.config, is_quick_reply, is_multi_user
+                    )
+                    if self.debug_mode:
+                        logger.info(
+                            f"✅ [主动对话成功] 群{chat_key} - "
+                            f"AI已实际发出回复，快速回复={is_quick_reply}, 多人回复={is_multi_user}"
+                        )
+
+                ProactiveChatManager.check_and_handle_reply_after_proactive(
+                    chat_key, self.config, force=True
+                )
+                ProactiveChatManager.record_bot_reply(chat_key, is_proactive=False)
+                if self.debug_mode:
+                    logger.info("[主动对话] 已在发送成功后重置主动对话计时器")
+            except Exception as e:
+                logger.warning(f"[主动对话] 发送后状态更新失败: {e}")
+
+        if self.enable_reply_density_limit:
+            try:
+                await ReplyDensityManager.record_reply(chat_key)
+            except Exception as e:
+                if self.debug_mode:
+                    logger.warning(f"[回复密度] 发送后记录失败: {e}")
+
+        if self.enable_attention_mechanism:
+            try:
+                replied_user_id = event.get_sender_id()
+                replied_user_name = event.get_sender_name() or "未知用户"
+                message_preview = message_text[:50] if message_text else ""
+                await AttentionManager.record_replied_user(
+                    platform_name,
+                    is_private,
+                    chat_id,
+                    replied_user_id,
+                    replied_user_name,
+                    message_preview=message_preview,
+                    message_text=message_text,
+                    attention_boost_step=self.attention_boost_step,
+                    attention_decrease_step=self.attention_decrease_step,
+                    emotion_boost_step=self.emotion_boost_step,
+                    extra_interaction_count=wait_window_extra_count,
+                    window_decay_per_msg=self.group_wait_window_attention_decay_per_msg,
+                )
+            except Exception as e:
+                logger.warning(f"[注意力机制] 发送后记录失败: {e}", exc_info=True)
+        else:
+            try:
+                await ProbabilityManager.boost_probability(
+                    platform_name,
+                    is_private,
+                    chat_id,
+                    self.after_reply_probability,
+                    self.probability_duration,
+                )
+            except Exception as e:
+                logger.warning(f"[概率调整] 发送后更新失败: {e}")
+
+        if self.poke_after_reply_enabled:
+            try:
+                await self._do_poke_after_reply(
+                    event, event.get_sender_id(), is_private, chat_id
+                )
+            except Exception as e:
+                logger.warning(f"[戳一戳] 发送后执行失败: {e}")
+
+        logger.info("消息处理完成,已发送回复并保存历史")
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -7434,19 +7329,33 @@ class ChatPlus(Star):
                 return
 
             result = event.get_result()
-            if not result or not hasattr(result, "chain") or not result.chain:
+            if not result:
                 return
 
             # 仅处理 LLM 最终结果（非流式片段）
             if not result.is_llm_result():
                 return
 
+            if not hasattr(result, "chain") or not result.chain:
+                recovered = await self._try_recover_empty_llm_reply(event, message_id)
+                if recovered:
+                    result = event.get_result()
+                if not result or not hasattr(result, "chain") or not result.chain:
+                    return
+
             # 提取纯文本
             reply_text = "".join(
                 [comp.text for comp in result.chain if hasattr(comp, "text")]
             ).strip()
             if not reply_text:
-                return
+                recovered = await self._try_recover_empty_llm_reply(event, message_id)
+                if recovered:
+                    result = event.get_result()
+                    reply_text = "".join(
+                        [comp.text for comp in result.chain if hasattr(comp, "text")]
+                    ).strip()
+                if not reply_text:
+                    return
 
             self.raw_reply_cache[message_id] = reply_text
 
@@ -7680,8 +7589,11 @@ class ChatPlus(Star):
                 # 如果agent还未完成（工具调用中），回复文本已在 on_decorating_result 中累积，
                 # 此处暂不保存，等待后续的最终调用
                 is_agent_done = message_id in self._agent_done_flags
+                is_direct_reply_mode = bool(
+                    event.get_extra(PLUGIN_DIRECT_REPLY_MODE, False)
+                )
 
-                if not is_agent_done:
+                if not is_agent_done and not is_direct_reply_mode:
                     # agent还在运行（多轮工具调用中），文本已在 on_decorating_result 累积
                     pending_count = len(self._pending_bot_replies.get(message_id, []))
                     logger.info(
@@ -7690,7 +7602,10 @@ class ChatPlus(Star):
                     )
                     return
 
-                # agent已完成，清除标记并进行最终保存
+                if is_direct_reply_mode and self.debug_mode:
+                    logger.info("[消息发送后] 检测到直连 Provider 回复，按单轮文本流程保存")
+
+                # agent已完成，或直连 Provider 已完成发送，清除标记并进行最终保存
                 del self.processing_sessions[message_id]
                 self._agent_done_flags.discard(message_id)
 
@@ -8126,6 +8041,19 @@ class ChatPlus(Star):
                     logger.warning(
                         f"[消息发送后] Phase-2: ⚠️ 窗口缓冲消息处理异常（降级：留在缓存）: {phase2_err}"
                     )
+
+                if bot_to_save:
+                    await self._apply_successful_reply_effects(
+                        event, platform_name, is_private, chat_id
+                    )
+
+                try:
+                    event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
+                    event.set_extra(PLUGIN_FALLBACK_PAYLOAD, None)
+                    event.set_extra(PLUGIN_REPLY_EFFECT_CONTEXT, None)
+                    event.set_extra("_group_chat_plus_empty_reply_fallback_done", None)
+                except Exception:
+                    pass
 
                 # 🔧 标记消息已保存（防止分段消息重复保存）
                 self._saved_messages[message_id] = time.time()
