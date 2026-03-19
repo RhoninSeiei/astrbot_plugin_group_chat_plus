@@ -145,7 +145,13 @@ from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
     PLUGIN_FALLBACK_PAYLOAD,
+    PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED,
     PLUGIN_REPLY_EFFECT_CONTEXT,
+)
+
+
+PLUGIN_PENDING_MAIN_MODEL_DECISION = (
+    "_group_chat_plus_pending_main_model_decision"
 )
 
 
@@ -244,6 +250,9 @@ class ChatPlus(Star):
         self.reply_ai_prompt_mode = config.get(
             "reply_ai_prompt_mode", "append"
         )  # 回复AI提示词模式
+        self.enable_main_model_final_decision = config.get(
+            "enable_main_model_final_decision", True
+        )  # 主模型最终判断开关（第一层读空气放行后再做一次最终是否出手判断）
 
         # === 消息格式配置 ===
         self.include_timestamp = config.get("include_timestamp", True)  # 包含时间戳
@@ -4017,6 +4026,10 @@ class ChatPlus(Star):
                 conversation_fatigue_info=conversation_fatigue_info,
                 # 🆕 v1.2.1: 传递回复密度提示
                 reply_density_hint=reply_density_hint,
+                # 🆕 v1.3.1: 第一层读空气作为宽松粗筛，主模型后续再做最终判断
+                is_preliminary_filter=(
+                    self.enable_main_model_final_decision and should_do_ai_decision
+                ),
             )
             # 🐛 修复：不要在这里删除缓存！
             # pre_decision 模式下，缓存的上下文（已植入记忆）需要在生成回复时使用
@@ -4101,12 +4114,25 @@ class ChatPlus(Star):
                     message_preview = (
                         formatted_context[:50] if formatted_context else ""
                     )
-                    await HumanizeModeManager.record_decision(
-                        chat_key=chat_key,
-                        decision=True,
-                        reason="AI判断应该回复",
-                        message_preview=message_preview,
-                    )
+                    if self.enable_main_model_final_decision and should_do_ai_decision:
+                        event.set_extra(
+                            PLUGIN_PENDING_MAIN_MODEL_DECISION,
+                            {
+                                "chat_key": chat_key,
+                                "message_preview": message_preview,
+                            },
+                        )
+                        if self.debug_mode:
+                            logger.info(
+                                "[拟人增强] 已延后记录回复决策，等待主模型最终判断"
+                            )
+                    else:
+                        await HumanizeModeManager.record_decision(
+                            chat_key=chat_key,
+                            decision=True,
+                            reason="AI判断应该回复",
+                            message_preview=message_preview,
+                        )
                 except Exception as e:
                     logger.warning(f"[拟人增强] 记录决策失败: {e}")
 
@@ -5160,6 +5186,12 @@ class ChatPlus(Star):
         except Exception:
             message_id_for_error = None
 
+        enable_final_decision_gate = (
+            self.enable_main_model_final_decision
+            and not is_at_message
+            and (not has_trigger_keyword or self.keyword_smart_mode)
+        )
+
         try:
             reply_result = await ReplyHandler.generate_reply(
                 event,
@@ -5172,6 +5204,7 @@ class ChatPlus(Star):
                 include_timestamp=self.include_timestamp,  # 🔧 v1.2.0: 补传时间戳开关，确保contexts格式与prompt一致
                 history_messages=history_messages,  # 🔧 修复：传递历史消息用于构建contexts
                 conversation_fatigue_info=conversation_fatigue_info,  # 🆕 v1.2.0: 传递疲劳信息
+                enable_final_decision_gate=enable_final_decision_gate,
             )
         except Exception as e:
             ai_error_flag = True
@@ -5210,6 +5243,51 @@ class ChatPlus(Star):
             logger.warning(
                 f"⚠️ AI回复生成耗时异常: {_elapsed:.2f}秒（超过{self.reply_generation_timeout_warning}秒）"
             )
+
+        main_model_declined = bool(
+            event.get_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, False)
+        )
+        if main_model_declined:
+            logger.info("主模型最终判断: 不应该回复此消息")
+
+            pending_final_decision = event.get_extra(
+                PLUGIN_PENDING_MAIN_MODEL_DECISION, {}
+            ) or {}
+            if self.humanize_mode_enabled and pending_final_decision:
+                try:
+                    pending_chat_key = pending_final_decision.get("chat_key") or (
+                        ProbabilityManager.get_chat_key(
+                            platform_name, is_private, chat_id
+                        )
+                    )
+                    await HumanizeModeManager.record_decision(
+                        chat_key=pending_chat_key,
+                        decision=False,
+                        reason="主模型最终判断不需要回复",
+                        message_preview=pending_final_decision.get(
+                            "message_preview", formatted_context[:50] if formatted_context else ""
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"[拟人增强] 记录主模型最终判断失败: {e}")
+
+            if cached_message_data:
+                self.cache_manager.add_to_cache(
+                    chat_id, cached_message_data, source="主模型最终判断过滤"
+                )
+                logger.info("📦 主模型最终判断: 不回复此消息，已缓存消息，等待后续转正")
+            else:
+                logger.info("📦 主模型最终判断: 不回复此消息，无待缓存数据")
+
+            self._message_cache_snapshots.pop(early_message_id, None)
+            event.call_llm = True
+            try:
+                event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
+                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, None)
+                event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
+            except Exception:
+                pass
+            return
 
         # 📝 注意：错字模拟和延迟模拟已迁移到 @on_decorating_result() 钩子中处理
         # 因为普通回复流程使用 event.request_llm() 返回 ProviderRequest 对象，
@@ -8042,6 +8120,27 @@ class ChatPlus(Star):
                         f"[消息发送后] Phase-2: ⚠️ 窗口缓冲消息处理异常（降级：留在缓存）: {phase2_err}"
                     )
 
+                pending_final_decision = event.get_extra(
+                    PLUGIN_PENDING_MAIN_MODEL_DECISION, {}
+                ) or {}
+                if self.humanize_mode_enabled and pending_final_decision and bot_to_save:
+                    try:
+                        pending_chat_key = pending_final_decision.get("chat_key") or (
+                            ProbabilityManager.get_chat_key(
+                                platform_name, is_private, chat_id
+                            )
+                        )
+                        await HumanizeModeManager.record_decision(
+                            chat_key=pending_chat_key,
+                            decision=True,
+                            reason="主模型最终判断并实际回复",
+                            message_preview=pending_final_decision.get(
+                                "message_preview", ""
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(f"[拟人增强] 记录主模型最终判断失败: {e}")
+
                 if bot_to_save:
                     await self._apply_successful_reply_effects(
                         event, platform_name, is_private, chat_id
@@ -8051,6 +8150,7 @@ class ChatPlus(Star):
                     event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
                     event.set_extra(PLUGIN_FALLBACK_PAYLOAD, None)
                     event.set_extra(PLUGIN_REPLY_EFFECT_CONTEXT, None)
+                    event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
                     event.set_extra("_group_chat_plus_empty_reply_fallback_done", None)
                 except Exception:
                     pass

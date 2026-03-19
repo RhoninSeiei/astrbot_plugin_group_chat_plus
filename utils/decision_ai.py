@@ -181,6 +181,8 @@ class DecisionAI:
         conversation_fatigue_info: Dict[str, Any] = None,
         # 🆕 v1.2.1: 回复密度提示文本
         reply_density_hint: str = "",
+        # 🆕 v1.3.1: 是否作为第一层宽松粗筛
+        is_preliminary_filter: bool = False,
     ) -> bool:
         """
         调用AI判断是否应该回复
@@ -436,6 +438,16 @@ class DecisionAI:
             # 🆕 v1.2.1: 回复密度提示
             if reply_density_hint:
                 enhanced_context += reply_density_hint
+
+            # 🆕 v1.3.1: 第一层粗筛模式提示
+            if is_preliminary_filter:
+                enhanced_context += (
+                    "\n\n[系统信息-两阶段回复流程]\n"
+                    "你现在是第一道宽松筛选，只负责筛掉明显不需要回复的消息。\n"
+                    "- 如果消息明显与你无关、明显不该介入、或命中拒绝/私聊/纯表情等情况，返回no。\n"
+                    "- 如果只是边界情况、可能值得回复但你并不完全确定，返回yes，让后续主模型做最终判断。\n"
+                    "- 因此这一阶段整体应偏宽松，但不要放过明显不该回复的消息。\n"
+                )
 
             # 🔧 v1.2.0: 缓存友好的提示词拼接顺序
             # 将静态内容（系统判断提示词、用户额外提示词）放在最前面，

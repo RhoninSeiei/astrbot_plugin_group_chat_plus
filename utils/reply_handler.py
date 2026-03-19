@@ -43,6 +43,9 @@ PLUGIN_FALLBACK_PAYLOAD = "_group_chat_plus_fallback_payload"
 # 🔧 存储回复成功后再记账所需的上下文
 PLUGIN_REPLY_EFFECT_CONTEXT = "_group_chat_plus_reply_effect_context"
 PLUGIN_DIRECT_REPLY_MODE = "_group_chat_plus_direct_reply_mode"
+PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED = (
+    "_group_chat_plus_main_model_final_gate_declined"
+)
 
 
 class ReplyHandler:
@@ -144,6 +147,17 @@ class ReplyHandler:
 
     # 系统回复提示词的结束指令（单独分离，用于插入自定义提示词）
     SYSTEM_REPLY_PROMPT_ENDING = "\n请开始回复：\n"
+    MAIN_MODEL_FINAL_GATE_NO_REPLY = "[[NO_REPLY]]"
+    MAIN_MODEL_FINAL_GATE_PROMPT = f"""
+
+[最终回复判断]
+你现在处于第二阶段。前一道读空气粗筛已经放行，但这不代表你必须回复。
+请在正式回复前先做一次最终判断：
+- 如果当前这条新消息其实不值得你出手，请只输出：{MAIN_MODEL_FINAL_GATE_NO_REPLY}
+- 如果值得回复，直接输出最终发送给群里的回复内容
+- 不要输出 yes/no、解释、理由、标签、引号、代码块或任何额外格式
+- 这是最终判断；边界情况允许你保持沉默，只有真的值得说话时再开口
+"""
 
     @staticmethod
     async def generate_reply(
@@ -158,6 +172,7 @@ class ReplyHandler:
         history_messages: list = None,
         conversation_fatigue_info: dict = None,
         reply_provider_id: str = "",
+        enable_final_decision_gate: bool = False,
     ) -> ProviderRequest:
         """
         生成AI回复
@@ -183,6 +198,11 @@ class ReplyHandler:
         # 如果history_messages为None，初始化为空列表
         if history_messages is None:
             history_messages = []
+
+        try:
+            event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, None)
+        except Exception:
+            pass
 
         # 🔧 v1.3.0: 不再构建 contexts 数组，改为全部依赖 full_prompt 文本传递历史上下文。
         # 原因：群聊中所有非 bot 消息都被标为 role="user"，LLM 在结构层面无法区分
@@ -233,6 +253,10 @@ class ReplyHandler:
                         f"禁止提及'疲劳'、'连续对话'、'系统提示'等元信息。\n"
                     )
 
+            final_decision_gate_prompt = ""
+            if enable_final_decision_gate:
+                final_decision_gate_prompt = ReplyHandler.MAIN_MODEL_FINAL_GATE_PROMPT
+
             # 🔧 v1.2.0: 缓存友好的提示词拼接顺序
             # 将静态内容（系统回复提示词、用户额外提示词）放在最前面，
             # 动态内容（对话上下文、发送者信息、疲劳提示）放在后面。
@@ -243,6 +267,7 @@ class ReplyHandler:
                 # 让 AI 在阅读历史消息前就明确当前对话对象，避免被历史/窗口缓冲消息干扰
                 full_prompt = (
                     extra_prompt.strip()
+                    + final_decision_gate_prompt
                     + sender_emphasis
                     + "\n\n"
                     + formatted_message
@@ -263,6 +288,9 @@ class ReplyHandler:
                         logger.info(
                             "使用拼接模式：用户自定义提示词紧跟系统提示词（缓存友好顺序）"
                         )
+
+                if final_decision_gate_prompt:
+                    full_prompt += final_decision_gate_prompt
 
                 # 添加结束指令（静态）
                 full_prompt += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
@@ -412,7 +440,18 @@ class ReplyHandler:
                     getattr(comp.__class__, "__name__", "") != "Plain"
                     for comp in result_chain.chain
                 )
+                if (
+                    enable_final_decision_gate
+                    and plain_text
+                    and not has_non_text_component
+                    and ReplyHandler._is_final_gate_decline(plain_text)
+                ):
+                    logger.info("[主模型最终判断] 当前消息无需回复，跳过发送")
+                    event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                    return None
                 if plain_text or has_non_text_component:
+                    if enable_final_decision_gate:
+                        logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
                     event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
                     reply_result = event.chain_result(result_chain.chain)
                     reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
@@ -420,6 +459,14 @@ class ReplyHandler:
 
             completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
             if completion_text:
+                if enable_final_decision_gate and ReplyHandler._is_final_gate_decline(
+                    completion_text
+                ):
+                    logger.info("[主模型最终判断] 当前消息无需回复，跳过发送")
+                    event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                    return None
+                if enable_final_decision_gate:
+                    logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
                 event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
                 reply_result = event.plain_result(completion_text)
                 reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
@@ -434,6 +481,21 @@ class ReplyHandler:
             logger.error(f"生成AI回复时发生错误: {e}")
             # 返回错误消息
             return event.plain_result(f"生成回复时发生错误: {str(e)}")
+
+    @staticmethod
+    def _normalize_final_gate_text(text: str) -> str:
+        normalized = (text or "").strip()
+        if normalized.startswith("```") and normalized.endswith("```"):
+            normalized = normalized.strip("`").strip()
+        normalized = normalized.strip().strip('\"').strip("'").strip()
+        return normalized
+
+    @staticmethod
+    def _is_final_gate_decline(text: str) -> bool:
+        return (
+            ReplyHandler._normalize_final_gate_text(text)
+            == ReplyHandler.MAIN_MODEL_FINAL_GATE_NO_REPLY
+        )
 
     @staticmethod
     def _llm_response_has_sendable_content(llm_resp: object | None) -> bool:
