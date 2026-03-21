@@ -111,6 +111,7 @@
 |--------|------|--------|------|
 | `initial_probability` | float | `0.02` | 基础回复概率。每条消息有 2% 的概率通过第一层筛选。值越高，AI越活跃 |
 | `after_reply_probability` | float | `0.8` | 回复后的提升概率。刚回复过后，概率临时提升到 80%，促进连续对话 |
+| `reply_probability_scale` | float | `0.5` | 对普通回复的最终概率做统一缩放。默认压到原先的一半，用于整体降频但保留注意力、疲劳、密度限制的相对效果 |
 | `probability_duration` | int | `120` | 回复后概率提升的持续时间（秒），超过后恢复到 `initial_probability` |
 
 ### 概率硬限制
@@ -422,9 +423,10 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enable_proactive_chat` | bool | `false` | 启用主动对话。群聊沉默一段时间后，AI自动发起话题 |
-| `proactive_silence_threshold` | int | `1800` | 群聊沉默多久后可能触发主动对话（秒，默认30分钟） |
-| `proactive_probability` | float | `0.2` | 满足条件后主动发言的概率 |
-| `proactive_check_interval` | int | `120` | 定时检查间隔（秒） |
+| `proactive_silence_threshold` | int | `600` | 群聊沉默多久后可能触发主动对话（秒，默认10分钟） |
+| `proactive_probability` | float | `0.3` | 满足条件后的基础主动发言概率 |
+| `proactive_probability_scale` | float | `0.5` | 对主动对话的最终概率做统一缩放。默认压到原先的一半，用于整体降低主动发言频率 |
+| `proactive_check_interval` | int | `60` | 定时检查间隔（秒） |
 | `proactive_enabled_groups` | list | `[]` | 启用主动对话的群列表（空=所有启用群聊的群） |
 
 ### 用户活跃要求
@@ -440,13 +442,14 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `proactive_max_consecutive_failures` | int | `3` | 连续被无视 N 次后进入冷却 |
-| `proactive_cooldown_duration` | int | `2400` | 冷却持续时间（秒） |
+| `enable_proactive_retry_sequence` | bool | `false` | 是否允许主动发言无人回应后立即再次尝试。默认关闭，失败后回到新的沉默周期 |
+| `proactive_cooldown_duration` | int | `1800` | 冷却持续时间（秒） |
 
 ### 安静时段
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `proactive_enable_quiet_time` | bool | `true` | 启用安静时段限制 |
+| `proactive_enable_quiet_time` | bool | `false` | 启用安静时段限制 |
 | `proactive_quiet_start` | string | `"23:00"` | 安静时段开始 |
 | `proactive_quiet_end` | string | `"07:00"` | 安静时段结束 |
 | `proactive_transition_minutes` | int | `30` | 安静时段边界平滑过渡 |

@@ -123,7 +123,9 @@ class ProactiveChatManager:
     _proactive_require_user_activity: bool = True
     _proactive_min_user_messages: int = 3
     _proactive_probability: float = 0.3
+    _proactive_probability_scale: float = 0.5
     _proactive_user_activity_window: int = 300
+    _enable_proactive_retry_sequence: bool = False
     # 时间段控制配置
     _proactive_enable_quiet_time: bool = False
     _proactive_quiet_start: str = "23:00"
@@ -272,7 +274,13 @@ class ProactiveChatManager:
         cls._proactive_require_user_activity = config["proactive_require_user_activity"]
         cls._proactive_min_user_messages = config["proactive_min_user_messages"]
         cls._proactive_probability = config["proactive_probability"]
+        cls._proactive_probability_scale = max(
+            0.0, min(1.0, config["proactive_probability_scale"])
+        )
         cls._proactive_user_activity_window = config["proactive_user_activity_window"]
+        cls._enable_proactive_retry_sequence = config[
+            "enable_proactive_retry_sequence"
+        ]
         # 时间段控制配置
         cls._proactive_enable_quiet_time = config["proactive_enable_quiet_time"]
         cls._proactive_quiet_start = config["proactive_quiet_start"]
@@ -2284,6 +2292,8 @@ class ProactiveChatManager:
 
         # 限制在合理范围内（最高90%）
         final_prob = min(0.9, max(0.0, final_prob))
+        scaled_prob = final_prob * cls._proactive_probability_scale
+        scaled_prob = min(0.9, max(0.0, scaled_prob))
 
         # 记录调试信息
 
@@ -2292,16 +2302,23 @@ class ProactiveChatManager:
                 f"📊 [自适应参数] 群{chat_key} - {adaptive_params['level']} "
                 f"评分={adaptive_params['score']}, "
                 f"基础概率={base_prob:.2f} → 时间调整={time_adjusted_prob:.2f} → "
-                f"自适应系数×{prob_multiplier:.2f} → 最终概率={final_prob:.2f}, "
+                f"自适应系数×{prob_multiplier:.2f} → 缩放×{cls._proactive_probability_scale:.2f} "
+                f"→ 最终概率={scaled_prob:.2f}, "
                 f"沉默阈值={silence_threshold}秒, 最大尝试={adaptive_params['max_failures']}次"
+            )
+        elif cls._debug_mode and abs(cls._proactive_probability_scale - 1.0) > 1e-9:
+            logger.info(
+                f"[主动对话积极性缩放] 群{chat_key} - "
+                f"缩放前概率={final_prob:.2f}, 缩放后概率={scaled_prob:.2f}, "
+                f"缩放系数={cls._proactive_probability_scale:.2f}"
             )
 
         # 5. 概率判断
         roll = random.random()
-        if roll >= final_prob:
-            return False, f"概率判断失败（{roll:.2f} >= {final_prob:.2f}）"
+        if roll >= scaled_prob:
+            return False, f"概率判断失败（{roll:.2f} >= {scaled_prob:.2f}）"
 
-        return True, f"触发成功（{roll:.2f} < {final_prob:.2f}）"
+        return True, f"触发成功（{roll:.2f} < {scaled_prob:.2f}）"
 
     @classmethod
     def check_user_activity(cls, chat_key: str, config: dict = None) -> bool:
@@ -2822,6 +2839,16 @@ class ProactiveChatManager:
                                     except Exception:
                                         pass
                                     state["proactive_attempts_count"] = 0
+                                    continue
+
+                                if not cls._enable_proactive_retry_sequence:
+                                    state["proactive_attempts_count"] = 0
+                                    state["last_proactive_content"] = None
+                                    if cls._debug_mode:
+                                        logger.info(
+                                            f"[连续尝试] 群{chat_key} 已关闭无人回应后的连续尝试，"
+                                            "本轮仅记录失败，不立即再次主动发言"
+                                        )
                                     continue
 
                                 # 未达上限：立即进行下一次连续尝试（不再依赖沉默阈值）

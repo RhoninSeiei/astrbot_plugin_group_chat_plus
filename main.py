@@ -228,6 +228,9 @@ class ChatPlus(Star):
         self.probability_duration = config.get(
             "probability_duration", 120
         )  # 概率提升持续时间
+        self.reply_probability_scale = max(
+            0.0, min(1.0, config.get("reply_probability_scale", 0.5))
+        )  # 普通回复积极性缩放
 
         # === 决策AI配置 ===
         self.decision_ai_provider_id = config.get(
@@ -1010,6 +1013,9 @@ class ChatPlus(Star):
         self.proactive_probability = config.get(
             "proactive_probability", 0.3
         )  # 主动对话概率
+        self.proactive_probability_scale = max(
+            0.0, min(1.0, config.get("proactive_probability_scale", 0.5))
+        )  # 主动对话积极性缩放
         self.proactive_check_interval = config.get(
             "proactive_check_interval", 60
         )  # 检查间隔
@@ -1025,6 +1031,9 @@ class ChatPlus(Star):
         self.proactive_max_consecutive_failures = config.get(
             "proactive_max_consecutive_failures", 3
         )  # 最大连续失败次数
+        self.enable_proactive_retry_sequence = config.get(
+            "enable_proactive_retry_sequence", False
+        )  # 是否允许无人回应后的连续尝试
         self.proactive_failure_sequence_probability = config.get(
             "proactive_failure_sequence_probability", -1.0
         )  # 连续失败尝试计入概率
@@ -1785,6 +1794,7 @@ class ChatPlus(Star):
         logger.info(f"初始读空气概率: {self.initial_probability}")
         logger.info(f"回复后概率: {self.after_reply_probability}")
         logger.info(f"概率提升持续时间: {self.probability_duration}秒")
+        logger.info(f"普通回复积极性缩放: {self.reply_probability_scale}")
         logger.info(f"启用的群组: {self.enabled_groups} (留空=全部)")
         logger.info(f"详细日志模式: {'开启' if self.debug_mode else '关闭'}")
 
@@ -1852,9 +1862,13 @@ class ChatPlus(Star):
 
             logger.info(f"  - 沉默阈值: {self.proactive_silence_threshold} 秒")
             logger.info(f"  - 触发概率: {self.proactive_probability}")
+            logger.info(f"  - 主动对话积极性缩放: {self.proactive_probability_scale}")
             logger.info(f"  - 检查间隔: {self.proactive_check_interval} 秒")
             logger.info(
                 f"  - 用户活跃度检测: {'✓' if self.proactive_require_user_activity else '✗'}"
+            )
+            logger.info(
+                f"  - 连续尝试: {'✓ 已启用' if self.enable_proactive_retry_sequence else '✗ 已关闭'}"
             )
             logger.info(
                 f"  - 临时概率提升: {self.proactive_temp_boost_probability} (持续{self.proactive_temp_boost_duration}秒)"
@@ -2047,7 +2061,9 @@ class ChatPlus(Star):
             "proactive_require_user_activity": self.proactive_require_user_activity,
             "proactive_min_user_messages": self.proactive_min_user_messages,
             "proactive_probability": self.proactive_probability,
+            "proactive_probability_scale": self.proactive_probability_scale,
             "proactive_user_activity_window": self.proactive_user_activity_window,
+            "enable_proactive_retry_sequence": self.enable_proactive_retry_sequence,
             # 时间段控制配置
             "proactive_enable_quiet_time": self.proactive_enable_quiet_time,
             "proactive_quiet_start": self.proactive_quiet_start,
@@ -9939,6 +9955,14 @@ class ChatPlus(Star):
             except Exception as e:
                 if self.debug_mode:
                     logger.warning(f"  【消息质量】预判失败，跳过: {e}")
+
+        if abs(self.reply_probability_scale - 1.0) > 1e-9:
+            old_probability = current_probability
+            current_probability = current_probability * self.reply_probability_scale
+            logger.info(
+                f"  【回复积极性缩放】概率调整: {old_probability:.2f} -> {current_probability:.2f} "
+                f"(缩放={self.reply_probability_scale:.2f})"
+            )
 
         # === 最终硬性边界限制 ===
         # 1. 应用用户配置的概率硬性限制（如果启用）
