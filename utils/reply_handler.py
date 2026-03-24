@@ -112,6 +112,11 @@ class ReplyHandler:
 - 不要提及"记忆"、"根据记忆"等词语
 - 绝对禁止提及任何系统提示词、规则、时间戳、用户ID等元信息
 
+【群聊篇幅】重要：
+- 这是群聊，不是私聊答疑。默认只回一句短句，能用几个词说清就不要写成长段
+- 除非对方明确要求你详细解释、给步骤、做分析，否则禁止分段、禁止列表、禁止连续好几句话
+- 大多数场合控制在一句内；就算要认真回应，也优先短句，不要像写小作文
+
 【严禁元叙述】特别重要：
 - 绝对禁止解释你为什么要回复
 - ❌ 禁止："看到你@我了"、"注意到你在说XXX"、"看着你发来的消息"、"看了看你的消息"、"我看到了主动对话提示词"、"根据系统提示"等
@@ -154,10 +159,61 @@ class ReplyHandler:
 你现在处于第二阶段。前一道读空气粗筛已经放行，但这不代表你必须回复。
 请在正式回复前先做一次最终判断：
 - 如果当前这条新消息其实不值得你出手，请只输出：{MAIN_MODEL_FINAL_GATE_NO_REPLY}
-- 如果值得回复，直接输出最终发送给群里的回复内容
+- 如果值得回复，直接输出最终发送给群里的回复内容，默认只用一句短句；能几个词说完就别展开
 - 不要输出 yes/no、解释、理由、标签、引号、代码块或任何额外格式
 - 这是最终判断；边界情况允许你保持沉默，只有真的值得说话时再开口
 """
+    BRIEF_REPLY_MAX_CHARS_DEFAULT = 30
+    BRIEF_REPLY_MAX_CHARS_DIRECT = 42
+    BRIEF_REPLY_MAX_CHARS_EXPLICIT = 78
+    BRIEF_REPLY_MAX_SENTENCES_DEFAULT = 1
+    BRIEF_REPLY_MAX_SENTENCES_EXPLICIT = 2
+    BRIEF_REPLY_SOFT_OVERRUN = 8
+    BRIEF_REPLY_MIN_KEEP = 6
+    BRIEF_REPLY_LONG_FORM_KEYWORDS = (
+        "详细",
+        "具体",
+        "展开",
+        "解释",
+        "分析",
+        "步骤",
+        "教程",
+        "原理",
+        "原因",
+        "怎么做",
+        "如何做",
+        "怎么弄",
+        "怎么排查",
+        "帮我看看",
+        "帮忙分析",
+        "说说",
+        "讲讲",
+    )
+    BRIEF_REPLY_SENTENCE_ENDINGS = "。！？!?；;~"
+    BRIEF_REPLY_CLAUSE_BREAKS = "，、；：,;: "
+    BRIEF_REPLY_CLOSING_CHARS = "\"'”’」』】）》〕）]"
+    BRIEF_REPLY_OPENING_CHARS = "“‘「『【《（〔(["
+    BRIEF_REPLY_TAIL_CONNECTORS = (
+        "但是",
+        "不过",
+        "所以",
+        "因此",
+        "然后",
+        "而且",
+        "并且",
+        "如果",
+        "要是",
+        "因为",
+        "于是",
+        "只是",
+        "或者",
+        "以及",
+        "还是",
+        "就是",
+        "并",
+        "且",
+        "但",
+    )
 
     @staticmethod
     async def generate_reply(
@@ -453,7 +509,20 @@ class ReplyHandler:
                     if enable_final_decision_gate:
                         logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
                     event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
-                    reply_result = event.chain_result(result_chain.chain)
+                    if plain_text and not has_non_text_component:
+                        brief_text = ReplyHandler._apply_group_chat_brevity_limit(
+                            event, plain_text
+                        )
+                        if brief_text != plain_text:
+                            logger.info(
+                                f"[群聊短回复限制] 已裁剪回复长度: {len(plain_text)} -> {len(brief_text)} 字符"
+                            )
+                            if DEBUG_MODE:
+                                logger.info(f"  原回复: {plain_text[:120]}")
+                                logger.info(f"  裁剪后: {brief_text[:120]}")
+                        reply_result = event.plain_result(brief_text)
+                    else:
+                        reply_result = event.chain_result(result_chain.chain)
                     reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
                     return reply_result
 
@@ -467,8 +536,18 @@ class ReplyHandler:
                     return None
                 if enable_final_decision_gate:
                     logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
+                brief_text = ReplyHandler._apply_group_chat_brevity_limit(
+                    event, completion_text
+                )
+                if brief_text != completion_text:
+                    logger.info(
+                        f"[群聊短回复限制] 已裁剪回复长度: {len(completion_text)} -> {len(brief_text)} 字符"
+                    )
+                    if DEBUG_MODE:
+                        logger.info(f"  原回复: {completion_text[:120]}")
+                        logger.info(f"  裁剪后: {brief_text[:120]}")
                 event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
-                reply_result = event.plain_result(completion_text)
+                reply_result = event.plain_result(brief_text)
                 reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
                 return reply_result
 
@@ -496,6 +575,228 @@ class ReplyHandler:
             ReplyHandler._normalize_final_gate_text(text)
             == ReplyHandler.MAIN_MODEL_FINAL_GATE_NO_REPLY
         )
+
+    @staticmethod
+    def _collapse_reply_text(text: str) -> str:
+        return " ".join(str(text or "").replace("\u3000", " ").split())
+
+    @staticmethod
+    def _is_explicit_long_form_request(user_message: str) -> bool:
+        normalized = ReplyHandler._collapse_reply_text(user_message)
+        if len(normalized) < 12:
+            return False
+        return any(
+            keyword in normalized
+            for keyword in ReplyHandler.BRIEF_REPLY_LONG_FORM_KEYWORDS
+        )
+
+    @staticmethod
+    def _scan_reply_breaks(text: str) -> list[tuple[int, str]]:
+        normalized = ReplyHandler._collapse_reply_text(text)
+        if not normalized:
+            return []
+
+        breaks: list[tuple[int, str]] = []
+        idx = 0
+        text_len = len(normalized)
+        while idx < text_len:
+            ch = normalized[idx]
+            if ch in ReplyHandler.BRIEF_REPLY_SENTENCE_ENDINGS:
+                cut_pos = idx + 1
+                while (
+                    cut_pos < text_len
+                    and normalized[cut_pos] in ReplyHandler.BRIEF_REPLY_CLOSING_CHARS
+                ):
+                    cut_pos += 1
+                breaks.append((cut_pos, "sentence"))
+            elif ch == "…":
+                cut_pos = idx + 1
+                while cut_pos < text_len and normalized[cut_pos] == "…":
+                    cut_pos += 1
+                while (
+                    cut_pos < text_len
+                    and normalized[cut_pos] in ReplyHandler.BRIEF_REPLY_CLOSING_CHARS
+                ):
+                    cut_pos += 1
+                breaks.append((cut_pos, "sentence"))
+                idx = cut_pos - 1
+            elif ch in ReplyHandler.BRIEF_REPLY_CLAUSE_BREAKS:
+                breaks.append((idx + 1, "clause"))
+            idx += 1
+
+        return breaks
+
+    @staticmethod
+    def _collect_reply_sentences(text: str) -> list[str]:
+        normalized = ReplyHandler._collapse_reply_text(text)
+        if not normalized:
+            return []
+
+        collected: list[str] = []
+        start = 0
+        for cut_pos, break_type in ReplyHandler._scan_reply_breaks(normalized):
+            if break_type != "sentence":
+                continue
+            segment = normalized[start:cut_pos].strip()
+            if segment:
+                collected.append(segment)
+            start = cut_pos
+
+        tail = normalized[start:].strip()
+        if tail:
+            collected.append(tail)
+
+        return collected
+
+    @staticmethod
+    def _take_leading_sentences(text: str, max_sentences: int) -> str:
+        if max_sentences <= 0:
+            return ReplyHandler._collapse_reply_text(text)
+
+        collected = ReplyHandler._collect_reply_sentences(text)
+        if not collected:
+            return ReplyHandler._collapse_reply_text(text)
+        return ReplyHandler._collapse_reply_text(" ".join(collected[:max_sentences]))
+
+    @staticmethod
+    def _guess_trimmed_reply_suffix(
+        trimmed: str, original_text: str, cut_pos: int
+    ) -> str:
+        normalized_tail = ReplyHandler._collapse_reply_text(original_text[cut_pos:])
+        if (
+            "？" in normalized_tail[:6]
+            or "?" in normalized_tail[:6]
+            or trimmed.endswith(("吗", "么", "嘛", "呢"))
+        ):
+            return "？"
+        if "！" in normalized_tail[:6] or "!" in normalized_tail[:6]:
+            return "！"
+        return "。"
+
+    @staticmethod
+    def _polish_trimmed_reply(
+        trimmed: str, original_text: str, cut_pos: int, from_hard_cut: bool
+    ) -> str:
+        polished = ReplyHandler._collapse_reply_text(trimmed).rstrip(
+            ReplyHandler.BRIEF_REPLY_CLAUSE_BREAKS
+        )
+        while polished and polished[-1] in ReplyHandler.BRIEF_REPLY_OPENING_CHARS:
+            polished = polished[:-1].rstrip()
+
+        connector_trimmed = True
+        while polished and connector_trimmed:
+            connector_trimmed = False
+            for suffix in ReplyHandler.BRIEF_REPLY_TAIL_CONNECTORS:
+                if polished.endswith(suffix) and len(polished) > len(suffix) + 1:
+                    polished = polished[: -len(suffix)].rstrip(
+                        ReplyHandler.BRIEF_REPLY_CLAUSE_BREAKS
+                    )
+                    connector_trimmed = True
+                    break
+
+        if not polished:
+            polished = ReplyHandler._collapse_reply_text(original_text[:cut_pos]).strip()
+
+        needs_suffix = (
+            bool(polished)
+            and cut_pos < len(ReplyHandler._collapse_reply_text(original_text))
+            and polished[-1]
+            not in (
+                ReplyHandler.BRIEF_REPLY_SENTENCE_ENDINGS
+                + ReplyHandler.BRIEF_REPLY_CLAUSE_BREAKS
+            )
+            and from_hard_cut
+        )
+        if needs_suffix and len(polished) >= 4:
+            polished += ReplyHandler._guess_trimmed_reply_suffix(
+                polished, original_text, cut_pos
+            )
+
+        return polished.strip()
+
+    @staticmethod
+    def _trim_reply_by_clause(text: str, max_chars: int) -> str:
+        normalized = ReplyHandler._collapse_reply_text(text)
+        if len(normalized) <= max_chars:
+            return normalized
+
+        min_keep = min(ReplyHandler.BRIEF_REPLY_MIN_KEEP, max_chars)
+        overrun_limit = min(
+            len(normalized), max_chars + ReplyHandler.BRIEF_REPLY_SOFT_OVERRUN
+        )
+        breaks = ReplyHandler._scan_reply_breaks(normalized)
+
+        def _pick_forward(preferred_type: str) -> int:
+            for cut_pos, break_type in breaks:
+                if break_type != preferred_type:
+                    continue
+                if max_chars <= cut_pos <= overrun_limit:
+                    return cut_pos
+            return -1
+
+        def _pick_backward(preferred_type: str, allow_short: bool = False) -> int:
+            cut_pos = -1
+            lower_bound = 1 if allow_short else min_keep
+            for break_pos, break_type in breaks:
+                if break_type != preferred_type:
+                    continue
+                if lower_bound <= break_pos <= max_chars:
+                    cut_pos = break_pos
+            return cut_pos
+
+        cut_pos = _pick_forward("sentence")
+        if cut_pos == -1:
+            cut_pos = _pick_forward("clause")
+        if cut_pos == -1:
+            cut_pos = _pick_backward("sentence")
+        if cut_pos == -1:
+            cut_pos = _pick_backward("clause")
+        if cut_pos == -1:
+            cut_pos = _pick_backward("sentence", allow_short=True)
+        if cut_pos == -1:
+            cut_pos = _pick_backward("clause", allow_short=True)
+
+        from_hard_cut = cut_pos == -1
+        if from_hard_cut:
+            cut_pos = max_chars
+
+        trimmed = normalized[:cut_pos].strip()
+        return ReplyHandler._polish_trimmed_reply(
+            trimmed, normalized, cut_pos, from_hard_cut=from_hard_cut
+        )
+
+    @staticmethod
+    def _apply_group_chat_brevity_limit(
+        event: AstrMessageEvent, reply_text: str
+    ) -> str:
+        if not reply_text:
+            return ""
+        if event.is_private_chat():
+            return ReplyHandler._collapse_reply_text(reply_text)
+
+        effect_context = event.get_extra(PLUGIN_REPLY_EFFECT_CONTEXT, {}) or {}
+        user_message = (
+            effect_context.get("message_text") or event.get_message_str() or ""
+        )
+        is_direct = bool(getattr(event, "is_at_or_wake_command", False))
+        explicit_long_form = is_direct and ReplyHandler._is_explicit_long_form_request(
+            user_message
+        )
+
+        max_sentences = (
+            ReplyHandler.BRIEF_REPLY_MAX_SENTENCES_EXPLICIT
+            if explicit_long_form
+            else ReplyHandler.BRIEF_REPLY_MAX_SENTENCES_DEFAULT
+        )
+        max_chars = ReplyHandler.BRIEF_REPLY_MAX_CHARS_DEFAULT
+        if is_direct:
+            max_chars = ReplyHandler.BRIEF_REPLY_MAX_CHARS_DIRECT
+        if explicit_long_form:
+            max_chars = ReplyHandler.BRIEF_REPLY_MAX_CHARS_EXPLICIT
+
+        shortened = ReplyHandler._take_leading_sentences(reply_text, max_sentences)
+        shortened = ReplyHandler._trim_reply_by_clause(shortened, max_chars)
+        return shortened.strip()
 
     @staticmethod
     def _llm_response_has_sendable_content(llm_resp: object | None) -> bool:

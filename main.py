@@ -6988,16 +6988,21 @@ class ChatPlus(Star):
 
         fatigue_level = (conversation_fatigue_info or {}).get("fatigue_level", "none")
         if fatigue_level == "heavy":
-            pace_text = "尽量简短收尾"
+            pace_text = "尽量一句话简短收尾"
         elif fatigue_level == "medium":
-            pace_text = "可适当收尾"
+            pace_text = "优先短句，可顺势收尾"
+        elif is_at_message:
+            pace_text = "优先一句短句回应，必要时再补半句"
+        elif has_trigger_keyword:
+            pace_text = "尽量短句接话，别展开"
         else:
-            pace_text = "正常推进"
+            pace_text = "群聊短句优先，能几个词说完就别展开"
 
         return (
             "\n\n[系统信息-回复状态]\n"
             f"- 触发来源: {trigger_text}\n"
             f"- 对话节奏: {pace_text}\n"
+            "- 默认一句短句即可，除非对方明确要求详细解释。\n"
             "- 直接自然回应当前发送者，不要解释你为什么会回复。\n"
         )
 
