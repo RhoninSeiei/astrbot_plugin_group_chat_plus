@@ -74,12 +74,14 @@ import random
 import time
 from datetime import datetime
 import copy
+import difflib
 import sys
 import hashlib
 import asyncio
 import json
 import os
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import List, Optional
 from collections import OrderedDict
@@ -1298,6 +1300,28 @@ class ChatPlus(Star):
         self.duplicate_filter_time_limit = min(
             max(60, _raw_time_limit), self._DUPLICATE_TIME_LIMIT_MAX
         )  # 重复检测时效(秒)（60-7200）
+        self.enable_duplicate_similarity_filter = config.get(
+            "enable_duplicate_similarity_filter", True
+        )  # 启用近似重复检测（隐藏高级配置）
+        _raw_similarity_threshold = config.get("duplicate_similarity_threshold", 0.84)
+        try:
+            _raw_similarity_threshold = float(_raw_similarity_threshold)
+        except Exception:
+            _raw_similarity_threshold = 0.84
+        self.duplicate_similarity_threshold = min(
+            max(0.75, _raw_similarity_threshold), 0.98
+        )  # 近似重复阈值（0.75-0.98）
+        _raw_similarity_min_length = config.get(
+            "duplicate_similarity_min_length", 8
+        )
+        try:
+            _raw_similarity_min_length = int(_raw_similarity_min_length)
+        except Exception:
+            _raw_similarity_min_length = 8
+        self.duplicate_similarity_min_length = min(
+            max(4, _raw_similarity_min_length), 50
+        )  # 近似重复最小文本长度（4-50）
+        self._duplicate_similarity_recent_limit = 2  # 仅额外检查最近两条近似回复
 
         # === 私信功能开关 ===
         self.enable_private_chat = config.get(
@@ -2110,6 +2134,9 @@ class ChatPlus(Star):
             "duplicate_filter_check_count": self.duplicate_filter_check_count,
             "enable_duplicate_time_limit": self.enable_duplicate_time_limit,
             "duplicate_filter_time_limit": self.duplicate_filter_time_limit,
+            "enable_duplicate_similarity_filter": self.enable_duplicate_similarity_filter,
+            "duplicate_similarity_threshold": self.duplicate_similarity_threshold,
+            "duplicate_similarity_min_length": self.duplicate_similarity_min_length,
             # 🆕 v1.2.0: AI回复内容过滤配置（传递给主动对话管理器）
             "enable_output_content_filter": self.enable_output_content_filter,
             "output_content_filter_rules": self.output_content_filter_rules,
@@ -5437,7 +5464,7 @@ class ChatPlus(Star):
             if isinstance(reply_result, str):
                 reply_text = reply_result.strip()
 
-        # 重复判断标准：严格字符串一致（不做大小写、标点等归一化，仅移除首尾空白）
+        # 重复判断标准：完全相同 / 归一化后相同 / 最近两条高度相似
 
         # 检查1: 回复是否与用户消息相同（防止直接转发）
         # 仅对字符串型即时回复进行检查；LLM结果在装饰阶段处理
@@ -5475,51 +5502,23 @@ class ChatPlus(Star):
         # 🔧 重要：重复检测只拦截发送，不影响后续流程（概率调整、注意力记录等）
         is_duplicate_blocked = False
         if reply_text and not is_provider_request and self.enable_duplicate_filter:
-            # 获取或初始化该会话的回复缓存
-            if chat_id not in self.recent_replies_cache:
-                self.recent_replies_cache[chat_id] = []
-
-            current_time = time.time()
-
-            # 根据配置决定是否启用时效性过滤
-            if self.enable_duplicate_time_limit:
-                # 清理过期的回复记录（使用配置的时效）
-                time_limit = max(60, self.duplicate_filter_time_limit)  # 最少60秒
-                self.recent_replies_cache[chat_id] = [
-                    reply
-                    for reply in self.recent_replies_cache[chat_id]
-                    if current_time - reply.get("timestamp", 0) < time_limit
-                ]
-
-            # 检查是否与最近N条回复重复（使用配置的条数，严格全等匹配）
-            check_count = max(1, self.duplicate_filter_check_count)  # 最少检查1条
-            for recent_reply in self.recent_replies_cache[chat_id][-check_count:]:
-                recent_content = recent_reply.get("content", "")
-                recent_timestamp = recent_reply.get("timestamp", 0)
-
-                # 如果启用时效性判断，检查消息是否在时效内
-                if self.enable_duplicate_time_limit:
-                    time_limit = max(60, self.duplicate_filter_time_limit)
-                    if current_time - recent_timestamp >= time_limit:
-                        continue  # 超过时效，跳过此条
-
-                if recent_content and reply_text == recent_content.strip():
-                    logger.info(
-                        "[消息过滤]回复与最近发送的回复重复，已拦截发送（后续流程继续执行）"
+            duplicate_match = self._match_recent_duplicate_reply(chat_id, reply_text)
+            if duplicate_match:
+                recent_content = duplicate_match.get("recent_content", "")
+                reason_label = self._format_duplicate_match_reason(duplicate_match)
+                logger.info(
+                    f"[消息过滤]回复与最近发送的回复{reason_label}，已拦截发送（后续流程继续执行）"
+                )
+                if self.debug_mode:
+                    logger.warning(
+                        f"🚫 [消息过滤] 检测到回复与最近发送的回复{reason_label}，跳过发送\n"
+                        f"  最近回复: {recent_content[:100]}...\n"
+                        f"  当前回复: {reply_text[:100]}..."
                     )
-                    if self.debug_mode:
-                        logger.warning(
-                            f"🚫 [消息过滤] 检测到回复与最近发送的回复重复，跳过发送\n"
-                            f"  最近回复: {recent_content[:100]}...\n"
-                            f"  当前回复: {reply_text[:100]}..."
-                        )
-                    else:
-                        # 非debug模式下也显示部分信息
-                        logger.info(f"  最近回复: {recent_content[:50]}...")
-                        logger.info(f"  当前回复: {reply_text[:50]}...")
-                    # 🔧 设置标记，跳过发送但继续后续流程
-                    is_duplicate_blocked = True
-                    break
+                else:
+                    logger.info(f"  最近回复: {recent_content[:50]}...")
+                    logger.info(f"  当前回复: {reply_text[:50]}...")
+                is_duplicate_blocked = True
 
         # 发送回复
         # 🔧 如果是重复消息，跳过发送但继续后续流程
@@ -7494,64 +7493,42 @@ class ChatPlus(Star):
             # 🔧 重要：重复检测必须在错字模拟之前执行，基于原始内容检测
             # 清理过期缓存并进行重复检查（使用可配置参数）
             if self.enable_duplicate_filter:
-                now_ts = time.time()
-                if chat_id not in self.recent_replies_cache:
-                    self.recent_replies_cache[chat_id] = []
-
-                # 根据配置决定是否启用时效性过滤
-                if self.enable_duplicate_time_limit:
-                    time_limit = max(60, self.duplicate_filter_time_limit)
-                    self.recent_replies_cache[chat_id] = [
-                        r
-                        for r in self.recent_replies_cache[chat_id]
-                        if now_ts - r.get("timestamp", 0) < time_limit
-                    ]
-
-                # 检查是否与最近N条回复重复（使用配置的条数）
-                check_count = max(1, self.duplicate_filter_check_count)
-                for recent in self.recent_replies_cache[chat_id][-check_count:]:
-                    recent_content = recent.get("content", "")
-                    recent_timestamp = recent.get("timestamp", 0)
-
-                    # 如果启用时效性判断，检查消息是否在时效内
-                    if self.enable_duplicate_time_limit:
-                        time_limit = max(60, self.duplicate_filter_time_limit)
-                        if now_ts - recent_timestamp >= time_limit:
-                            continue  # 超过时效，跳过此条
-
-                    if recent_content and reply_text == recent_content.strip():
-                        logger.warning(
-                            f"🚫 [装饰阶段过滤] 检测到与最近回复重复，跳过发送（后续流程继续执行）\n"
-                            f"  最近回复: {recent_content[:100]}...\n"
-                            f"  当前回复: {reply_text[:100]}..."
-                        )
+                duplicate_match = self._match_recent_duplicate_reply(chat_id, reply_text)
+                if duplicate_match:
+                    recent_content = duplicate_match.get("recent_content", "")
+                    reason_label = self._format_duplicate_match_reason(duplicate_match)
+                    logger.warning(
+                        f"🚫 [装饰阶段过滤] 检测到与最近回复{reason_label}，跳过发送（后续流程继续执行）\n"
+                        f"  最近回复: {recent_content[:100]}...\n"
+                        f"  当前回复: {reply_text[:100]}..."
+                    )
+                    logger.info(
+                        f"[装饰阶段] 正在清空event.result以阻止发送（注意：清空后 after_message_sent 不会被框架调用，processing_sessions 由 on_group_message 的 finally 块清理）"
+                    )
+                    # 清空结果以阻止发送
+                    event.clear_result()
+                    # 🔧 标记为重复拦截（由 on_group_message 的 finally 块统一清理）
+                    self._duplicate_blocked_messages[message_id] = True
+                    if message_id in self.raw_reply_cache:
+                        del self.raw_reply_cache[message_id]
+                    if self.debug_mode:
                         logger.info(
-                            f"[装饰阶段] 正在清空event.result以阻止发送（注意：清空后 after_message_sent 不会被框架调用，processing_sessions 由 on_group_message 的 finally 块清理）"
+                            f"[装饰阶段] 已标记消息为重复拦截: {message_id[:30]}...（将跳过AI消息保存，但保存用户消息）"
                         )
-                        # 清空结果以阻止发送
-                        event.clear_result()
-                        # 🔧 标记为重复拦截（由 on_group_message 的 finally 块统一清理）
-                        self._duplicate_blocked_messages[message_id] = True
-                        if message_id in self.raw_reply_cache:
-                            del self.raw_reply_cache[message_id]
-                        if self.debug_mode:
-                            logger.info(
-                                f"[装饰阶段] 已标记消息为重复拦截: {message_id[:30]}...（将跳过AI消息保存，但保存用户消息）"
-                            )
 
-                        # 🔧 修复：重复拦截后 after_message_sent 不会被框架调用
-                        # 因此需要在此处直接保存用户消息和缓存消息到官方对话系统
-                        # 否则这些消息永远不会被保存，导致上下文逐渐脱节
-                        try:
-                            await self._save_user_messages_on_duplicate_block(
-                                event, message_id, chat_id
-                            )
-                        except Exception as save_err:
-                            logger.warning(
-                                f"[装饰阶段] 重复拦截后保存用户消息失败: {save_err}"
-                            )
+                    # 🔧 修复：重复拦截后 after_message_sent 不会被框架调用
+                    # 因此需要在此处直接保存用户消息和缓存消息到官方对话系统
+                    # 否则这些消息永远不会被保存，导致上下文逐渐脱节
+                    try:
+                        await self._save_user_messages_on_duplicate_block(
+                            event, message_id, chat_id
+                        )
+                    except Exception as save_err:
+                        logger.warning(
+                            f"[装饰阶段] 重复拦截后保存用户消息失败: {save_err}"
+                        )
 
-                        return
+                    return
 
             # 🔧 修复竞态条件：通过重复检测后，立即写入 recent_replies_cache
             # 原来的逻辑是在 after_message_sent 中才写入，但此时消息已经发送
@@ -8766,6 +8743,133 @@ class ChatPlus(Star):
             return s2[i:]
         except Exception:
             return ""
+
+
+    def _normalize_reply_for_duplicate_check(self, text: str) -> str:
+        """
+        对回复文本做去重归一化：
+        - NFKC 归一化
+        - 忽略大小写
+        - 去掉空白、标点、控制字符
+
+        这样可以把“几乎一样，只差标点/空格”的回复也识别为重复。
+        """
+        try:
+            normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+            cleaned_chars = []
+            for ch in normalized:
+                category = unicodedata.category(ch)
+                if category.startswith(("Z", "P", "C")):
+                    continue
+                cleaned_chars.append(ch)
+            return "".join(cleaned_chars).strip()
+        except Exception:
+            return ""
+
+    def _match_recent_duplicate_reply(self, chat_id, reply_text: str):
+        """
+        检查当前回复是否与最近回复重复。
+
+        返回 dict 表示命中：
+        - kind: exact / normalized / similar
+        - score: 相似度分数
+        - recent_content: 命中的最近回复内容
+        """
+        try:
+            reply_text = (reply_text or "").strip()
+            if not reply_text:
+                return None
+
+            if chat_id not in self.recent_replies_cache:
+                self.recent_replies_cache[chat_id] = []
+
+            current_time = time.time()
+
+            if self.enable_duplicate_time_limit:
+                time_limit = max(60, self.duplicate_filter_time_limit)
+                self.recent_replies_cache[chat_id] = [
+                    reply
+                    for reply in self.recent_replies_cache[chat_id]
+                    if current_time - reply.get("timestamp", 0) < time_limit
+                ]
+
+            recent_replies = self.recent_replies_cache.get(chat_id, [])
+            if not recent_replies:
+                return None
+
+            check_count = max(1, self.duplicate_filter_check_count)
+            recent_slice = recent_replies[-check_count:]
+            similarity_start_index = max(
+                0, len(recent_slice) - self._duplicate_similarity_recent_limit
+            )
+            normalized_current = self._normalize_reply_for_duplicate_check(reply_text)
+
+            for idx, recent_reply in enumerate(recent_slice):
+                recent_content = (recent_reply.get("content", "") or "").strip()
+                recent_timestamp = recent_reply.get("timestamp", 0)
+
+                if not recent_content:
+                    continue
+
+                if self.enable_duplicate_time_limit:
+                    time_limit = max(60, self.duplicate_filter_time_limit)
+                    if current_time - recent_timestamp >= time_limit:
+                        continue
+
+                if reply_text == recent_content:
+                    return {
+                        "kind": "exact",
+                        "score": 1.0,
+                        "recent_content": recent_content,
+                    }
+
+                normalized_recent = self._normalize_reply_for_duplicate_check(
+                    recent_content
+                )
+                if (
+                    normalized_current
+                    and normalized_recent
+                    and normalized_current == normalized_recent
+                ):
+                    return {
+                        "kind": "normalized",
+                        "score": 1.0,
+                        "recent_content": recent_content,
+                    }
+
+                if not self.enable_duplicate_similarity_filter:
+                    continue
+                if idx < similarity_start_index:
+                    continue
+                if not normalized_current or not normalized_recent:
+                    continue
+                if len(normalized_current) < self.duplicate_similarity_min_length:
+                    continue
+                if len(normalized_recent) < self.duplicate_similarity_min_length:
+                    continue
+
+                similarity = difflib.SequenceMatcher(
+                    None, normalized_current, normalized_recent
+                ).ratio()
+                if similarity >= self.duplicate_similarity_threshold:
+                    return {
+                        "kind": "similar",
+                        "score": similarity,
+                        "recent_content": recent_content,
+                    }
+        except Exception as e:
+            logger.warning(f"[重复检测] 近似重复判断失败: {e}")
+
+        return None
+
+    def _format_duplicate_match_reason(self, match: dict) -> str:
+        kind = (match or {}).get("kind", "")
+        score = float((match or {}).get("score", 0.0) or 0.0)
+        if kind == "normalized":
+            return "归一化后相同"
+        if kind == "similar":
+            return f"高度相似(相似度={score:.2f})"
+        return "完全相同"
 
     def _is_command_message(self, event: AstrMessageEvent) -> bool:
         """
