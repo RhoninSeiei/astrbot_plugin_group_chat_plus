@@ -2201,6 +2201,65 @@ class ContextManager:
             return False
 
     @staticmethod
+    def _decode_official_history_value(raw_value, source_name: str) -> list:
+        """将官方对话历史统一解码为列表，兼容历史上的双重编码字符串。"""
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            return list(raw_value)
+
+        value = raw_value
+        decode_count = 0
+        while isinstance(value, str) and decode_count < 2:
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError) as parse_err:
+                logger.warning(
+                    f"[官方保存] 解析 {source_name} 失败: {parse_err}，将使用空历史继续"
+                )
+                return []
+            decode_count += 1
+
+        if isinstance(value, list):
+            if decode_count >= 2:
+                logger.warning(
+                    f"[官方保存] 检测到 {source_name} 为双重编码字符串，已自动纠正为列表"
+                )
+            return value
+
+        if isinstance(value, dict):
+            logger.warning(
+                f"[官方保存] 检测到 {source_name} 为单条消息字典，已包装为列表"
+            )
+            return [value]
+
+        logger.warning(
+            f"[官方保存] {source_name} 解码后类型异常: {type(value).__name__}，将使用空历史继续"
+        )
+        return []
+
+    @staticmethod
+    def _extract_official_history_list(conversation) -> list:
+        """从官方对话对象中提取可写入的历史列表。"""
+        if not conversation:
+            return []
+
+        for field_name in ("content", "history"):
+            raw_value = getattr(conversation, field_name, None)
+            if raw_value is None:
+                continue
+            history_list = ContextManager._decode_official_history_value(
+                raw_value, f"conversation.{field_name}"
+            )
+            if history_list or raw_value in ([], "[]"):
+                return history_list
+
+        return []
+
+    @staticmethod
     async def save_to_official_conversation(
         event: AstrMessageEvent, user_message: str, bot_message: str, context: "Context"
     ) -> bool:
@@ -2266,10 +2325,7 @@ class ContextManager:
             )
 
             # 5. 构建完整的历史列表（包含已有历史+新消息）
-            if conversation and conversation.content:
-                history_list = conversation.content
-            else:
-                history_list = []
+            history_list = ContextManager._extract_official_history_list(conversation)
 
             if DEBUG_MODE:
                 logger.info(f"[官方保存] 当前对话有 {len(history_list)} 条历史消息")
@@ -2318,6 +2374,14 @@ class ContextManager:
             是否成功
         """
         try:
+            if not isinstance(history_list, list):
+                logger.warning(
+                    f"[官方保存] history_list 类型异常: {type(history_list).__name__}，将先尝试纠正"
+                )
+                history_list = ContextManager._decode_official_history_value(
+                    history_list, "history_list"
+                )
+
             # 扩展的方法列表（完全按照旧插件）
             methods = [
                 "update_conversation",  # 这是正确的主要保存方法
@@ -2355,15 +2419,23 @@ class ContextManager:
             # 优先尝试以列表直接保存（按照旧插件的方式）
             for m in methods:
                 if hasattr(cm, m):
-                    # 尝试位置参数+列表
+                    save_func = getattr(cm, m)
+
                     try:
                         if DEBUG_MODE:
                             logger.info(
                                 f"[官方保存] >>> 尝试 {m} 使用列表参数，历史长度={len(history_list)}"
                             )
-                        await getattr(cm, m)(
-                            unified_msg_origin, conversation_id, history_list
-                        )
+                        if m == "update_conversation":
+                            await save_func(
+                                unified_msg_origin,
+                                conversation_id=conversation_id,
+                                history=history_list,
+                            )
+                        else:
+                            await save_func(
+                                unified_msg_origin, conversation_id, history_list
+                            )
 
                         logger.info(f"✅ [官方保存] {m} 成功（列表）")
 
@@ -2386,27 +2458,10 @@ class ContextManager:
 
                         return True
                     except TypeError as te:
-                        # 参数类型不匹配，尝试字符串格式
                         if DEBUG_MODE:
                             logger.info(f"[官方保存] {m} 列表参数类型不匹配: {te}")
                     except Exception as e:
                         logger.warning(f"[官方保存] {m}（列表）失败: {e}")
-
-                    # 尝试字符串格式
-                    try:
-                        history_str = json.dumps(history_list, ensure_ascii=False)
-                        if DEBUG_MODE:
-                            logger.info(
-                                f"[官方保存] >>> 尝试 {m} 使用字符串参数，长度={len(history_str)}"
-                            )
-                        await getattr(cm, m)(
-                            unified_msg_origin, conversation_id, history_str
-                        )
-
-                        logger.info(f"✅ [官方保存] {m} 成功（字符串）")
-                        return True
-                    except Exception as e2:
-                        logger.warning(f"[官方保存] {m}（字符串）失败: {e2}")
 
             logger.error(
                 f"❌ [官方保存] 所有保存方法均失败！消息可能未保存到官方系统！"
@@ -2565,21 +2620,11 @@ class ContextManager:
                 conversation = None
 
             # 5. 构建完整的历史列表
-            if conversation and conversation.history:
-                # history是JSON字符串，需要解析
-                try:
-                    history_list = json.loads(conversation.history)
-                    if DEBUG_MODE:
-                        logger.info(
-                            f"[官方保存+缓存转正] 解析历史记录成功: {len(history_list)} 条"
-                        )
-                except (json.JSONDecodeError, TypeError) as parse_err:
-                    logger.warning(f"[官方保存+缓存转正] 解析历史记录失败: {parse_err}")
-                    history_list = []
-            else:
-                if DEBUG_MODE:
-                    logger.info(f"[官方保存+缓存转正] 对话历史为空，从头开始")
-                history_list = []
+            history_list = ContextManager._extract_official_history_list(conversation)
+            if DEBUG_MODE:
+                logger.info(
+                    f"[官方保存+缓存转正] 当前对话解析后历史记录: {len(history_list)} 条"
+                )
 
             # 6. 添加需要转正的缓存消息（去重）
             cache_converted = 0
