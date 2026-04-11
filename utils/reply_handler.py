@@ -11,6 +11,7 @@ v1.2.0 更新：
 """
 
 import asyncio
+import re
 
 from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
@@ -153,6 +154,12 @@ class ReplyHandler:
     # 系统回复提示词的结束指令（单独分离，用于插入自定义提示词）
     SYSTEM_REPLY_PROMPT_ENDING = "\n请开始回复：\n"
     MAIN_MODEL_FINAL_GATE_NO_REPLY = "[[NO_REPLY]]"
+    MAIN_MODEL_FINAL_GATE_SENTINEL_RE = re.compile(
+        r"(?i)(\[\[\s*NO[\s_-]*REPLY\s*\]\]|\[\s*NO[\s_-]*REPLY\s*\]|(?<!\w)NO[\s_-]*REPLY(?!\w))"
+    )
+    MAIN_MODEL_FINAL_GATE_META_RE = re.compile(
+        r"(?i)(无需回复|不需要回复|没必要回复|不用回复|不回复|无需回应|不用回应|保持沉默|跳过|理由|解释|no[\s_-]*reply)"
+    )
     MAIN_MODEL_FINAL_GATE_PROMPT = f"""
 
 [最终回复判断]
@@ -510,6 +517,27 @@ class ReplyHandler:
                         logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
                     event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
                     if plain_text and not has_non_text_component:
+                        if ReplyHandler._contains_final_gate_sentinel(plain_text):
+                            sanitized_text = ReplyHandler._strip_final_gate_sentinel(
+                                plain_text
+                            )
+                            if (
+                                not sanitized_text
+                                or ReplyHandler._looks_like_final_gate_meta(
+                                    sanitized_text
+                                )
+                            ):
+                                logger.warning(
+                                    "[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送"
+                                )
+                                event.set_extra(
+                                    PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True
+                                )
+                                return None
+                            logger.warning(
+                                "[主模型最终判断] 检测到 NO_REPLY 残留，发送前已清理"
+                            )
+                            plain_text = sanitized_text
                         brief_text = ReplyHandler._apply_group_chat_brevity_limit(
                             event, plain_text
                         )
@@ -536,6 +564,25 @@ class ReplyHandler:
                     return None
                 if enable_final_decision_gate:
                     logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
+                    if ReplyHandler._contains_final_gate_sentinel(completion_text):
+                        sanitized_text = ReplyHandler._strip_final_gate_sentinel(
+                            completion_text
+                        )
+                        if (
+                            not sanitized_text
+                            or ReplyHandler._looks_like_final_gate_meta(sanitized_text)
+                        ):
+                            logger.warning(
+                                "[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送"
+                            )
+                            event.set_extra(
+                                PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True
+                            )
+                            return None
+                        logger.warning(
+                            "[主模型最终判断] 检测到 NO_REPLY 残留，发送前已清理"
+                        )
+                        completion_text = sanitized_text
                 brief_text = ReplyHandler._apply_group_chat_brevity_limit(
                     event, completion_text
                 )
@@ -565,16 +612,43 @@ class ReplyHandler:
     def _normalize_final_gate_text(text: str) -> str:
         normalized = (text or "").strip()
         if normalized.startswith("```") and normalized.endswith("```"):
-            normalized = normalized.strip("`").strip()
+            lines = normalized.splitlines()
+            if len(lines) >= 2:
+                normalized = "\n".join(lines[1:-1]).strip()
+            else:
+                normalized = normalized.strip("`").strip()
         normalized = normalized.strip().strip('\"').strip("'").strip()
         return normalized
 
     @staticmethod
+    def _contains_final_gate_sentinel(text: str) -> bool:
+        normalized = ReplyHandler._normalize_final_gate_text(text)
+        return bool(ReplyHandler.MAIN_MODEL_FINAL_GATE_SENTINEL_RE.search(normalized))
+
+    @staticmethod
+    def _strip_final_gate_sentinel(text: str) -> str:
+        normalized = ReplyHandler._normalize_final_gate_text(text)
+        stripped = ReplyHandler.MAIN_MODEL_FINAL_GATE_SENTINEL_RE.sub(" ", normalized)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        stripped = stripped.strip("`'\"[](){}<>")
+        stripped = stripped.strip(" \t\r\n,，.。!！?？:：;；-_")
+        return stripped.strip()
+
+    @staticmethod
+    def _looks_like_final_gate_meta(text: str) -> bool:
+        normalized = ReplyHandler._strip_final_gate_sentinel(text)
+        if not normalized:
+            return True
+        return bool(ReplyHandler.MAIN_MODEL_FINAL_GATE_META_RE.search(normalized))
+
+    @staticmethod
     def _is_final_gate_decline(text: str) -> bool:
-        return (
-            ReplyHandler._normalize_final_gate_text(text)
-            == ReplyHandler.MAIN_MODEL_FINAL_GATE_NO_REPLY
-        )
+        normalized = ReplyHandler._normalize_final_gate_text(text)
+        if normalized == ReplyHandler.MAIN_MODEL_FINAL_GATE_NO_REPLY:
+            return True
+        if not ReplyHandler._contains_final_gate_sentinel(normalized):
+            return False
+        return not ReplyHandler._strip_final_gate_sentinel(normalized)
 
     @staticmethod
     def _collapse_reply_text(text: str) -> str:

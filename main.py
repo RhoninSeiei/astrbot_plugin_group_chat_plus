@@ -10108,3 +10108,7 @@ class ChatPlus(Star):
             )
 
         return should_process
+
+
+class Main(ChatPlus):
+    """兼容旧版插件载入器的入口类别名。"""
