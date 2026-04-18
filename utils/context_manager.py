@@ -160,6 +160,58 @@ class ContextManager:
         return ContextManager._history_cutoff_timestamps.get(chat_id, 0)
 
     @staticmethod
+    def normalize_message_content(content: Any) -> str:
+        """
+        将字符串、官方多模态 content 列表或组件字典统一归一化为纯文本
+
+        归一化规则：
+        1. 文本组件提取 text/data.text
+        2. 图片组件保留为 [图片] 占位
+        3. 其他结构递归提取可识别文本
+        """
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="ignore")
+
+        if isinstance(content, list):
+            parts = [
+                ContextManager.normalize_message_content(item)
+                for item in content
+            ]
+            return "".join(part for part in parts if part)
+
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text is not None:
+                return ContextManager.normalize_message_content(text)
+
+            data = content.get("data")
+            if isinstance(data, dict):
+                data_text = data.get("text")
+                if data_text is not None:
+                    return ContextManager.normalize_message_content(data_text)
+
+            nested_content = content.get("content")
+            if nested_content is not None:
+                return ContextManager.normalize_message_content(nested_content)
+
+            comp_type = str(content.get("type", "") or "").lower()
+            if comp_type in {"image", "image_url"} or "image_url" in content:
+                return "[图片]"
+
+            if isinstance(data, dict):
+                return ContextManager.normalize_message_content(data)
+
+            return ""
+
+        return str(content)
+
+    @staticmethod
     def _message_to_dict(msg: AstrBotMessage) -> Dict[str, Any]:
         """
         将 AstrBotMessage 对象转换为可JSON序列化的字典
@@ -172,7 +224,9 @@ class ContextManager:
         """
         try:
             msg_dict = {
-                "message_str": msg.message_str if hasattr(msg, "message_str") else "",
+                "message_str": ContextManager.normalize_message_content(
+                    msg.message_str if hasattr(msg, "message_str") else ""
+                ),
                 "platform_name": msg.platform_name
                 if hasattr(msg, "platform_name")
                 else "",
@@ -218,7 +272,9 @@ class ContextManager:
         """
         try:
             msg = AstrBotMessage()
-            msg.message_str = msg_dict.get("message_str", "")
+            msg.message_str = ContextManager.normalize_message_content(
+                msg_dict.get("message_str", "")
+            )
             msg.platform_name = msg_dict.get("platform_name", "")
             msg.timestamp = msg_dict.get("timestamp", 0)
 
@@ -259,7 +315,9 @@ class ContextManager:
             logger.error(f"从字典转换为消息对象失败: {e}")
             # 返回一个空的消息对象而不是 None，避免后续处理出错
             empty_msg = AstrBotMessage()
-            empty_msg.message_str = str(msg_dict.get("message_str", ""))
+            empty_msg.message_str = ContextManager.normalize_message_content(
+                msg_dict.get("message_str", "")
+            )
             empty_msg.timestamp = 0
             return empty_msg
 
@@ -780,23 +838,9 @@ class ContextManager:
 
             # 从 content 字段提取消息文本
             # content 是一个消息链列表，格式如 [{"type": "text", "data": {"text": "..."}}]
-            content = history_item.content
-            message_text = ""
-            if isinstance(content, list):
-                for comp in content:
-                    if isinstance(comp, dict):
-                        comp_type = comp.get("type", "")
-                        comp_data = comp.get("data", {})
-                        if comp_type == "text" and isinstance(comp_data, dict):
-                            message_text += comp_data.get("text", "")
-            elif isinstance(content, dict):
-                # 兼容单个组件的情况
-                comp_type = content.get("type", "")
-                comp_data = content.get("data", {})
-                if comp_type == "text" and isinstance(comp_data, dict):
-                    message_text = comp_data.get("text", "")
-
-            msg.message_str = message_text
+            msg.message_str = ContextManager.normalize_message_content(
+                history_item.content
+            )
             msg.platform_name = platform_name
 
             # 处理时间戳
@@ -1383,7 +1427,9 @@ class ContextManager:
                     # 获取消息内容
                     message_content = ""
                     if hasattr(msg, "message_str"):
-                        message_content = msg.message_str
+                        message_content = ContextManager.normalize_message_content(
+                            msg.message_str
+                        )
                     elif hasattr(msg, "message"):
                         # 简单提取文本
                         for comp in msg.message:
@@ -1471,7 +1517,9 @@ class ContextManager:
                     for wb_msg in sorted_wb:
                         wb_sender_name = wb_msg.get("sender_name", "未知用户")
                         wb_sender_id = wb_msg.get("sender_id", "unknown")
-                        wb_content = wb_msg.get("content", "")
+                        wb_content = ContextManager.normalize_message_content(
+                            wb_msg.get("content", "")
+                        )
 
                         # 时间格式化（与历史消息保持一致）
                         wb_time_str = ""

@@ -4486,7 +4486,9 @@ class ChatPlus(Star):
                     parts = []
                     for msg in recent_cached:
                         if isinstance(msg, dict):
-                            content = msg.get("content", "").strip()
+                            content = ContextManager.normalize_message_content(
+                                msg.get("content", "")
+                            ).strip()
                             sender_name = (
                                 msg.get("sender_name")
                                 or f"用户(ID:{msg.get('sender_id', '?')})"
@@ -4598,7 +4600,9 @@ class ChatPlus(Star):
                                 # 官方原始历史等
                                 t = m.get("timestamp") or m.get("ts")
                                 # 规范里只有role/content
-                                content = m.get("content", "")
+                                content = ContextManager.normalize_message_content(
+                                    m.get("content", "")
+                                )
                                 # 尝试补充sender（若有的话）
                                 if isinstance(m.get("sender"), dict):
                                     sid = str(m["sender"].get("user_id", ""))
@@ -4667,7 +4671,9 @@ class ChatPlus(Star):
                     if isinstance(cached_msg, dict):
                         try:
                             msg_obj = AstrBotMessage()
-                            msg_obj.message_str = cached_msg.get("content", "")
+                            msg_obj.message_str = ContextManager.normalize_message_content(
+                                cached_msg.get("content", "")
+                            )
                             msg_obj.platform_name = event.get_platform_name()
                             msg_obj.timestamp = cached_msg.get(
                                 "message_timestamp"
@@ -4773,12 +4779,12 @@ class ChatPlus(Star):
                                     for r in official_history[
                                         -min(5, len(official_history)) :
                                     ]:
-                                        _s = (
+                                        _s = ContextManager.normalize_message_content(
                                             r.get("content", "")
                                             if isinstance(r, dict)
-                                            else str(r)
+                                            else r
                                         )
-                                        _s = str(_s).replace("\n", " ")
+                                        _s = _s.replace("\n", " ")
                                         if len(_s) > 80:
                                             _s = _s[:80] + "…"
                                         _raw_prev.append(_s)
@@ -4816,7 +4822,11 @@ class ChatPlus(Star):
                                     and "content" in msg
                                 ):
                                     m = AstrBotMessage()
-                                    m.message_str = msg["content"]
+                                    m.message_str = (
+                                        ContextManager.normalize_message_content(
+                                            msg["content"]
+                                        )
+                                    )
                                     m.platform_name = platform_name
                                     _ts = (
                                         msg.get("timestamp")

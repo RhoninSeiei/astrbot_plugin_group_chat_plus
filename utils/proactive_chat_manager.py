@@ -3789,7 +3789,11 @@ class ProactiveChatManager:
                                         and "content" in msg
                                     ):
                                         msg_obj = AstrBotMessage()
-                                        msg_obj.message_str = msg["content"]
+                                        msg_obj.message_str = (
+                                            ContextManager.normalize_message_content(
+                                                msg["content"]
+                                            )
+                                        )
                                         msg_obj.platform_name = (
                                             platform_id  # 🔧 修复：使用platform_id
                                         )
@@ -3899,7 +3903,11 @@ class ProactiveChatManager:
                         if isinstance(cached_msg, dict):
                             try:
                                 msg_obj = AstrBotMessage()
-                                msg_obj.message_str = cached_msg.get("content", "")
+                                msg_obj.message_str = (
+                                    ContextManager.normalize_message_content(
+                                        cached_msg.get("content", "")
+                                    )
+                                )
                                 msg_obj.platform_name = platform_name
                                 msg_obj.timestamp = cached_msg.get(
                                     "message_timestamp"
@@ -4028,7 +4036,11 @@ class ProactiveChatManager:
                     # 检查缓存消息是否已在历史中（去重
                     for cached_msg in cached_messages:
                         if isinstance(cached_msg, dict) and "content" in cached_msg:
-                            cached_content = cached_msg.get("content", "").strip()
+                            cached_content = (
+                                ContextManager.normalize_message_content(
+                                    cached_msg.get("content", "")
+                                ).strip()
+                            )
                             if cached_content:
                                 # 检查是否重复
                                 if cached_content not in history_contents:
@@ -4067,7 +4079,9 @@ class ProactiveChatManager:
                     if isinstance(cached_msg, dict):
                         try:
                             msg_obj = AstrBotMessage()
-                            msg_obj.message_str = cached_msg.get("content", "")
+                            msg_obj.message_str = ContextManager.normalize_message_content(
+                                cached_msg.get("content", "")
+                            )
                             msg_obj.platform_name = (
                                 platform_id  # 🔧 修复：使用platform_id
                             )

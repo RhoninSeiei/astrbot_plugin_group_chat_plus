@@ -15,6 +15,7 @@ from astrbot.api import logger
 from .message_processor import MessageProcessor
 from .message_cleaner import MessageCleaner
 from .proactive_chat_manager import ProactiveChatManager
+from .context_manager import ContextManager
 
 
 class MessageCacheManager:
@@ -152,7 +153,9 @@ class MessageCacheManager:
             for cached_msg in self.pending_messages_cache[chat_id]:
                 if cached_msg.get("message_id") == message_id:
                     if self.debug_mode:
-                        content = message_data.get("content", "")
+                        content = ContextManager.normalize_message_content(
+                            message_data.get("content", "")
+                        )
                         logger.info(
                             f"  [缓存防御性去重] 检测到重复 message_id，跳过: {content[:50]}..."
                         )
@@ -168,7 +171,9 @@ class MessageCacheManager:
 
         if self.debug_mode:
             content_preview = (
-                message_data.get("content", "")[:100]
+                ContextManager.normalize_message_content(
+                    message_data.get("content", "")
+                )[:100]
                 if message_data.get("content")
                 else "(空)"
             )
@@ -290,7 +295,9 @@ class MessageCacheManager:
                         if cached_msg_id in history_message_ids:
                             dedup_skipped += 1
                             if self.debug_mode:
-                                content = cached_msg.get("content", "")
+                                content = ContextManager.normalize_message_content(
+                                    cached_msg.get("content", "")
+                                )
                                 logger.info(
                                     f"  [缓存去重] 跳过重复消息（message_id已存在）: {content[:50]}..."
                                 )
@@ -316,7 +323,9 @@ class MessageCacheManager:
             if isinstance(cached_msg, dict):
                 try:
                     msg_obj = AstrBotMessage()
-                    msg_obj.message_str = cached_msg.get("content", "")
+                    msg_obj.message_str = ContextManager.normalize_message_content(
+                        cached_msg.get("content", "")
+                    )
                     msg_obj.platform_name = event.get_platform_name()
                     msg_obj.timestamp = cached_msg.get(
                         "message_timestamp"
