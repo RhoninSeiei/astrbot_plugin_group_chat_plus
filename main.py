@@ -143,6 +143,7 @@ from .utils.image_description_cache import (
 )  # 🆕 v1.2.0: 图片描述缓存
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
+from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
@@ -2647,6 +2648,40 @@ class ChatPlus(Star):
             logger.error(f"发送重启请求时出错: {e}")
             raise e
 
+    def _restart_admin_user_ids(self) -> set[str]:
+        try:
+            core_config = self.context.get_config()
+        except Exception:
+            core_config = {}
+        if not isinstance(core_config, dict):
+            core_config = {}
+        return normalize_user_ids(core_config.get("admins_id", []))
+
+    def _authorize_restart_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        command_name: str,
+        command_allowlist: object = None,
+        command_denylist: object = None,
+    ) -> bool:
+        allowed = is_restart_command_authorized(
+            event,
+            admin_user_ids=self._restart_admin_user_ids(),
+            command_allowlist=command_allowlist,
+            command_denylist=command_denylist,
+        )
+        if not allowed:
+            try:
+                logger.warning(
+                    "【重启指令】%s 被拒绝，sender_id=%s",
+                    command_name,
+                    event.get_sender_id(),
+                )
+            except Exception:
+                logger.warning("【重启指令】%s 被拒绝", command_name)
+        return allowed
+
     @filter.command("gcp_reset")
     async def gcp_reset(self, event: AstrMessageEvent):
         """全局重置插件：清空所有会话的插件缓存与数据文件，设置历史截止点（忽略重置前的平台聊天记录），然后重启 AstrBot。不会删除平台官方的对话历史。"""
@@ -2671,17 +2706,11 @@ class ChatPlus(Star):
             # 必须是"纯文本"消息，防止图片/引用等组件混入而误触
             if not all(isinstance(c, Plain) for c in components):
                 return
-            # 白名单：为空=允许所有用户；否则仅允许列表内用户
-            whitelist = self.plugin_gcp_reset_allowed_user_ids
-            allow_all = not whitelist or len(whitelist) == 0
-            sender_id = str(event.get_sender_id())
-            allowed = allow_all or (str(sender_id) in {str(x) for x in whitelist})
-            if not allowed:
-                # 不在白名单：按"已处理"返回，防止本条消息继续触发本插件的其他逻辑
-                logger.info(
-                    "【会话重置】用户 %s 未在白名单中，重置指令被忽略",
-                    sender_id,
-                )
+            if not self._authorize_restart_command(
+                event,
+                command_name="gcp_reset",
+                command_allowlist=self.plugin_gcp_reset_allowed_user_ids,
+            ):
                 return
             # 通过全部校验：执行清理+热重载，并发送提示
             try:
@@ -2762,17 +2791,11 @@ class ChatPlus(Star):
             # 必须是"纯文本"消息（仅 Plain 组件），防止图片/引用等造成误触
             if not all(isinstance(c, Plain) for c in components):
                 return
-            # 白名单判定：空列表=允许所有用户；否则仅允许列表内用户
-            whitelist = self.plugin_gcp_reset_here_allowed_user_ids
-            allow_all = not whitelist or len(whitelist) == 0
-            sender_id = str(event.get_sender_id())
-            allowed = allow_all or (str(sender_id) in {str(x) for x in whitelist})
-            # 若不被允许，按"已处理"返回，阻止该消息继续触发本插件其它逻辑
-            if not allowed:
-                logger.info(
-                    "【会话重置】用户 %s 未在白名单中，重置指令被忽略",
-                    sender_id,
-                )
+            if not self._authorize_restart_command(
+                event,
+                command_name="gcp_reset_here",
+                command_allowlist=self.plugin_gcp_reset_here_allowed_user_ids,
+            ):
                 return
             # 执行当前会话的数据重置并发送提示
             try:
@@ -2873,47 +2896,22 @@ class ChatPlus(Star):
             if not all(isinstance(c, Plain) for c in components):
                 return
 
-            # ========== 名单权限检查：群聊和私信使用各自独立的名单 ==========
-            sender_id = str(event.get_sender_id())
-
+            # ========== 重启权限检查：必须具备 AstrBot 管理员身份 ==========
             if is_private:
-                # --- 私信名单检查（支持黑名单/白名单模式） ---
                 filter_list = self.private_gcp_clear_image_cache_filter_list
                 filter_mode = self.private_gcp_clear_image_cache_filter_mode
-
-                if filter_list and len(filter_list) > 0:
-                    # 名单不为空，按模式检查
-                    id_set = {str(x) for x in filter_list}
-                    in_list = sender_id in id_set
-
-                    if filter_mode == "whitelist":
-                        # 白名单模式：仅名单内用户可以使用
-                        if not in_list:
-                            logger.info(
-                                "【图片缓存清除·私信】用户 %s 不在白名单中，指令被忽略",
-                                sender_id,
-                            )
-                            return
-                    else:
-                        # 黑名单模式（默认）：名单内用户不能使用
-                        if in_list:
-                            logger.info(
-                                "【图片缓存清除·私信】用户 %s 在黑名单中，指令被忽略",
-                                sender_id,
-                            )
-                            return
-                # 名单为空 → 不过滤，允许所有用户
+                command_allowlist = filter_list if filter_mode == "whitelist" else None
+                command_denylist = filter_list if filter_mode != "whitelist" else None
             else:
-                # --- 群聊白名单检查（原有逻辑不变） ---
-                whitelist = self.gcp_clear_image_cache_allowed_user_ids
-                allow_all = not whitelist or len(whitelist) == 0
-                allowed = allow_all or (sender_id in {str(x) for x in whitelist})
-                if not allowed:
-                    logger.info(
-                        "【图片缓存清除·群聊】用户 %s 未在白名单中，指令被忽略",
-                        sender_id,
-                    )
-                    return
+                command_allowlist = self.gcp_clear_image_cache_allowed_user_ids
+                command_denylist = None
+            if not self._authorize_restart_command(
+                event,
+                command_name="gcp_clear_image_cache",
+                command_allowlist=command_allowlist,
+                command_denylist=command_denylist,
+            ):
+                return
 
             # ========== 执行清除（群聊/私信共享同一份缓存文件） ==========
             source_label = "私信" if is_private else "群聊"

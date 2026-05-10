@@ -111,13 +111,13 @@
     "plugin_gcp_reset_allowed_user_ids": {
         "description": "允许使用插件gcp_reset重置指令的用户ID白名单",
         "type": "list",
-        "hint": "可配置多个用户ID，只有在此列表中的用户才能触发gcp_reset重置指令。留空=允许所有用户使用。仅在群聊中生效。",
+        "hint": "可配置多个 AstrBot 管理员用户 ID，只有具备 AstrBot 管理员身份且在此列表中的用户才能触发 gcp_reset 重置指令。留空=允许所有 AstrBot 管理员使用。普通用户始终不能触发 AstrBot 重启。仅在群聊中生效。",
         "default": []
     },
     "plugin_gcp_reset_here_allowed_user_ids": {
         "description": "允许使用插件gcp_reset_here重置指令的用户ID白名单",
         "type": "list",
-        "hint": "可配置多个用户ID，只有在此列表中的用户才能触发gcp_reset_here重置指令。留空=允许所有用户使用。仅在群聊中生效。",
+        "hint": "可配置多个 AstrBot 管理员用户 ID，只有具备 AstrBot 管理员身份且在此列表中的用户才能触发 gcp_reset_here 重置指令。留空=允许所有 AstrBot 管理员使用。普通用户始终不能触发 AstrBot 重启。仅在群聊中生效。",
         "default": []
     },
     "decision_ai_provider_id": {
@@ -311,7 +311,7 @@
     "gcp_clear_image_cache_allowed_user_ids": {
         "description": "💾 允许使用gcp_clear_image_cache指令的用户ID白名单",
         "type": "list",
-        "hint": "【v1.2.0新增】可配置多个用户ID，只有在此列表中的用户才能触发gcp_clear_image_cache清除图片缓存指令。留空=允许所有用户使用。仅在群聊中生效",
+        "hint": "【v1.2.0新增】可配置多个 AstrBot 管理员用户 ID，只有具备 AstrBot 管理员身份且在此列表中的用户才能触发 gcp_clear_image_cache 清除图片缓存并重启 AstrBot。留空=允许所有 AstrBot 管理员使用。普通用户始终不能触发 AstrBot 重启。仅在群聊中生效",
         "default": []
     },
     "platform_image_caption_max_wait": {
@@ -1853,7 +1853,7 @@
     "private_gcp_clear_image_cache_filter_mode": {
         "description": "💾 私信：gcp_clear_image_cache指令名单模式",
         "type": "string",
-        "hint": "【私信专用】选择私信中gcp_clear_image_cache指令的名单运作模式。\n\n⚙️ 模式说明：\n• blacklist（黑名单模式）：名单内的用户【不能】在私信中使用此指令，其他人都可以\n• whitelist（白名单模式）：仅名单内的用户【才能】在私信中使用此指令\n\n📌 重要：此配置独立于群聊的白名单（gcp_clear_image_cache_allowed_user_ids），两边互不影响。\n• 群聊来源的指令 → 按群聊白名单检查\n• 私信来源的指令 → 按此处的名单模式和名单检查\n\n💡 名单留空时，无论选择哪种模式，都等同于允许所有用户使用（不进行过滤）",
+        "hint": "【私信专用】选择私信中 gcp_clear_image_cache 指令的名单运作模式。此指令会重启 AstrBot，发送者必须具备 AstrBot 管理员身份。\n\n⚙️ 模式说明：\n• blacklist（黑名单模式）：管理员名单内用户不能使用此指令，其他管理员可以\n• whitelist（白名单模式）：仅名单内管理员可以使用此指令\n\n📌 重要：此配置独立于群聊的白名单（gcp_clear_image_cache_allowed_user_ids），两边互不影响。\n• 群聊来源的指令 → 按群聊白名单检查\n• 私信来源的指令 → 按此处的名单模式和名单检查\n\n💡 名单留空时，无论选择哪种模式，都等同于允许所有 AstrBot 管理员使用。普通用户始终不能触发 AstrBot 重启",
         "default": "blacklist",
         "options": [
             "blacklist",
@@ -1863,7 +1863,7 @@
     "private_gcp_clear_image_cache_filter_list": {
         "description": "💾 私信：gcp_clear_image_cache指令用户ID名单",
         "type": "list",
-        "hint": "【私信专用】填写用户ID，根据上方名单模式作为黑名单或白名单生效。控制哪些用户能在私信中使用gcp_clear_image_cache清除图片缓存指令。\n\n📌 留空=不过滤任何用户（所有人都可以在私信中使用此指令）\n📌 此名单独立于群聊的白名单配置，互不影响",
+        "hint": "【私信专用】填写 AstrBot 管理员用户 ID，根据上方名单模式作为黑名单或白名单生效。控制哪些管理员能在私信中使用 gcp_clear_image_cache 清除图片缓存并重启 AstrBot。\n\n📌 留空=允许所有 AstrBot 管理员使用\n📌 普通用户始终不能触发 AstrBot 重启\n📌 此名单独立于群聊的白名单配置，互不影响",
         "default": []
     },
     "private_enable_command_filter": {
