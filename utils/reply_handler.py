@@ -17,6 +17,7 @@ from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.star.star_handler import EventType
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
+from .session_preferences import resolve_session_persona
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -384,11 +385,7 @@ class ReplyHandler:
             system_prompt = ""
             begin_dialogs_text = ""
             try:
-                # 直接调用 get_default_persona_v3() 获取最新人格配置
-                # 这样可以确保：1. 每次都获取最新配置 2. 支持不同会话使用不同人格
-                default_persona = await context.persona_manager.get_default_persona_v3(
-                    event.unified_msg_origin
-                )
+                default_persona = await resolve_session_persona(context, event=event)
 
                 system_prompt = default_persona.get("prompt", "")
 

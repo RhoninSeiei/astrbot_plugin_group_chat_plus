@@ -37,6 +37,7 @@ from astrbot.api.all import AstrBotMessage, MessageType, MessageMember
 
 # 🆕 v1.2.0: 导入钩子调用相关模块
 from astrbot.core.star.star_handler import EventType
+from .session_preferences import get_session_provider, resolve_session_persona
 
 # 🆕 v1.2.0: 标记键名（与 reply_handler.py 保持一致）
 PLUGIN_REQUEST_MARKER = "_group_chat_plus_request"
@@ -3711,8 +3712,10 @@ class ProactiveChatManager:
                                 # 经过 format_context_for_ai() 后添加时间戳和发送者前缀，
                                 # 导致 AI 看到类似 "[时间] 用户(ID:user): <预设内容>" 的假历史。
                                 try:
-                                    persona_for_filter = await context.persona_manager.get_default_persona_v3(
-                                        unified_msg_origin
+                                    persona_for_filter = await resolve_session_persona(
+                                        context,
+                                        umo=unified_msg_origin,
+                                        platform_name=platform_id,
                                     )
                                     begin_dialogs_to_filter = persona_for_filter.get(
                                         "_begin_dialogs_processed", []
@@ -4278,8 +4281,10 @@ class ProactiveChatManager:
                     judge_persona_prompt = ""
                     try:
                         judge_persona = (
-                            await context.persona_manager.get_default_persona_v3(
-                                unified_msg_origin
+                            await resolve_session_persona(
+                                context,
+                                umo=unified_msg_origin,
+                                platform_name=platform_id,
                             )
                         )
                         judge_persona_prompt = judge_persona.get("prompt", "")
@@ -4337,7 +4342,9 @@ class ProactiveChatManager:
                             cls._decision_ai_provider_id
                         )
                     if not judge_provider:
-                        judge_provider = context.get_using_provider()
+                        judge_provider = get_session_provider(
+                            context, umo=unified_msg_origin
+                        )
 
                     if not judge_provider:
                         logger.warning(
@@ -4444,10 +4451,10 @@ class ProactiveChatManager:
             system_prompt = ""
             begin_dialogs_text = ""
             try:
-                # 直接调用 get_default_persona_v3() 获取最新人格配置
-                # 这样可以确保：1. 每次都获取最新配置 2. 支持不同会话使用不同人格
-                default_persona = await context.persona_manager.get_default_persona_v3(
-                    unified_msg_origin
+                default_persona = await resolve_session_persona(
+                    context,
+                    umo=unified_msg_origin,
+                    platform_name=platform_id,
                 )
 
                 system_prompt = default_persona.get("prompt", "")
@@ -4494,7 +4501,7 @@ class ProactiveChatManager:
                 "- 严格按照你的人格设定来发言\n"
                 "请开始主动发言：\n"
             )
-            provider = context.get_using_provider()
+            provider = get_session_provider(context, umo=unified_msg_origin)
             if not provider:
                 logger.error("[主动对话生成] 未找到可用的AI提供商")
                 return

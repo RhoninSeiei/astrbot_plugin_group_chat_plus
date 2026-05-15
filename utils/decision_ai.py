@@ -19,6 +19,7 @@ from typing import List, Optional, Dict, Any
 from astrbot.api.all import *
 from .ai_response_filter import AIResponseFilter
 from ._session_guard import sample_guard
+from .session_preferences import get_session_provider, resolve_session_persona
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -218,9 +219,9 @@ class DecisionAI:
                 provider = context.get_provider_by_id(provider_id)
                 if not provider:
                     logger.warning(f"无法找到提供商 {provider_id},使用默认提供商")
-                    provider = context.get_using_provider()
+                    provider = get_session_provider(context, event=event)
             else:
-                provider = context.get_using_provider()
+                provider = get_session_provider(context, event=event)
 
             if not provider:
                 logger.error("无法获取AI提供商")
@@ -232,11 +233,7 @@ class DecisionAI:
 
             # 🔧 修复：直接使用 persona_manager 获取最新人格配置，支持多会话和实时更新
             try:
-                # 直接调用 get_default_persona_v3() 获取最新人格配置
-                # 这样可以确保：1. 每次都获取最新配置 2. 支持不同会话使用不同人格
-                default_persona = await context.persona_manager.get_default_persona_v3(
-                    event.unified_msg_origin
-                )
+                default_persona = await resolve_session_persona(context, event=event)
 
                 persona_prompt = default_persona.get("prompt", "")
 
@@ -572,9 +569,9 @@ class DecisionAI:
                 provider = context.get_provider_by_id(provider_id)
                 if not provider:
                     logger.warning(f"无法找到提供商 {provider_id},使用默认提供商")
-                    provider = context.get_using_provider()
+                    provider = get_session_provider(context, event=event)
             else:
-                provider = context.get_using_provider()
+                provider = get_session_provider(context, event=event)
 
             if not provider:
                 logger.error("无法获取AI提供商")
@@ -582,11 +579,7 @@ class DecisionAI:
 
             # 🔧 修复：直接使用 persona_manager 获取最新人格配置，支持多会话和实时更新
             try:
-                # 直接调用 get_default_persona_v3() 获取最新人格配置
-                # 这样可以确保：1. 每次都获取最新配置 2. 支持不同会话使用不同人格
-                default_persona = await context.persona_manager.get_default_persona_v3(
-                    event.unified_msg_origin
-                )
+                default_persona = await resolve_session_persona(context, event=event)
 
                 persona_prompt = default_persona.get("prompt", "")
 
