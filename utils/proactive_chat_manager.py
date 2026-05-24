@@ -231,6 +231,8 @@ class ProactiveChatManager:
             logger.warning("[主动对话管理器] 后台任务已在运行")
             return
 
+        cls._cancel_orphan_background_tasks()
+
         # 同步调试开关
         try:
             cls._debug_mode = bool(getattr(plugin_instance, "debug_mode", False))
@@ -441,6 +443,34 @@ class ProactiveChatManager:
         )
         if cls._debug_mode or getattr(cls, "DEBUG_MODE", False):
             logger.info("✅ [主动对话管理器] 后台检查任务已启动")
+
+    @classmethod
+    def _cancel_orphan_background_tasks(cls):
+        """清理热重载后遗留的旧版本主动对话后台任务"""
+        try:
+            current_task = asyncio.current_task()
+            cancelled_count = 0
+            for task in asyncio.all_tasks():
+                if task is current_task or task.done():
+                    continue
+                coro = task.get_coro()
+                qualname = getattr(coro, "__qualname__", "")
+                code = getattr(coro, "cr_code", None)
+                filename = getattr(code, "co_filename", "")
+                if (
+                    "ProactiveChatManager._background_check_loop" in qualname
+                    and filename.endswith("proactive_chat_manager.py")
+                ):
+                    task.cancel()
+                    cancelled_count += 1
+            if cancelled_count:
+                logger.warning(
+                    f"[主动对话管理器] 已清理 {cancelled_count} 个旧后台任务"
+                )
+        except RuntimeError:
+            return
+        except Exception as e:
+            logger.warning(f"[主动对话管理器] 清理旧后台任务失败: {e}")
 
     @classmethod
     async def stop_background_task(cls):
