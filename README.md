@@ -238,6 +238,8 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
   "custom_storage_max_messages": 500,
   "pending_cache_max_count": 20,
   "pending_cache_ttl_seconds": 1800,
+  "single_at_message_reply_link_max_messages": 3,
+  "single_at_message_reply_link_max_seconds": 600,
 
   "enable_image_processing": true,
   "image_to_text_scope": "mention_only",

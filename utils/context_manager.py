@@ -1588,7 +1588,10 @@ class ContextManager:
 
     @staticmethod
     async def save_user_message(
-        event: AstrMessageEvent, message_text: str, context: "Context" = None
+        event: AstrMessageEvent,
+        message_text: str,
+        context: "Context" = None,
+        skip_custom_storage: bool = False,
     ) -> bool:
         """
         保存用户消息（自定义存储+官方存储）
@@ -1701,7 +1704,10 @@ class ContextManager:
                 return False
 
             # ========== 自定义存储（智能追加，不加载全部消息到内存） ==========
-            if ContextManager._is_custom_storage_enabled():
+            if (
+                not skip_custom_storage
+                and ContextManager._is_custom_storage_enabled()
+            ):
                 file_path = ContextManager._get_storage_path(
                     platform_name, is_private, chat_id
                 )
@@ -1840,7 +1846,10 @@ class ContextManager:
 
     @staticmethod
     async def save_bot_message(
-        event: AstrMessageEvent, bot_message_text: str, context: "Context" = None
+        event: AstrMessageEvent,
+        bot_message_text: str,
+        context: "Context" = None,
+        skip_custom_storage: bool = False,
     ) -> bool:
         """
         保存AI回复（自定义存储+官方存储）
@@ -1951,7 +1960,10 @@ class ContextManager:
                 return False
 
             # ========== 自定义存储（智能追加，不加载全部消息到内存） ==========
-            if ContextManager._is_custom_storage_enabled():
+            if (
+                not skip_custom_storage
+                and ContextManager._is_custom_storage_enabled()
+            ):
                 file_path = ContextManager._get_storage_path(
                     platform_name, is_private, chat_id
                 )
@@ -2723,6 +2735,7 @@ class ContextManager:
         user_message: str,
         bot_message: str,
         context: "Context",
+        save_kind: str = "",
     ) -> bool:
         """
         保存到官方对话系统，支持缓存转正
@@ -2768,6 +2781,8 @@ class ContextManager:
                 logger.info(
                     f"[官方保存+缓存转正] unified_msg_origin: {unified_msg_origin}"
                 )
+                if save_kind:
+                    logger.info(f"[官方保存+缓存转正] 保存类型: {save_kind}")
                 logger.info(f"[官方保存+缓存转正] 缓存消息: {len(cached_messages)} 条")
                 logger.info(
                     f"[官方保存+缓存转正] 用户消息长度: {len(user_message)} 字符"
@@ -2911,6 +2926,9 @@ class ContextManager:
                 for cached_msg in cached_messages:
                     if isinstance(cached_msg, dict) and "content" in cached_msg:
                         try:
+                            role = cached_msg.get("role", "user") or "user"
+                            if role not in ("user", "assistant", "system"):
+                                role = "user"
                             hashable_content = make_content_hashable(
                                 cached_msg["content"]
                             )
@@ -2944,7 +2962,10 @@ class ContextManager:
                                             )
 
                                     history_list.append(
-                                        {"role": "user", "content": multimodal_content}
+                                        {
+                                            "role": role,
+                                            "content": multimodal_content,
+                                        }
                                     )
                                     image_count += len(cached_image_urls)
 
@@ -2956,7 +2977,7 @@ class ContextManager:
                                     # 无图片URL，使用普通文本格式
                                     history_list.append(
                                         {
-                                            "role": "user",
+                                            "role": role,
                                             "content": cached_msg["content"],
                                         }
                                     )
@@ -2974,7 +2995,10 @@ class ContextManager:
                                     f"[官方保存+缓存转正] 缓存消息content转换失败: {e}，仍添加"
                                 )
                             history_list.append(
-                                {"role": "user", "content": cached_msg["content"]}
+                                {
+                                    "role": cached_msg.get("role", "user") or "user",
+                                    "content": cached_msg["content"],
+                                }
                             )
                             added_count += 1
 

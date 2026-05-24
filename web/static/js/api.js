@@ -129,6 +129,7 @@ const Api = {
 
     // ---- Session ----
     sessionList()            { return this.get('/api/session/list'); },
+    sessionCleanGhosts()     { return this.post('/api/session/clean-ghosts'); },
     sessionReset(session)    { return this.post(`/api/session/reset/${encodeURIComponent(session)}`); },
     clearImageCache()        { return this.post('/api/session/clear-image-cache'); },
     getChatHistory(session)  { return this.get(`/api/session/chat-history/${encodeURIComponent(session)}`); },

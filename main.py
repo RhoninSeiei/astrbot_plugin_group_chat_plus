@@ -429,6 +429,20 @@ class ChatPlus(Star):
             )
             _cache_ttl = 0
         self.pending_cache_ttl_seconds = _cache_ttl
+        try:
+            self.single_at_message_reply_link_max_messages = max(
+                0, min(20, int(config.get("single_at_message_reply_link_max_messages", 3)))
+            )
+        except (ValueError, TypeError):
+            self.single_at_message_reply_link_max_messages = 3
+        try:
+            self.single_at_message_reply_link_max_seconds = max(
+                0,
+                min(7200, int(config.get("single_at_message_reply_link_max_seconds", 600))),
+            )
+        except (ValueError, TypeError):
+            self.single_at_message_reply_link_max_seconds = 600
+
         self.enable_idle_cache_flush = config.get("enable_idle_cache_flush", False)
         _idle_flush_delay_raw = config.get("idle_cache_flush_delay_seconds", 600)
         try:
@@ -2765,6 +2779,12 @@ class ChatPlus(Star):
             if not self.enable_private_chat or not event.is_private_chat():
                 return
 
+            if self._is_vacuum_message(event):
+                if self.private_chat_enable_debug_log:
+                    logger.info("[真空消息过滤] 私聊消息没有可处理内容，跳过处理")
+                event.call_llm = True
+                return
+
             # 获取消息ID
             msg_id = self._get_message_id(event)
 
@@ -2836,6 +2856,12 @@ class ChatPlus(Star):
         try:
             # 🔘 检查群聊功能总开关
             if not self.enable_group_chat or event.is_private_chat():
+                return
+
+            if self._is_vacuum_message(event):
+                if self.debug_mode:
+                    logger.info("[真空消息过滤] 群聊消息没有可处理内容，跳过处理")
+                event.call_llm = True
                 return
 
             self._check_compliance_status()
@@ -3003,6 +3029,69 @@ class ChatPlus(Star):
                     except Exception:
                         pass
                 self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
+
+    def _is_vacuum_message(self, event: AstrMessageEvent) -> bool:
+        """识别没有文本、提及、图片、戳一戳、转发等有效载荷的空事件。"""
+        try:
+            raw_text = MessageCleaner.extract_raw_message_from_event(event)
+            if raw_text and raw_text.strip():
+                return False
+
+            message_str = ""
+            try:
+                message_str = event.get_message_str() or ""
+            except Exception:
+                message_str = ""
+            if message_str.strip():
+                return False
+
+            try:
+                messages = event.get_messages() or []
+            except Exception:
+                messages = (
+                    event.message_obj.message
+                    if hasattr(event, "message_obj")
+                    and hasattr(event.message_obj, "message")
+                    else []
+                )
+
+            meaningful_component_names = {
+                "Image",
+                "Record",
+                "Video",
+                "File",
+                "Face",
+                "Reply",
+                "Node",
+                "Share",
+                "Json",
+                "Xml",
+            }
+            for component in messages or []:
+                if isinstance(component, Plain):
+                    if getattr(component, "text", "").strip():
+                        return False
+                    continue
+                if isinstance(component, (At, AtAll, Poke, Forward)):
+                    return False
+                if component.__class__.__name__ in meaningful_component_names:
+                    return False
+
+            raw_event = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            raw_message = None
+            if raw_event is not None:
+                if hasattr(raw_event, "message"):
+                    raw_message = raw_event.message
+                elif isinstance(raw_event, dict):
+                    raw_message = raw_event.get("message")
+            if isinstance(raw_message, list) and raw_message:
+                return False
+
+            return True
+        except Exception as e:
+            if self.debug_mode:
+                logger.info(f"[真空消息过滤] 检查失败，按普通消息处理: {e}")
+            return False
 
     async def restart_core(self):
         """
@@ -4177,8 +4266,15 @@ class ChatPlus(Star):
             )
             user_id = event.get_sender_id()
             raw_text = MessageCleaner.extract_raw_message_from_event(event)
-            is_empty_at = MessageCleaner.is_empty_at_message(raw_text, is_at_message)
-            mention_other_flag = bool(mention_info)
+            is_empty_at = MessageCleaner.is_empty_at_message(
+                raw_text,
+                is_at_message,
+                mention_info=mention_info,
+                mode="contains_ai",
+            )
+            mention_other_flag = bool(
+                mention_info and mention_info.get("has_at_others", False)
+            )
 
             await CooldownManager.check_and_release_expired_pending(chat_key)
             await self._sync_cooldown_with_attention_tracking(
@@ -4895,6 +4991,7 @@ class ChatPlus(Star):
         poke_info: dict = None,
         raw_is_at_message: bool = None,
         is_emoji_message: bool = False,
+        persistent_poke_event_text: str = "",
     ) -> tuple:
         """
         处理消息内容（图片处理、上下文格式化）
@@ -4932,11 +5029,20 @@ class ChatPlus(Star):
 
         # 检查是否是空@消息
         is_empty_at = MessageCleaner.is_empty_at_message(
-            original_message_text, real_is_at_message
+            original_message_text,
+            real_is_at_message,
+            mention_info=mention_info,
+            mode="only_ai",
         )
         if is_empty_at:
             if self.debug_mode:
                 logger.info("  纯@消息将使用特殊处理")
+
+        is_at_all_message = bool(
+            event.get_extra("is_at_all_message")
+            if hasattr(event, "get_extra")
+            else False
+        )
 
         # 处理图片（在缓存之前）
         # 这样如果图片被过滤，消息就不会被缓存
@@ -5033,6 +5139,8 @@ class ChatPlus(Star):
             "image_urls": image_urls or [],
             # 🔧 修复：保存空@标记，用于生成正确的系统提示词
             "is_empty_at": is_empty_at,
+            "is_at_all_message": is_at_all_message,
+            "persistent_poke_event_text": persistent_poke_event_text,
         }
 
         # 缓存内容日志
@@ -5095,7 +5203,7 @@ class ChatPlus(Star):
 
         # 🆕 空@时：提取最近缓存消息摘要，直接嵌入提示词，让AI无需在长历史中搜索
         # ⏱️ 时间差阈值：超过此时间（秒）则认为间隔过久，不拼接上下文，让AI自然询问
-        EMPTY_AT_MAX_TIME_GAP = 600  # 10分钟
+        EMPTY_AT_MAX_TIME_GAP = self.single_at_message_reply_link_max_seconds
         recent_pending_summary = ""
         if is_empty_at and chat_id in self.pending_messages_cache:
             cache_list = self.pending_messages_cache[chat_id]
@@ -5105,8 +5213,13 @@ class ChatPlus(Star):
                 non_window_cache = [
                     m for m in cache_list if not m.get("window_buffered", False)
                 ]
-                # 最多取最近3条非空缓存消息
-                recent_cached = non_window_cache[-3:]
+                # 最多取配置数量的近期非空缓存消息
+                max_link_messages = self.single_at_message_reply_link_max_messages
+                recent_cached = (
+                    non_window_cache[-max_link_messages:]
+                    if max_link_messages > 0
+                    else []
+                )
 
                 # 检查最近缓存消息与当前消息的时间差
                 current_ts = time.time()
@@ -5158,6 +5271,14 @@ class ChatPlus(Star):
             poke_info,  # 🆕 v1.0.9: 传递戳一戳信息
             is_empty_at,  # 🔧 修复：传递空@标记，让AI区分空艾特和带消息艾特
             recent_pending_summary,  # 🆕 空@时：近期缓存消息摘要，直接嵌入提示词
+            "",
+            is_at_all_message,
+        )
+        message_text_for_ai = MessageProcessor.format_message_for_context_display(
+            message_text_for_ai,
+            mention_info,
+            is_at_all_message,
+            persistent_poke_event_text,
         )
 
         # 🆕 戳过对方追踪提示（需要同时满足：功能启用 + 群聊在白名单中 + 有追踪记录）
@@ -6074,6 +6195,12 @@ class ChatPlus(Star):
                     trigger_type,  # 🆕 v1.0.4: 传递触发方式
                     last_cached.get("poke_info"),  # 🆕 v1.0.9: 传递戳一戳信息
                     last_cached.get("is_empty_at", False),  # 🔧 修复：传递空@标记
+                    "",
+                    last_cached.get("is_at_all_message", False),
+                )
+                message_to_save = self._append_persistent_event_text(
+                    message_to_save,
+                    last_cached.get("persistent_poke_event_text", ""),
                 )
 
                 # 清理系统提示（保存前过滤）
@@ -6451,6 +6578,96 @@ class ChatPlus(Star):
         except Exception as e:
             logger.error(f"【反戳】反戳流程发生错误: {e}")
             return False
+
+    def _append_persistent_event_text(self, base_text: str, event_text: str) -> str:
+        """把可保留事件文本追加到上下文展示文本中，避免重复追加。"""
+        return MessageProcessor.format_message_for_context_display(
+            base_text or "",
+            None,
+            False,
+            event_text or "",
+        )
+
+    async def _save_poke_assistant_event(
+        self, event: AstrMessageEvent, poke_info: dict
+    ) -> bool:
+        """保存收到戳一戳后反戳的用户事件和助手事件。"""
+        try:
+            if not poke_info:
+                return False
+
+            user_event_text = MessageProcessor.build_persistent_poke_event_text(
+                poke_info
+            )
+            assistant_event_text = MessageProcessor.build_persistent_poke_event_text(
+                {
+                    "target_id": poke_info.get("sender_id", ""),
+                    "target_name": poke_info.get("sender_name", ""),
+                },
+                perspective="assistant",
+            )
+            user_event_text = self._append_persistent_event_text("", user_event_text)
+            assistant_event_text = self._append_persistent_event_text(
+                "", assistant_event_text
+            )
+            if not user_event_text and not assistant_event_text:
+                return False
+
+            success = await ContextManager.save_to_official_conversation_with_cache(
+                event,
+                [],
+                user_event_text,
+                assistant_event_text,
+                self.context,
+                save_kind="poke_event",
+            )
+            if success and self.debug_mode:
+                logger.info("[戳一戳事件保存] 已保存收到戳一戳与反戳记录")
+            return success
+        except Exception as e:
+            logger.warning(f"[戳一戳事件保存] 保存失败，已跳过: {e}", exc_info=True)
+            return False
+
+    def _downgrade_smart_batch_messages_to_regular(
+        self, chat_id: str, smart_batch_messages: list, source: str
+    ) -> None:
+        """Smart 批次主消息不回复时，将已吸收的后续消息转回普通缓存。"""
+        if not smart_batch_messages:
+            return
+
+        cache_list = self.pending_messages_cache.setdefault(chat_id, [])
+        downgraded_count = 0
+        for smart_msg in smart_batch_messages:
+            if not isinstance(smart_msg, dict):
+                continue
+            fallback_cache = copy.deepcopy(smart_msg)
+            fallback_cache.pop("window_buffered", None)
+            fallback_cache.pop("smart_batch_dynamic_hint", None)
+            fallback_cache.pop("smart_merged", None)
+            message_id = fallback_cache.get("message_id")
+            replaced = False
+            if message_id:
+                for cached_msg in cache_list:
+                    if (
+                        isinstance(cached_msg, dict)
+                        and cached_msg.get("message_id") == message_id
+                    ):
+                        cached_msg.update(fallback_cache)
+                        cached_msg.pop("window_buffered", None)
+                        cached_msg.pop("smart_batch_dynamic_hint", None)
+                        cached_msg.pop("smart_merged", None)
+                        replaced = True
+                        break
+            if not replaced:
+                self.cache_manager.add_to_cache(
+                    chat_id, fallback_cache, source=source
+                )
+            downgraded_count += 1
+
+        if downgraded_count:
+            logger.info(
+                f"📦 [缓存-{source}] 已将 {downgraded_count} 条Smart合并消息转回普通缓存"
+            )
 
     def _get_poke_trace_store(self, chat_id: str) -> OrderedDict:
         key = str(chat_id)
@@ -7360,6 +7577,11 @@ class ChatPlus(Star):
             if poke_info_for_probability
             else None
         )
+        persistent_poke_event_text = (
+            MessageProcessor.build_persistent_poke_event_text(poke_info)
+            if poke_info
+            else ""
+        )
 
         # 收到戳一戳后的反戳逻辑（放在概率判断之后）：
         # 若命中概率，则反戳并丢弃本插件处理中剩余步骤
@@ -7368,6 +7590,7 @@ class ChatPlus(Star):
                 event, poke_info, is_private, chat_id
             )
             if reversed_and_discarded:
+                await self._save_poke_assistant_event(event, poke_info)
                 # 不拦截消息传播，仅本插件结束处理
                 return
 
@@ -7393,6 +7616,7 @@ class ChatPlus(Star):
             poke_info,
             raw_is_at_message=is_at_message,
             is_emoji_message=is_emoji_message,  # 🆕 v1.2.0: 传递表情包检测结果
+            persistent_poke_event_text=persistent_poke_event_text,
         )
         if not result[0]:  # should_continue为False
             return
@@ -7523,6 +7747,7 @@ class ChatPlus(Star):
                         continue
                     follower_cache["window_buffered"] = True
                     follower_cache["smart_batch_dynamic_hint"] = True
+                    follower_cache["smart_merged"] = True
                     self.cache_manager.add_to_cache(
                         chat_id, follower_cache, source="Smart并发"
                     )
@@ -7625,7 +7850,14 @@ class ChatPlus(Star):
 
             # 🔧 清理缓存快照（不回复时 after_message_sent 不会被调用）
             self._message_cache_snapshots.pop(early_message_id, None)
-            self._smart_batch_snapshots.pop(early_message_id, None)
+            smart_batch_messages = self._smart_batch_snapshots.pop(
+                early_message_id, []
+            )
+            self._downgrade_smart_batch_messages_to_regular(
+                chat_id,
+                smart_batch_messages,
+                source="AI决策过滤-smart-batch",
+            )
             if self.concurrent_mode == "smart":
                 await SmartConcurrentManager.remove_self(chat_id, early_message_id)
 
@@ -8750,6 +8982,12 @@ class ChatPlus(Star):
                     trigger_type,  # 🆕 v1.0.4: 传递触发方式
                     last_cached.get("poke_info"),  # 🆕 v1.0.9: 传递戳一戳信息
                     last_cached.get("is_empty_at", False),  # 🔧 修复：传递空@标记
+                    "",
+                    last_cached.get("is_at_all_message", False),
+                )
+                message_to_save = self._append_persistent_event_text(
+                    message_to_save,
+                    last_cached.get("persistent_poke_event_text", ""),
                 )
 
                 # 清理系统提示（保存前过滤）
@@ -8955,6 +9193,7 @@ class ChatPlus(Star):
                     logger.warning(
                         f"[消息发送后] Phase-2: ⚠️ 窗口缓冲消息处理异常（降级：留在缓存）: {phase2_err}"
                     )
+                self._smart_batch_snapshots.pop(message_id, None)
 
                 pending_final_decision = event.get_extra(
                     PLUGIN_PENDING_MAIN_MODEL_DECISION, {}
@@ -9081,6 +9320,12 @@ class ChatPlus(Star):
                 trigger_type,
                 last_cached.get("poke_info"),
                 last_cached.get("is_empty_at", False),
+                "",
+                last_cached.get("is_at_all_message", False),
+            )
+            message_to_save = self._append_persistent_event_text(
+                message_to_save,
+                last_cached.get("persistent_poke_event_text", ""),
             )
 
             # 清理系统提示
@@ -9162,6 +9407,7 @@ class ChatPlus(Star):
                     logger.warning(
                         f"[重复拦截-保存] Phase-2 窗口缓冲消息处理异常: {phase2_err}"
                     )
+                self._smart_batch_snapshots.pop(message_id, None)
             else:
                 logger.warning(f"[重复拦截-保存] ⚠️ 保存用户消息失败")
 
@@ -9468,6 +9714,12 @@ class ChatPlus(Star):
                     trigger_type,
                     last_cached.get("poke_info"),
                     last_cached.get("is_empty_at", False),
+                    "",
+                    last_cached.get("is_at_all_message", False),
+                )
+                message_to_save = self._append_persistent_event_text(
+                    message_to_save,
+                    last_cached.get("persistent_poke_event_text", ""),
                 )
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
@@ -9486,13 +9738,49 @@ class ChatPlus(Star):
                     message_to_save = MessageCleaner.clean_message(message_to_save)
 
             if message_to_save:
-                await ContextManager.save_to_official_conversation_with_cache(
+                async with self.concurrent_lock:
+                    processing_msg_ids = set(self.processing_sessions.keys())
+
+                success = await ContextManager.save_to_official_conversation_with_cache(
                     event,
                     [],
                     message_to_save,
                     bot_reply_to_save,
                     self.context,
                 )
+                if success:
+                    try:
+                        window_buffered_to_convert = (
+                            self.cache_manager.prepare_window_buffered_for_save(
+                                chat_id=chat_id,
+                                processing_msg_ids=processing_msg_ids,
+                            )
+                        )
+                        if window_buffered_to_convert:
+                            wb_saved_msg_ids = set()
+                            for wb_msg in self.cache_manager.get_window_buffered_messages(
+                                chat_id
+                            ):
+                                msg_id = wb_msg.get("message_id")
+                                if msg_id:
+                                    wb_saved_msg_ids.add(msg_id)
+
+                            phase2_success = await ContextManager.save_to_official_conversation_with_cache(
+                                event,
+                                window_buffered_to_convert,
+                                None,
+                                None,
+                                self.context,
+                            )
+                            if phase2_success:
+                                self.cache_manager.clear_window_buffered_cache(
+                                    chat_id, saved_msg_ids=wb_saved_msg_ids
+                                )
+                    except Exception as phase2_err:
+                        logger.warning(
+                            f"[_finalize_bot_reply_save] Phase-2 窗口缓冲消息处理异常: {phase2_err}"
+                        )
+                    self._smart_batch_snapshots.pop(message_id, None)
 
             self._saved_messages[message_id] = time.time()
 
@@ -10286,7 +10574,12 @@ class ChatPlus(Star):
         Returns:
             dict: {"has_at_bot": bool, "has_at_others": bool}
         """
-        result = {"has_at_bot": False, "has_at_others": False}
+        result = {
+            "has_at_bot": False,
+            "has_at_others": False,
+            "has_at_all": False,
+            "mentions": [],
+        }
         try:
             raw_event = getattr(event.message_obj, "raw_message", None)
             if not raw_event:
@@ -10326,8 +10619,37 @@ class ChatPlus(Star):
 
                 if qq_val == bot_id:
                     result["has_at_bot"] = True
+                    result["mentions"].append(
+                        {
+                            "user_id": qq_val,
+                            "user_name": "机器人",
+                            "is_bot": True,
+                            "is_all": False,
+                            "resolved": True,
+                        }
+                    )
+                elif qq_val.lower() == "all":
+                    result["has_at_all"] = True
+                    result["mentions"].append(
+                        {
+                            "user_id": "all",
+                            "user_name": "全体成员",
+                            "is_bot": False,
+                            "is_all": True,
+                            "resolved": True,
+                        }
+                    )
                 elif qq_val.lower() != "all":
                     result["has_at_others"] = True
+                    result["mentions"].append(
+                        {
+                            "user_id": qq_val,
+                            "user_name": "",
+                            "is_bot": False,
+                            "is_all": False,
+                            "resolved": False,
+                        }
+                    )
 
         except Exception as e:
             if self.debug_mode:
@@ -10336,55 +10658,84 @@ class ChatPlus(Star):
 
     async def _check_mention_others(self, event: AstrMessageEvent) -> dict:
         """
-        检测消息中是否@了别人（不是机器人自己）
+        检测消息中的 @ 指向，返回结构化信息。
 
         Args:
             event: 消息事件对象
 
         Returns:
-            dict: 包含@信息的字典，如果没有@别人则返回None
-                  格式: {"mentioned_user_id": "xxx", "mentioned_user_name": "xxx"}
+            dict: 包含 @AI、@他人、@全体及 mentions 列表；没有 @ 时返回 None。
         """
         try:
             # 获取机器人自己的ID
-            bot_id = event.get_self_id()
+            bot_id = str(event.get_self_id())
 
             # 获取消息组件列表
             messages = event.get_messages()
             if not messages:
-                return None
+                raw_info = self._detect_at_from_raw_message(event, bot_id)
+                return raw_info if raw_info.get("mentions") else None
+
+            mention_info = {
+                "has_at_ai": False,
+                "has_at_others": False,
+                "has_at_all": False,
+                "mentions": [],
+                "mentioned_user_id": "",
+                "mentioned_user_name": "",
+            }
 
             # 检查消息中的At组件
             for component in messages:
-                if isinstance(component, At):
-                    # 获取被@的用户ID
-                    mentioned_id = str(component.qq)
+                if not isinstance(component, At):
+                    continue
+                mentioned_id = str(component.qq)
+                mentioned_name = (
+                    component.name
+                    if hasattr(component, "name") and component.name
+                    else ""
+                )
+                is_at_all = mentioned_id.lower() == "all"
+                is_bot = mentioned_id == bot_id
+                is_other = not is_bot and not is_at_all
 
-                    # 如果@的不是机器人自己，且不是@全体成员
-                    if mentioned_id != bot_id and mentioned_id.lower() != "all":
-                        mentioned_name = (
-                            component.name
-                            if hasattr(component, "name") and component.name
-                            else ""
-                        )
+                mention_info["has_at_ai"] = mention_info["has_at_ai"] or is_bot
+                mention_info["has_at_all"] = mention_info["has_at_all"] or is_at_all
+                mention_info["has_at_others"] = (
+                    mention_info["has_at_others"] or is_other
+                )
+                mention_info["mentions"].append(
+                    {
+                        "user_id": "all" if is_at_all else mentioned_id,
+                        "user_name": mentioned_name
+                        or ("你" if is_bot else ("全体成员" if is_at_all else "")),
+                        "is_bot": is_bot,
+                        "is_all": is_at_all,
+                        "resolved": bool(mentioned_name or is_bot or is_at_all),
+                    }
+                )
 
-                        # 强制输出 @ 检测日志（使用 INFO 级别确保可见）
+                if is_other and not mention_info["mentioned_user_id"]:
+                    mention_info["mentioned_user_id"] = mentioned_id
+                    mention_info["mentioned_user_name"] = mentioned_name
+                    logger.info(
+                        f"🔍 [@检测-@别人] 发现@其他用户: ID={mentioned_id}, 名称={mentioned_name or '未知'}"
+                    )
+                    if self.debug_mode:
                         logger.info(
-                            f"🔍 [@检测-@别人] 发现@其他用户: ID={mentioned_id}, 名称={mentioned_name or '未知'}"
+                            f"【@检测】详细信息: mentioned_id={mentioned_id}, mentioned_name={mentioned_name}"
                         )
-                        if self.debug_mode:
-                            logger.info(
-                                f"【@检测】详细信息: mentioned_id={mentioned_id}, mentioned_name={mentioned_name}"
-                            )
 
-                        return {
-                            "mentioned_user_id": mentioned_id,
-                            "mentioned_user_name": mentioned_name,
-                        }
+            if mention_info["mentions"]:
+                return mention_info
 
-            # 未检测到@别人，输出日志（仅在debug模式）
+            raw_info = self._detect_at_from_raw_message(event, bot_id)
+            if raw_info.get("mentions"):
+                return raw_info
+
+            # 未检测到@，输出日志（仅在debug模式）
             if self.debug_mode:
-                logger.info("【@检测】未检测到@其他用户")
+                logger.info("【@检测】未检测到@信息")
             return None
 
         except Exception as e:

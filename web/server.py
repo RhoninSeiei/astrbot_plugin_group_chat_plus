@@ -573,6 +573,7 @@ class WebPanelServer:
 
         # 会话管理
         r.add_get("/api/session/list", self._handle_session_list)
+        r.add_post("/api/session/clean-ghosts", self._handle_clean_ghost_sessions)
         r.add_post("/api/session/reset/{session}", self._handle_session_reset)
         r.add_post("/api/session/clear-image-cache", self._handle_clear_image_cache)
         r.add_get("/api/session/chat-history/{session}", self._handle_get_chat_history)
@@ -868,8 +869,26 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
             sessions.add(key)
         # 处理中会话
         if hasattr(self.plugin, "processing_sessions"):
-            for key in self.plugin.processing_sessions:
+            for key, value in getattr(self.plugin, "processing_sessions", {}).items():
+                if value:
+                    sessions.add(value)
+                else:
+                    sessions.add(key)
+        # 主动对话处理中会话
+        if hasattr(self.plugin, "proactive_processing_sessions"):
+            for key in getattr(self.plugin, "proactive_processing_sessions", {}):
                 sessions.add(key)
+        # 最近回复缓存
+        if hasattr(self.plugin, "recent_replies_cache"):
+            for key in getattr(self.plugin, "recent_replies_cache", {}):
+                sessions.add(key)
+        # 等待窗口
+        if hasattr(self.plugin, "_group_wait_windows"):
+            for key in getattr(self.plugin, "_group_wait_windows", {}):
+                if isinstance(key, tuple) and key:
+                    sessions.add(key[0])
+                else:
+                    sessions.add(key)
         # 情绪追踪
         if hasattr(self.plugin, "mood_tracker") and self.plugin.mood_tracker:
             if hasattr(self.plugin.mood_tracker, "moods"):
@@ -887,6 +906,17 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
         ):
             for key in self.plugin.frequency_adjuster.check_states:
                 sessions.add(key)
+        # 候选冷却状态
+        try:
+            from ..utils.cooldown_manager import CooldownManager
+
+            for attr in ("_cooldown_map", "_pending_cooldown_map"):
+                state_map = getattr(CooldownManager, attr, {})
+                if isinstance(state_map, dict):
+                    for key in state_map:
+                        sessions.add(key)
+        except Exception:
+            pass
         return sessions
 
     # ==================== 认证 Handler ====================
@@ -2062,6 +2092,78 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
                     )
 
         return web.json_response({"ok": True, "sessions": sessions})
+
+    def _session_id_from_history_file(self, chat_dir: Path, file_path: Path) -> str:
+        """从聊天记录文件路径还原会话 ID。"""
+        try:
+            rel = file_path.relative_to(chat_dir)
+        except ValueError:
+            return ""
+        parts = rel.parts
+        if len(parts) == 3:
+            return f"{parts[0]}_{parts[1]}_{file_path.stem}"
+        if len(parts) == 1:
+            return file_path.stem
+        return ""
+
+    async def _handle_clean_ghost_sessions(self, request: web.Request):
+        """清理只有文件记录、没有运行时状态的幽灵会话。"""
+        try:
+            runtime_sessions = {
+                str(session_id)
+                for session_id in self._collect_all_sessions()
+                if session_id
+            }
+            data_dir = self._get_data_path()
+            chat_dir = data_dir / "chat_history"
+            deleted_sessions = []
+            kept_count = 0
+
+            if not chat_dir.exists():
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "deleted": 0,
+                        "deleted_sessions": [],
+                        "kept": 0,
+                    }
+                )
+
+            chat_dir_resolved = chat_dir.resolve()
+            for file_path in chat_dir.rglob("*.json"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    resolved = file_path.resolve()
+                    if chat_dir_resolved not in resolved.parents:
+                        continue
+                    session_id = self._session_id_from_history_file(
+                        chat_dir, file_path
+                    )
+                    if not session_id:
+                        kept_count += 1
+                        continue
+                    if session_id in runtime_sessions:
+                        kept_count += 1
+                        continue
+                    file_path.unlink()
+                    deleted_sessions.append(session_id)
+                except Exception as e:
+                    logger.warning(f"🌐 清理幽灵会话文件失败 {file_path}: {e}")
+
+            return web.json_response(
+                {
+                    "ok": True,
+                    "deleted": len(deleted_sessions),
+                    "deleted_sessions": deleted_sessions,
+                    "kept": kept_count,
+                }
+            )
+        except Exception as e:
+            logger.error(f"🌐 清理幽灵会话失败: {e}", exc_info=True)
+            return web.json_response(
+                {"ok": False, "msg": f"清理幽灵会话失败: {e}"}, status=500
+            )
 
     async def _handle_session_reset(self, request: web.Request):
         """重置会话数据"""

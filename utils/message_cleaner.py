@@ -519,31 +519,54 @@ class MessageCleaner:
             return "[引用消息]"
 
     @staticmethod
-    def is_empty_at_message(raw_message: str, is_at_message: bool) -> bool:
+    def is_empty_at_message(
+        raw_message: str,
+        is_at_message: bool,
+        mention_info: dict = None,
+        mode: str = "only_ai",
+    ) -> bool:
         """
-        判断是否是纯@消息（只有@没有其他内容）
+        判断是否是没有正文的@消息。
 
         Args:
             raw_message: 原始消息
             is_at_message: 是否是@消息
+            mention_info: 结构化@解析结果
+            mode: only_ai 只接受单独@AI；contains_ai 接受混合@里包含AI
 
         Returns:
-            True=纯@消息（只有@标记），False=有其他内容
+            True=没有正文的@消息，False=有其他内容
         """
         if not is_at_message:
             return False
 
-        # 移除所有@标记
-        without_at = re.sub(r"\[At:\d+\]", "", raw_message)
-        # 移除空白字符
+        raw_message = raw_message or ""
+        # 支持 [At:123]、[At:123|昵称]、[At:all] 等格式。
+        without_at = re.sub(r"\[At:[^\]]+\]", "", raw_message)
         without_at = without_at.strip()
+        if without_at:
+            return False
 
-        # 如果移除@后为空，说明是纯@消息
-        is_empty = len(without_at) == 0
+        mention_info = mention_info if isinstance(mention_info, dict) else {}
+        if mention_info:
+            has_at_ai = bool(
+                mention_info.get("has_at_ai") or mention_info.get("has_at_bot")
+            )
+            has_at_others = bool(
+                mention_info.get("has_at_others")
+                or mention_info.get("mentioned_user_id")
+            )
+            has_at_all = bool(mention_info.get("has_at_all"))
+            if mode == "contains_ai":
+                is_empty = has_at_ai
+            else:
+                is_empty = has_at_ai and not has_at_others and not has_at_all
+        else:
+            is_empty = True
 
         if is_empty:
             if DEBUG_MODE:
-                logger.info("[消息清理] 检测到纯@消息（无其他内容）")
+                logger.info("[消息清理] 检测到无正文@消息")
 
         return is_empty
 

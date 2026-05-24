@@ -18,6 +18,22 @@ from .proactive_chat_manager import ProactiveChatManager
 from .context_manager import ContextManager
 
 
+def _append_persistent_poke_event_text(base_text: str, event_text: str) -> str:
+    try:
+        base_text = base_text or ""
+        event_text = (event_text or "").strip()
+        if not event_text:
+            return base_text
+        if event_text in base_text:
+            return base_text
+        if not base_text.strip():
+            return event_text
+        return f"{base_text}\n{event_text}"
+    except Exception as e:
+        logger.warning(f"[消息缓存] 追加戳一戳持久事件文本失败，已回退原文本: {e}")
+        return base_text
+
+
 class MessageCacheManager:
     """
     消息缓存管理器 - 统一管理所有缓存操作
@@ -487,10 +503,17 @@ class MessageCacheManager:
                     cached_msg.get("mention_info"),
                     trigger_type,
                     cached_msg.get("poke_info"),
+                    cached_msg.get("is_empty_at", False),
+                    "",
+                    cached_msg.get("is_at_all_message", False),
                 )
 
                 # 清理系统提示
                 msg_content = MessageCleaner.clean_message(msg_content)
+                msg_content = _append_persistent_poke_event_text(
+                    msg_content,
+                    cached_msg.get("persistent_poke_event_text", ""),
+                )
 
                 # 保存图片URL
                 cached_image_urls = cached_msg.get("image_urls", [])
@@ -499,6 +522,11 @@ class MessageCacheManager:
                 convert_entry = {
                     "role": cached_msg.get("role", "user"),
                     "content": msg_content,
+                    "sender_id": cached_msg.get("sender_id", "") or "unknown",
+                    "sender_name": cached_msg.get("sender_name", "") or "未知用户",
+                    "message_timestamp": cached_msg.get("message_timestamp")
+                    or cached_msg.get("timestamp", 0),
+                    "message_id": cached_msg.get("message_id", ""),
                 }
 
                 if cached_image_urls:
@@ -758,10 +786,17 @@ class MessageCacheManager:
                 cached_msg.get("mention_info"),
                 trigger_type,
                 cached_msg.get("poke_info"),
+                cached_msg.get("is_empty_at", False),
+                "",
+                cached_msg.get("is_at_all_message", False),
             )
 
             # 清理系统提示
             msg_content = MessageCleaner.clean_message(msg_content)
+            msg_content = _append_persistent_poke_event_text(
+                msg_content,
+                cached_msg.get("persistent_poke_event_text", ""),
+            )
 
             # 保存图片URL
             cached_image_urls = cached_msg.get("image_urls", [])
@@ -769,12 +804,33 @@ class MessageCacheManager:
             convert_entry = {
                 "role": cached_msg.get("role", "user"),
                 "content": msg_content,
+                "sender_id": cached_msg.get("sender_id", "") or "unknown",
+                "sender_name": cached_msg.get("sender_name", "") or "未知用户",
+                "message_timestamp": cached_msg.get("message_timestamp")
+                or cached_msg.get("timestamp", 0),
+                "message_id": cached_msg.get("message_id", ""),
             }
 
             if cached_image_urls:
                 convert_entry["image_urls"] = cached_image_urls
 
             cached_messages_to_convert.append(convert_entry)
+
+            if cached_msg.get("smart_merged"):
+                _smart_sender = (
+                    f"{cached_msg.get('sender_name', '未知用户')}"
+                    f"(ID:{cached_msg.get('sender_id', 'unknown')})"
+                )
+                _smart_msg_id = str(cached_msg.get("message_id", ""))[:16]
+                cached_messages_to_convert.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"[Smart合并] {_smart_sender}的消息已与同期消息合并处理，"
+                            f"AI已在合并回复中一并回应，无需重复回答（ref:{_smart_msg_id}）"
+                        ),
+                    }
+                )
 
             if self.debug_mode:
                 sender_info = f"{cached_msg.get('sender_name')}(ID: {cached_msg.get('sender_id')})"

@@ -64,12 +64,23 @@ const SessionMgr = {
         // 列表头部：刷新按钮
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:16px 24px 8px;';
-        header.innerHTML = `<span style="font-size:13px;color:var(--text-muted);">共 ${this._sessions.length} 个会话</span>`;
+        const ghostCount = this._sessions.filter(s => s.has_file && !s.has_runtime_data).length;
+        header.innerHTML = `<span style="font-size:13px;color:var(--text-muted);">共 ${this._sessions.length} 个会话${ghostCount ? `，${ghostCount} 个幽灵会话` : ''}</span>`;
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;gap:8px;align-items:center;';
+        if (ghostCount) {
+            const cleanupBtn = document.createElement('button');
+            cleanupBtn.className = 'btn btn-sm';
+            cleanupBtn.textContent = '清理幽灵会话';
+            cleanupBtn.addEventListener('click', () => this._cleanupGhostSessions());
+            actions.appendChild(cleanupBtn);
+        }
         const refreshBtn = document.createElement('button');
         refreshBtn.className = 'btn btn-sm';
         refreshBtn.textContent = '刷新列表';
         refreshBtn.addEventListener('click', () => this._loadSessions());
-        header.appendChild(refreshBtn);
+        actions.appendChild(refreshBtn);
+        header.appendChild(actions);
         container.appendChild(header);
 
         if (!this._sessions.length) {
@@ -813,6 +824,24 @@ const SessionMgr = {
             setTimeout(() => this._loadSessions(), 1000);
         } else {
             Utils.toast(res.msg || '重置失败', 'error');
+        }
+    },
+
+    /** 清理仅有文件记录、没有运行时状态的幽灵会话 */
+    async _cleanupGhostSessions() {
+        const ghostCount = this._sessions.filter(s => s.has_file && !s.has_runtime_data).length;
+        if (!ghostCount) {
+            Utils.toast('没有需要清理的幽灵会话', 'info');
+            return;
+        }
+        const ok = await Utils.confirm(`确认清理 ${ghostCount} 个幽灵会话文件？\n运行中的会话和仍有运行时状态的会话会保留。`);
+        if (!ok) return;
+        const res = await Api.sessionCleanGhosts();
+        if (res.ok) {
+            Utils.toast(`已清理 ${res.deleted || 0} 个幽灵会话`, 'success');
+            setTimeout(() => this._loadSessions(), 500);
+        } else {
+            Utils.toast(res.msg || '清理失败', 'error');
         }
     },
 

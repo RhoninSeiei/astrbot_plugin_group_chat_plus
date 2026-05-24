@@ -159,6 +159,8 @@
 | `custom_storage_max_messages` | int | `500` | 自定义消息存储的最大条数。`0` = 禁用，`-1` = 不限制。用于保存完整的群聊上下文 |
 | `pending_cache_max_count` | int | `10` | 待处理消息池的最大条数。未通过概率筛选的消息暂存于此，下次回复时作为上下文合并 |
 | `pending_cache_ttl_seconds` | int | `1800` | 待处理消息的过期时间（秒），超过后自动清理 |
+| `single_at_message_reply_link_max_messages` | int | `3` | 纯空@机器人时，最多补充几条近期未转正缓存消息给回复AI参考。`0` 表示不补充 |
+| `single_at_message_reply_link_max_seconds` | int | `600` | 纯空@机器人时，近期缓存消息可被关联的最大时间窗口，超过后让AI自然询问 |
 
 ---
 

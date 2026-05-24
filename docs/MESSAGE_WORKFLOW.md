@@ -204,6 +204,8 @@ Phase 9 · 回复后处理（概率提升/打字延迟/错别字等）
 |--------|------|
 | `pending_cache_max_count` | 待处理池最大消息数 |
 | `pending_cache_ttl_seconds` | 缓存消息的过期时间 |
+| `single_at_message_reply_link_max_messages` | 空@机器人时关联的近期缓存消息数量 |
+| `single_at_message_reply_link_max_seconds` | 空@机器人时关联近期缓存消息的时间窗口 |
 
 ---
 

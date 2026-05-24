@@ -588,6 +588,18 @@
         "hint": "【上下文连续性】缓存消息的最大保留时间。如果长时间没有触发AI回复，超过此时间的缓存消息会被自动清理（认为已过时）。默认1800秒(30分钟)，建议600-3600秒。⚠️系统保护上限7200秒(2小时)",
         "default": 1800
     },
+    "single_at_message_reply_link_max_messages": {
+        "description": "📦 空@关联最近消息数量",
+        "type": "int",
+        "hint": "当用户只@机器人且没有附带文字时，最多向回复AI补充几条近期未转正缓存消息，帮助判断是在接上文还是单纯呼叫。0表示不补充，默认3条，系统上限20条。",
+        "default": 3
+    },
+    "single_at_message_reply_link_max_seconds": {
+        "description": "📦 空@关联最近消息时间窗口(秒)",
+        "type": "int",
+        "hint": "当用户只@机器人且没有附带文字时，只补充此时间窗口内的近期缓存消息。超过时间窗口则让AI自然询问。0表示只接受同一瞬间缓存，默认600秒，系统上限7200秒。",
+        "default": 600
+    },
     "enable_idle_cache_flush": {
         "description": "📦 启用冷群缓存自动转正",
         "type": "bool",
