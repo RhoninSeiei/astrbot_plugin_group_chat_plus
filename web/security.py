@@ -43,6 +43,7 @@ class BruteForceTracker:
     attempts: int = 0
     locked_until: float = 0.0
     first_attempt: float = 0.0
+    recent_attempts: List[float] = field(default_factory=list)
 
 
 # 暴力破解阶梯延迟配置：(失败次数阈值, 锁定秒数)
@@ -57,6 +58,10 @@ _BRUTE_FORCE_TIERS = [
 _LOG_FILE_MAX_SIZE = 1 * 1024 * 1024
 # 保留的历史日志文件数量
 _LOG_FILE_MAX_ROTATIONS = 2
+# 已登录请求默认速率阈值
+_DEFAULT_AUTHENTICATED_RATE_LIMIT = 240
+# 已登录请求默认滑动窗口
+_DEFAULT_AUTHENTICATED_RATE_WINDOW = 60
 
 # 可疑 User-Agent 特征（正则）
 _SUSPICIOUS_UA_PATTERNS = [
@@ -108,8 +113,22 @@ class SecurityManager:
         self.anti_spider_ban_duration: int = config.get(
             "web_panel_anti_spider_ban_duration", 300
         )
+        self.authenticated_rate_limit: int = self._get_int_config(
+            config,
+            "web_panel_authenticated_rate_limit",
+            max(_DEFAULT_AUTHENTICATED_RATE_LIMIT, self.anti_spider_rate_limit * 4),
+        )
+        self.authenticated_rate_window: int = self._get_int_config(
+            config,
+            "web_panel_authenticated_rate_window",
+            _DEFAULT_AUTHENTICATED_RATE_WINDOW,
+        )
         # 每 IP 请求计数（1分钟滑动窗口）: ip -> deque of timestamps
         self._request_timestamps: Dict[str, deque] = defaultdict(lambda: deque())
+        # 已登录请求计数: bucket -> deque of timestamps
+        self._authenticated_request_timestamps: Dict[str, deque] = defaultdict(
+            lambda: deque()
+        )
 
         # 访问日志 - 内存环形缓冲
         self.access_log: deque = deque(maxlen=10000)
@@ -130,11 +149,29 @@ class SecurityManager:
 
         # 暴力破解追踪 - 纯内存，重启清空
         self.brute_force: Dict[str, BruteForceTracker] = {}
+        self.brute_force_window: int = self._get_int_config(
+            config, "web_panel_brute_force_window", 3600
+        )
+        self.brute_force_rate_window: int = self._get_int_config(
+            config, "web_panel_brute_force_rate_window", 10
+        )
+        self.brute_force_rate_count: int = self._get_int_config(
+            config, "web_panel_brute_force_rate_count", 3
+        )
 
         # 启动时清理受保护 IP 误写入的封禁记录
         self._purge_protected_from_bans()
 
     # ==================== 辅助 ====================
+
+    @staticmethod
+    def _get_int_config(config: dict, key: str, default: int) -> int:
+        """读取整数配置，配置异常时使用默认值"""
+        try:
+            value = int(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value
 
     def _is_protected(self, ip: str) -> bool:
         """检查 IP 是否在受保护名单中"""
@@ -255,6 +292,48 @@ class SecurityManager:
                 return True, f"扫描行为检测（路径特征）: {path}"
 
         return False, ""
+
+    def check_authenticated_rate_limit(
+        self,
+        ip: str,
+        session_id: str = "",
+        path: str = "",
+        *,
+        is_heartbeat: bool = False,
+    ) -> Tuple[bool, int]:
+        """
+        检查已认证请求速率。
+
+        Returns:
+            (allowed, wait_seconds) - 是否放行及建议等待秒数
+        """
+        if self.authenticated_rate_limit <= 0 or self.authenticated_rate_window <= 0:
+            return True, 0
+        if self._is_protected(ip):
+            return True, 0
+        if self.ip_mode == "whitelist" and ip in self.ip_list:
+            return True, 0
+
+        now = time.time()
+        bucket = f"{session_id or 'session'}:{ip}"
+        window = self._authenticated_request_timestamps[bucket]
+        cutoff = now - self.authenticated_rate_window
+        while window and window[0] < cutoff:
+            window.popleft()
+        window.append(now)
+
+        if is_heartbeat:
+            return True, 0
+
+        if len(window) > self.authenticated_rate_limit:
+            wait_seconds = int(window[0] + self.authenticated_rate_window - now) + 1
+            logger.warning(
+                f"🔒 已认证请求频率过高：IP={ip}，路径={path or '-'}，"
+                f"{len(window)} 次/{self.authenticated_rate_window}秒"
+            )
+            return False, max(1, wait_seconds)
+
+        return True, 0
 
     def auto_ban_spider(self, ip: str, reason: str):
         """防爬虫触发时自动临时封禁（受保护 IP 豁免）"""
@@ -546,6 +625,14 @@ class SecurityManager:
             remaining = int(tracker.locked_until - now) + 1
             return True, remaining
 
+        if (
+            self.brute_force_window > 0
+            and tracker.first_attempt > 0
+            and now - tracker.first_attempt > self.brute_force_window
+        ):
+            self.brute_force.pop(ip, None)
+            return False, 0
+
         return False, 0
 
     def record_login_failure(self, ip: str):
@@ -555,13 +642,39 @@ class SecurityManager:
         if tracker is None:
             tracker = BruteForceTracker(attempts=0, locked_until=0.0, first_attempt=now)
             self.brute_force[ip] = tracker
+        elif (
+            self.brute_force_window > 0
+            and tracker.first_attempt > 0
+            and now - tracker.first_attempt > self.brute_force_window
+        ):
+            tracker.attempts = 0
+            tracker.locked_until = 0.0
+            tracker.first_attempt = now
+            tracker.recent_attempts.clear()
+        elif tracker.first_attempt <= 0:
+            tracker.first_attempt = now
 
         tracker.attempts += 1
+        if self.brute_force_rate_window > 0 and self.brute_force_rate_count > 1:
+            cutoff = now - self.brute_force_rate_window
+            tracker.recent_attempts = [
+                timestamp
+                for timestamp in tracker.recent_attempts
+                if timestamp >= cutoff
+            ]
+            tracker.recent_attempts.append(now)
 
         lock_seconds = 0
         for threshold, seconds in _BRUTE_FORCE_TIERS:
             if tracker.attempts >= threshold:
                 lock_seconds = seconds
+
+        if (
+            self.brute_force_rate_window > 0
+            and self.brute_force_rate_count > 1
+            and len(tracker.recent_attempts) >= self.brute_force_rate_count
+        ):
+            lock_seconds = max(lock_seconds, self.brute_force_rate_window)
 
         if lock_seconds > 0:
             tracker.locked_until = now + lock_seconds
@@ -585,6 +698,25 @@ class SecurityManager:
         self.anti_spider_rate_limit = config.get("web_panel_anti_spider_rate_limit", 60)
         self.anti_spider_ban_duration = config.get(
             "web_panel_anti_spider_ban_duration", 300
+        )
+        self.authenticated_rate_limit = self._get_int_config(
+            config,
+            "web_panel_authenticated_rate_limit",
+            max(_DEFAULT_AUTHENTICATED_RATE_LIMIT, self.anti_spider_rate_limit * 4),
+        )
+        self.authenticated_rate_window = self._get_int_config(
+            config,
+            "web_panel_authenticated_rate_window",
+            _DEFAULT_AUTHENTICATED_RATE_WINDOW,
+        )
+        self.brute_force_window = self._get_int_config(
+            config, "web_panel_brute_force_window", 3600
+        )
+        self.brute_force_rate_window = self._get_int_config(
+            config, "web_panel_brute_force_rate_window", 10
+        )
+        self.brute_force_rate_count = self._get_int_config(
+            config, "web_panel_brute_force_rate_count", 3
         )
 
         # 若受保护 IP 名单发生变化，重新检查封禁表

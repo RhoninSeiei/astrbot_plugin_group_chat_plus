@@ -37,6 +37,7 @@ from astrbot.api.all import AstrBotMessage, MessageType, MessageMember
 
 # 🆕 v1.2.0: 导入钩子调用相关模块
 from astrbot.core.star.star_handler import EventType
+from .ai_error_formatter import format_ai_error
 from .session_preferences import get_session_provider, resolve_session_persona
 
 # 🆕 v1.2.0: 标记键名（与 reply_handler.py 保持一致）
@@ -185,6 +186,13 @@ class ProactiveChatManager:
     _enable_proactive_ai_judge: bool = False
     _proactive_ai_judge_prompt: str = ""
     _proactive_ai_judge_timeout: int = 15
+    _proactive_ai_judge_include_persona: bool = True
+    _proactive_ai_judge_persona_name: str = ""
+    _enable_proactive_ai_reasoning: bool = False
+    _proactive_ai_reasoning_log: bool = False
+    _proactive_ai_reasoning_log_mode: str = "processed"
+    _judgment_reasoning_start_marker: str = "<gcp_judgment_reasoning>"
+    _judgment_reasoning_end_marker: str = "</gcp_judgment_reasoning>"
     _decision_ai_provider_id: str = ""
     # 🔄 共享的AI回复缓存引用（由 main.py 传入，用于重复检测）
     # 格式: {chat_id: [{"content": "回复内容", "timestamp": 时间戳}]}
@@ -359,6 +367,27 @@ class ProactiveChatManager:
         cls._enable_proactive_ai_judge = config.get("enable_proactive_ai_judge", False)
         cls._proactive_ai_judge_prompt = config.get("proactive_ai_judge_prompt", "")
         cls._proactive_ai_judge_timeout = config.get("proactive_ai_judge_timeout", 15)
+        cls._proactive_ai_judge_include_persona = config.get(
+            "proactive_ai_judge_include_persona", True
+        )
+        cls._proactive_ai_judge_persona_name = config.get(
+            "proactive_ai_judge_persona_name", ""
+        )
+        cls._enable_proactive_ai_reasoning = config.get(
+            "enable_proactive_ai_reasoning", False
+        )
+        cls._proactive_ai_reasoning_log = config.get(
+            "proactive_ai_reasoning_log", False
+        )
+        cls._proactive_ai_reasoning_log_mode = config.get(
+            "proactive_ai_reasoning_log_mode", "processed"
+        )
+        cls._judgment_reasoning_start_marker = config.get(
+            "judgment_reasoning_start_marker", "<gcp_judgment_reasoning>"
+        )
+        cls._judgment_reasoning_end_marker = config.get(
+            "judgment_reasoning_end_marker", "</gcp_judgment_reasoning>"
+        )
         cls._decision_ai_provider_id = config.get("decision_ai_provider_id", "")
         # 🔄 获取共享的AI回复缓存引用（与普通对话共享，用于跨模式重复检测）
         if hasattr(plugin_instance, "recent_replies_cache"):
@@ -4283,24 +4312,20 @@ class ProactiveChatManager:
                     # 保存原始完整提示词（判断完成后直接用于生成，不经过判断AI的提示词污染）
                     saved_final_message = final_message
 
-                    # 提取当前人格（每次重新提取，避免用户中途切换人格）
-                    judge_persona_prompt = ""
-                    try:
-                        judge_persona = (
-                            await resolve_session_persona(
-                                context,
-                                umo=unified_msg_origin,
-                                platform_name=platform_id,
-                            )
-                        )
-                        judge_persona_prompt = judge_persona.get("prompt", "")
-                        if debug_mode:
-                            logger.info(
-                                f"[主动对话-AI预判断] 已提取人格: {judge_persona.get('name', 'default')}"
-                            )
-                    except Exception as e:
-                        if debug_mode:
-                            logger.warning(f"[主动对话-AI预判断] 提取人格失败: {e}")
+                    from .decision_ai import DecisionAI
+                    from .ai_response_filter import AIResponseFilter
+
+                    persona_result = await DecisionAI.resolve_judgment_persona(
+                        context=context,
+                        unified_msg_origin=unified_msg_origin,
+                        platform_name=platform_id,
+                        include_persona=cls._proactive_ai_judge_include_persona,
+                        configured_persona_name=cls._proactive_ai_judge_persona_name,
+                        log_prefix="[主动对话-AI预判断]",
+                    )
+                    judge_persona_prompt = (
+                        persona_result.get("system_prompt", "") or ""
+                    )
 
                     # 构建判断AI的提示词（静态部分在前，利于缓存命中）
                     default_judge_prompt = (
@@ -4325,6 +4350,15 @@ class ProactiveChatManager:
                     )
                     if not judge_prompt_text:
                         judge_prompt_text = default_judge_prompt
+                    judge_prompt_text, _reasoning_added = (
+                        DecisionAI._ensure_reasoning_protocol(
+                            judge_prompt_text,
+                            cls._enable_proactive_ai_reasoning,
+                            cls._judgment_reasoning_start_marker,
+                            cls._judgment_reasoning_end_marker,
+                            allowed_answers=["yes", "no"],
+                        )
+                    )
 
                     # 拼接：静态判断提示词 + 动态上下文（缓存友好：静态在前）
                     judge_full_prompt = (
@@ -4356,8 +4390,6 @@ class ProactiveChatManager:
                         logger.warning(
                             "[主动对话-AI预判断] 未找到可用的AI提供商，跳过本次主动对话"
                         )
-                        state = cls.get_chat_state(chat_key)
-                        state["last_bot_reply_time"] = time.time()
                         return
 
                     # 调用AI判断（带超时控制）
@@ -4377,23 +4409,26 @@ class ProactiveChatManager:
                         _call_judge_ai(), timeout=judge_timeout
                     )
 
-                    # 过滤思考链
-                    from .ai_response_filter import AIResponseFilter
-
-                    judge_response = AIResponseFilter.filter_thinking_chain(
-                        judge_response
+                    parse_result = AIResponseFilter.parse_decision_response(
+                        judge_response,
+                        cls._judgment_reasoning_start_marker
+                        if cls._enable_proactive_ai_reasoning
+                        else "",
+                        cls._judgment_reasoning_end_marker
+                        if cls._enable_proactive_ai_reasoning
+                        else "",
                     )
-
-                    # 解析判断结果
-                    judge_result = judge_response.strip().lower().rstrip(".,!?。，！？")
-                    judge_pass = judge_result in (
-                        "yes",
-                        "y",
-                        "是",
-                        "应该",
-                        "回复",
-                        "适合",
+                    DecisionAI.log_reasoning_output(
+                        "[主动对话-AI预判断]",
+                        judge_response,
+                        parse_result,
+                        cls._proactive_ai_reasoning_log,
+                        cls._proactive_ai_reasoning_log_mode,
                     )
+                    judge_result = (
+                        parse_result.get("normalized_answer") or ""
+                    ).lower()
+                    judge_pass = judge_result in ("yes", "y", "是", "应该", "回复", "适合")
 
                     if debug_mode:
                         logger.info(
@@ -4420,15 +4455,12 @@ class ProactiveChatManager:
                     logger.warning(
                         f"[主动对话-AI预判断] 群{chat_key} - AI判断超时（{cls._proactive_ai_judge_timeout}秒），默认不触发"
                     )
-                    state = cls.get_chat_state(chat_key)
-                    state["last_bot_reply_time"] = time.time()
                     return
                 except Exception as e:
                     logger.warning(
-                        f"[主动对话-AI预判断] 群{chat_key} - AI判断调用失败: {e}，默认不触发"
+                        "%s，默认不触发",
+                        format_ai_error(e, f"主动对话AI预判断 群{chat_key}"),
                     )
-                    state = cls.get_chat_state(chat_key)
-                    state["last_bot_reply_time"] = time.time()
                     return
 
             # 注入情绪状态（如果启用，放在AI预判断之后避免影响判断）

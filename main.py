@@ -137,6 +137,7 @@ from .utils import (
     WelcomeMessageParser,  # 🆕 新成员入群消息解析器
     ReplyDensityManager,  # 🆕 v1.2.1: 回复密度管理器
     MessageQualityScorer,  # 🆕 v1.2.1: 消息质量预判器
+    SmartConcurrentManager,  # 智能并发合并管理器
 )
 from .utils.image_description_cache import (
     ImageDescriptionCache,
@@ -144,6 +145,7 @@ from .utils.image_description_cache import (
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
+from .utils.system_prompt_rewriter import SystemPromptRewriter
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
@@ -248,6 +250,25 @@ class ChatPlus(Star):
         self.decision_ai_prompt_mode = config.get(
             "decision_ai_prompt_mode", "append"
         )  # 读空气AI提示词模式
+        self.decision_ai_include_persona = config.get(
+            "decision_ai_include_persona", True
+        )
+        self.decision_ai_persona_name = config.get("decision_ai_persona_name", "")
+        self.enable_decision_ai_reasoning = config.get(
+            "enable_decision_ai_reasoning", False
+        )
+        self.decision_ai_reasoning_log = config.get(
+            "decision_ai_reasoning_log", False
+        )
+        self.decision_ai_reasoning_log_mode = config.get(
+            "decision_ai_reasoning_log_mode", "processed"
+        )
+        self.judgment_reasoning_start_marker = config.get(
+            "judgment_reasoning_start_marker", "<gcp_judgment_reasoning>"
+        )
+        self.judgment_reasoning_end_marker = config.get(
+            "judgment_reasoning_end_marker", "</gcp_judgment_reasoning>"
+        )
 
         # === 回复AI配置 ===
         self.reply_ai_extra_prompt = config.get(
@@ -1010,6 +1031,21 @@ class ChatPlus(Star):
         self.proactive_ai_judge_timeout = config.get(
             "proactive_ai_judge_timeout", 15
         )  # 主动对话AI预判断超时时间
+        self.proactive_ai_judge_include_persona = config.get(
+            "proactive_ai_judge_include_persona", True
+        )
+        self.proactive_ai_judge_persona_name = config.get(
+            "proactive_ai_judge_persona_name", ""
+        )
+        self.enable_proactive_ai_reasoning = config.get(
+            "enable_proactive_ai_reasoning", False
+        )
+        self.proactive_ai_reasoning_log = config.get(
+            "proactive_ai_reasoning_log", False
+        )
+        self.proactive_ai_reasoning_log_mode = config.get(
+            "proactive_ai_reasoning_log_mode", "processed"
+        )
         self.proactive_silence_threshold = config.get(
             "proactive_silence_threshold", 600
         )  # 沉默阈值
@@ -1270,6 +1306,19 @@ class ChatPlus(Star):
         self.concurrent_wait_interval = config.get(
             "concurrent_wait_interval", 1.0
         )  # 并发等待间隔
+        self.concurrent_mode = config.get("concurrent_mode", "legacy")
+        self.enable_smart_batch_reply_hint = config.get(
+            "enable_smart_batch_reply_hint", True
+        )
+        self.smart_concurrent_merge_wait = config.get(
+            "smart_concurrent_merge_wait", 15.0
+        )
+        self.smart_concurrent_max_batch_size = config.get(
+            "smart_concurrent_max_batch_size", 20
+        )
+        self.smart_concurrent_claim_delay = config.get(
+            "smart_concurrent_claim_delay", 0.3
+        )
         self.typing_delay_timeout_warning = config.get(
             "typing_delay_timeout_warning", 5
         )  # 打字延迟超时警告
@@ -1567,6 +1616,14 @@ class ChatPlus(Star):
         # 🔧 并发保护：存储消息缓存快照，供 after_message_sent 使用
         # 格式: {message_id: cached_message_dict}
         self._message_cache_snapshots = {}
+        self._smart_batch_snapshots = {}
+        self._smart_arrival_seq = 0
+        SmartConcurrentManager._EXPIRE_SECONDS = float(
+            self.smart_concurrent_merge_wait
+        )
+        SmartConcurrentManager._MAX_BATCH_SIZE = max(
+            1, int(self.smart_concurrent_max_batch_size)
+        )
 
         # 🆕 主动对话正在处理的会话标记（用于普通对话和主动对话之间的并发保护）
         # 格式: {chat_id: timestamp}，记录主动对话开始处理的时间
@@ -2149,6 +2206,13 @@ class ChatPlus(Star):
             "enable_proactive_ai_judge": self.enable_proactive_ai_judge,
             "proactive_ai_judge_prompt": self.proactive_ai_judge_prompt,
             "proactive_ai_judge_timeout": self.proactive_ai_judge_timeout,
+            "proactive_ai_judge_include_persona": self.proactive_ai_judge_include_persona,
+            "proactive_ai_judge_persona_name": self.proactive_ai_judge_persona_name,
+            "enable_proactive_ai_reasoning": self.enable_proactive_ai_reasoning,
+            "proactive_ai_reasoning_log": self.proactive_ai_reasoning_log,
+            "proactive_ai_reasoning_log_mode": self.proactive_ai_reasoning_log_mode,
+            "judgment_reasoning_start_marker": self.judgment_reasoning_start_marker,
+            "judgment_reasoning_end_marker": self.judgment_reasoning_end_marker,
             "decision_ai_provider_id": self.decision_ai_provider_id,
         }
 
@@ -2629,6 +2693,20 @@ class ChatPlus(Star):
             if _cleanup_message_id:
                 self.processing_sessions.pop(_cleanup_message_id, None)
                 self._message_cache_snapshots.pop(_cleanup_message_id, None)
+                self._smart_batch_snapshots.pop(_cleanup_message_id, None)
+                if self.concurrent_mode == "smart":
+                    try:
+                        smart_chat_id = (
+                            event.get_extra("_gcp_smart_chat_id", "")
+                            if hasattr(event, "get_extra")
+                            else ""
+                        )
+                        await SmartConcurrentManager.remove_self(
+                            smart_chat_id,
+                            _cleanup_message_id,
+                        )
+                    except Exception:
+                        pass
                 self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
 
     async def restart_core(self):
@@ -4071,6 +4149,13 @@ class ChatPlus(Star):
                 is_preliminary_filter=(
                     self.enable_main_model_final_decision and should_do_ai_decision
                 ),
+                enable_reasoning=self.enable_decision_ai_reasoning,
+                reasoning_log_enabled=self.decision_ai_reasoning_log,
+                reasoning_log_mode=self.decision_ai_reasoning_log_mode,
+                reasoning_start_marker=self.judgment_reasoning_start_marker,
+                reasoning_end_marker=self.judgment_reasoning_end_marker,
+                include_persona=self.decision_ai_include_persona,
+                configured_persona_name=self.decision_ai_persona_name,
             )
             # 🐛 修复：不要在这里删除缓存！
             # pre_decision 模式下，缓存的上下文（已植入记忆）需要在生成回复时使用
@@ -6252,6 +6337,8 @@ class ChatPlus(Star):
         ) = await self._perform_initial_checks(event)
         if not should_continue:
             return
+        if self.concurrent_mode == "smart":
+            event.set_extra("_gcp_smart_chat_id", chat_id)
 
         # 🆕 v1.0.2: 记录消息（用于频率调整统计）
         if self.frequency_adjuster_enabled and self.frequency_adjuster:
@@ -6708,6 +6795,125 @@ class ChatPlus(Star):
         except Exception as e:
             logger.warning(f"[并发保护] 保存缓存副本失败: {e}")
 
+        smart_batch_messages = []
+        if self.concurrent_mode == "smart" and current_message_cache:
+            try:
+                self._smart_arrival_seq += 1
+                await SmartConcurrentManager.register_arrival(
+                    chat_id=chat_id,
+                    processing_id=early_message_id,
+                    source_event_id=early_message_id,
+                    arrival_seq=self._smart_arrival_seq,
+                    arrival_monotonic=time.monotonic(),
+                )
+                await SmartConcurrentManager.attach_payload(
+                    chat_id=chat_id,
+                    processing_id=early_message_id,
+                    content=ContextManager.normalize_message_content(
+                        current_message_cache.get("content", "")
+                    ),
+                    sender_name=event.get_sender_name() or "未知用户",
+                    sender_id=str(event.get_sender_id() or ""),
+                    cached_data=copy.deepcopy(current_message_cache),
+                    is_forced=bool(is_at_message or has_trigger_keyword),
+                )
+
+                if await SmartConcurrentManager.is_consumed(early_message_id):
+                    consumer_id = await SmartConcurrentManager.get_consumer(
+                        early_message_id
+                    )
+                    logger.info(
+                        f"🔀 [Smart并发] 消息 {early_message_id[:20]} 已被更早批次 {consumer_id} 吸收，跳过独立处理"
+                    )
+                    event.call_llm = True
+                    return
+
+                if await SmartConcurrentManager.has_earlier_pending(
+                    chat_id, early_message_id
+                ):
+                    wait_deadline = time.monotonic() + float(
+                        self.smart_concurrent_merge_wait
+                    )
+                    while time.monotonic() < wait_deadline:
+                        if await SmartConcurrentManager.is_consumed(early_message_id):
+                            consumer_id = await SmartConcurrentManager.get_consumer(
+                                early_message_id
+                            )
+                            logger.info(
+                                f"🔀 [Smart并发] 消息 {early_message_id[:20]} 等待期间被批次 {consumer_id} 吸收"
+                            )
+                            event.call_llm = True
+                            return
+                        if not await SmartConcurrentManager.has_earlier_pending(
+                            chat_id, early_message_id
+                        ):
+                            break
+                        await asyncio.sleep(min(0.2, self.concurrent_wait_interval))
+
+                if self.smart_concurrent_claim_delay > 0:
+                    await asyncio.sleep(float(self.smart_concurrent_claim_delay))
+
+                smart_claim = await SmartConcurrentManager.claim_batch(
+                    chat_id, early_message_id
+                )
+                if smart_claim.get("is_consumed"):
+                    event.call_llm = True
+                    return
+
+                merged_entries = smart_claim.get("merged_entries") or []
+                for entry in merged_entries:
+                    follower_cache = copy.deepcopy(entry.get("cached_data") or {})
+                    if not follower_cache:
+                        continue
+                    follower_cache["window_buffered"] = True
+                    follower_cache["smart_batch_dynamic_hint"] = True
+                    self.cache_manager.add_to_cache(
+                        chat_id, follower_cache, source="Smart并发"
+                    )
+                    smart_batch_messages.append(follower_cache)
+
+                if smart_batch_messages:
+                    self._smart_batch_snapshots[early_message_id] = smart_batch_messages
+                    bot_id = event.get_self_id()
+                    formatted_context = await ContextManager.format_context_for_ai(
+                        history_messages,
+                        message_text,
+                        bot_id,
+                        include_timestamp=self.include_timestamp,
+                        include_sender_info=self.include_sender_info,
+                        window_buffered_messages=self.cache_manager.get_window_buffered_messages(
+                            chat_id
+                        ),
+                    )
+                    for _smart_msg in smart_batch_messages:
+                        for _url in _smart_msg.get("image_urls") or []:
+                            if _url and _url not in merged_image_urls:
+                                merged_image_urls.append(_url)
+                    if self.enable_smart_batch_reply_hint:
+                        sender_name = event.get_sender_name() or "当前发送者"
+                        summary_lines = []
+                        for idx, _smart_msg in enumerate(smart_batch_messages, 1):
+                            _name = _smart_msg.get("sender_name") or "未知用户"
+                            _sid = _smart_msg.get("sender_id") or "unknown"
+                            _content = ContextManager.normalize_message_content(
+                                _smart_msg.get("content", "")
+                            )
+                            summary_lines.append(
+                                f"{idx}. {_name}(ID:{_sid}): {_content[:160]}"
+                            )
+                        formatted_context += (
+                            "\n\n[系统提示-Smart并发]\n"
+                            f"当前消息来自 {sender_name}，其后又有 {len(smart_batch_messages)} 条消息被合并到本批次。\n"
+                            "回复时请综合当前消息和这些追加消息，避免只回答第一条。\n"
+                            + "\n".join(summary_lines)
+                            + "\n"
+                        )
+                    logger.info(
+                        f"🔀 [Smart并发] 当前消息吸收 {len(smart_batch_messages)} 条后续消息进入同一批次"
+                    )
+            except Exception as e:
+                logger.warning(f"[Smart并发] 批处理准备失败，降级为单消息处理: {e}")
+
         # 步骤7: AI决策判断（第二道核心过滤）
         # 🆕 新成员入群消息 skip_all 模式：跳过AI决策，强制处理
         _welcome_skip_all = (
@@ -6756,6 +6962,9 @@ class ChatPlus(Star):
 
             # 🔧 清理缓存快照（不回复时 after_message_sent 不会被调用）
             self._message_cache_snapshots.pop(early_message_id, None)
+            self._smart_batch_snapshots.pop(early_message_id, None)
+            if self.concurrent_mode == "smart":
+                await SmartConcurrentManager.remove_self(chat_id, early_message_id)
 
             if self.debug_mode:
                 logger.info("=" * 60)
@@ -7245,45 +7454,18 @@ class ChatPlus(Star):
         plugin_prompt = event.get_extra(PLUGIN_CUSTOM_PROMPT, "")
         plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])
 
-        # 🔧 关键：保留其他插件注入的 system_prompt 内容
-        # 其他插件可能在 system_prompt 前面（prepend）或后面（append）追加内容
-        # 例如 Favour Ultra 会 prepend 好感度规则，emotionai 会 append 情感指令
-        # 我们需要保留这些内容，但移除平台重复注入的 persona 和 LTM 聊天记录
-        import re
-
-        other_plugin_additions = ""
-        if req.system_prompt and plugin_system_prompt:
-            if plugin_system_prompt in req.system_prompt:
-                # 从当前 system_prompt 中移除所有本插件的原始 prompt
-                # 使用 replace 无限制，移除所有出现（包括平台 ProcessLLMRequest 重复注入的）
-                other_plugin_additions = req.system_prompt.replace(
-                    plugin_system_prompt, ""
-                )
-
-                # 🆕 移除平台 LTM 注入的群聊历史记录（我们插件自己管理上下文）
-                # LTM 会追加类似 "You are now in a chatroom. The chat history is as follows: \n..." 的内容
-                # 注意：使用保守的匹配策略，只匹配到下一个 "\n\n" 为止，避免误删其他插件的内容
-                # 其他插件（如 FavourPro、SelfLearning）通常用 "\n\n" 作为分隔符
-                ltm_pattern = r"You are now in a chatroom\. The chat history is as follows:\s*[^\n]*(?:\n(?!\n)[^\n]*)*"
-                other_plugin_additions = re.sub(ltm_pattern, "", other_plugin_additions)
-
-                # 清理多余的换行符和空白
-                other_plugin_additions = re.sub(
-                    r"\n{3,}", "\n\n", other_plugin_additions
-                ).strip()
-
-                if self.debug_mode and other_plugin_additions:
-                    logger.info(
-                        f"  检测到其他插件注入的 system_prompt 内容，长度: {len(other_plugin_additions)}"
-                    )
-            elif len(req.system_prompt) > len(plugin_system_prompt):
-                # 插件原始 prompt 不在当前 system_prompt 中（可能被平台 LTM 整体替换）
-                # 回退：将整个当前 system_prompt 与插件 prompt 的差异部分视为其他插件内容
-                other_plugin_additions = req.system_prompt
-                if self.debug_mode:
-                    logger.info(
-                        f"  插件原始 prompt 未在当前 system_prompt 中找到，保留全部当前内容作为其他插件注入"
-                    )
+        rewrite_result = SystemPromptRewriter.rewrite_preserving_plugin_base(
+            req.system_prompt or "",
+            plugin_system_prompt,
+        )
+        if self.debug_mode:
+            logger.info(
+                f"  system_prompt重写策略: {rewrite_result.strategy}, "
+                f"置信度: {rewrite_result.confidence}, "
+                f"长度: {len(rewrite_result.merged_system_prompt or '')}"
+            )
+            for warning in rewrite_result.warnings:
+                logger.warning(f"  system_prompt重写提示: {warning}")
 
         # 🔧 使用插件自己的上下文替换平台 LTM 注入的上下文
         # 平台 LTM 的 on_req_llm 方法会修改 req.contexts 和 req.system_prompt
@@ -7305,11 +7487,7 @@ class ChatPlus(Star):
         plugin_tool_set = event.get_extra(PLUGIN_FUNC_TOOL)
         req.func_tool = plugin_tool_set  # 可能是 ToolSet 或 None（获取失败时）
 
-        # 🔧 合并 system_prompt：插件基础 + 其他插件注入的内容
-        if other_plugin_additions:
-            req.system_prompt = f"{plugin_system_prompt}\n{other_plugin_additions}"
-        else:
-            req.system_prompt = plugin_system_prompt
+        req.system_prompt = rewrite_result.merged_system_prompt
 
         # 🔧 修复：注入 Skills 提示词，避免插件接管 LLM 请求后丢失技能识别
         # 原因：插件通过 event.request_llm() 创建的 ProviderRequest 没有 conversation 对象，

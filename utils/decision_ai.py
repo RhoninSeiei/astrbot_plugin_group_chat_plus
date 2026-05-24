@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from astrbot.api.all import *
 from .ai_response_filter import AIResponseFilter
+from .ai_error_formatter import format_ai_error
 from ._session_guard import sample_guard
 from .session_preferences import get_session_provider, resolve_session_persona
 
@@ -159,6 +160,161 @@ class DecisionAI:
     SYSTEM_DECISION_PROMPT_ENDING = "\n请开始判断：\n"
 
     @staticmethod
+    def _build_reasoning_protocol(
+        reasoning_start_marker: str,
+        reasoning_end_marker: str,
+        allowed_answers: Optional[List[str]] = None,
+    ) -> str:
+        if not reasoning_start_marker or not reasoning_end_marker:
+            return ""
+        answers = [str(ans).strip() for ans in (allowed_answers or []) if str(ans).strip()]
+        if not answers:
+            answers = ["yes", "no"]
+        return (
+            "\n\n【额外推理协议】\n"
+            f"1. 先在 {reasoning_start_marker} 和 {reasoning_end_marker} 之间写出简短推理。\n"
+            f"2. 推理块结束后，最后一行只能输出以下之一：{' / '.join(answers)}。\n"
+            "3. 不要输出原生思考标签，例如 <think>、<reasoning>、<analysis>。\n"
+            "4. 最终答案必须独占最后一行，不要添加解释、标点或前后缀。\n"
+        )
+
+    @staticmethod
+    def _prompt_has_reasoning_protocol(
+        prompt_text: str,
+        reasoning_start_marker: str,
+        reasoning_end_marker: str,
+    ) -> bool:
+        if not prompt_text:
+            return False
+        markers = [reasoning_start_marker, reasoning_end_marker, "【额外推理协议】"]
+        return any(marker and marker in prompt_text for marker in markers)
+
+    @staticmethod
+    def _ensure_reasoning_protocol(
+        prompt_text: str,
+        enable_reasoning: bool,
+        reasoning_start_marker: str,
+        reasoning_end_marker: str,
+        allowed_answers: Optional[List[str]] = None,
+    ) -> tuple[str, bool]:
+        if not enable_reasoning:
+            return prompt_text, False
+        if DecisionAI._prompt_has_reasoning_protocol(
+            prompt_text, reasoning_start_marker, reasoning_end_marker
+        ):
+            return prompt_text, False
+        protocol = DecisionAI._build_reasoning_protocol(
+            reasoning_start_marker,
+            reasoning_end_marker,
+            allowed_answers=allowed_answers,
+        )
+        if not protocol:
+            return prompt_text, False
+        return (prompt_text or "").rstrip() + protocol, True
+
+    @staticmethod
+    def log_reasoning_output(
+        log_prefix: str,
+        raw_response: str,
+        parse_result: Dict[str, Any],
+        log_enabled: bool,
+        log_mode: str = "processed",
+    ) -> None:
+        if not log_enabled:
+            return
+        mode = (log_mode or "processed").strip().lower()
+        if mode == "raw":
+            if raw_response:
+                logger.info(f"{log_prefix} 原始输出:\n{raw_response}")
+            return
+        reasoning_text = (parse_result or {}).get("reasoning_text") or ""
+        if reasoning_text:
+            logger.info(f"{log_prefix} 推理过程:\n{reasoning_text}")
+        elif (parse_result or {}).get("protocol_followed") is True:
+            logger.info(f"{log_prefix} 未输出推理过程，最终答案: {(parse_result or {}).get('tail_line', '')}")
+        elif (parse_result or {}).get("protocol_followed") is False:
+            logger.warning(
+                f"{log_prefix} 未严格遵守推理协议，已使用兼容解析。最后一行: {(parse_result or {}).get('tail_line', '')}"
+            )
+
+    @staticmethod
+    async def resolve_judgment_persona(
+        context: Context,
+        event: Optional[AstrMessageEvent] = None,
+        unified_msg_origin: str = "",
+        platform_name: str = "",
+        include_persona: bool = True,
+        configured_persona_name: str = "",
+        log_prefix: str = "[判断型AI]",
+    ) -> Dict[str, Any]:
+        result = {
+            "system_prompt": "",
+            "persona_name": "",
+            "source": "none",
+            "fallback_used": False,
+            "include_persona": bool(include_persona),
+            "configured_persona_name": (configured_persona_name or "").strip(),
+        }
+        if not include_persona:
+            logger.info(f"{log_prefix} 已关闭人格注入，使用中性判断模式")
+            return result
+
+        persona_manager = getattr(context, "persona_manager", None)
+        configured_name = (configured_persona_name or "").strip()
+        if persona_manager and configured_name:
+            try:
+                persona = None
+                getter = getattr(persona_manager, "get_persona_v3_by_id", None)
+                if callable(getter):
+                    persona = getter(configured_name)
+                if not persona:
+                    personas = getattr(persona_manager, "personas_v3", []) or []
+                    persona = next(
+                        (
+                            item
+                            for item in personas
+                            if isinstance(item, dict)
+                            and item.get("name") == configured_name
+                        ),
+                        None,
+                    )
+                if isinstance(persona, dict):
+                    result["system_prompt"] = persona.get("prompt", "") or ""
+                    result["persona_name"] = persona.get("name", configured_name)
+                    result["source"] = "configured"
+                    logger.info(f"{log_prefix} 已使用指定人格: {result['persona_name']}")
+                    return result
+                result["fallback_used"] = True
+                logger.warning(
+                    f"{log_prefix} 未找到指定人格“{configured_name}”，回退到当前会话人格"
+                )
+            except Exception as e:
+                result["fallback_used"] = True
+                logger.warning(
+                    f"{log_prefix} 解析指定人格“{configured_name}”失败: {e}，回退到当前会话人格"
+                )
+
+        try:
+            persona = await resolve_session_persona(
+                context,
+                event=event,
+                umo=unified_msg_origin or None,
+                platform_name=platform_name or None,
+            )
+            if isinstance(persona, dict):
+                result["system_prompt"] = persona.get("prompt", "") or ""
+                result["persona_name"] = persona.get("name", "default") or "default"
+                result["source"] = "current-session"
+                if DEBUG_MODE:
+                    logger.info(
+                        f"{log_prefix} 已使用当前会话人格: {result['persona_name']}，长度: {len(result['system_prompt'])}"
+                    )
+                return result
+        except Exception as e:
+            logger.warning(f"{log_prefix} 获取人格设定失败: {e}，使用空人格")
+        return result
+
+    @staticmethod
     async def should_reply(
         context: Context,
         event: AstrMessageEvent,
@@ -184,6 +340,15 @@ class DecisionAI:
         reply_density_hint: str = "",
         # 🆕 v1.3.1: 是否作为第一层宽松粗筛
         is_preliminary_filter: bool = False,
+        # 判断型AI额外推理配置
+        enable_reasoning: bool = False,
+        reasoning_log_enabled: bool = False,
+        reasoning_log_mode: str = "processed",
+        reasoning_start_marker: str = "",
+        reasoning_end_marker: str = "",
+        # 判断型AI人格配置
+        include_persona: bool = True,
+        configured_persona_name: str = "",
     ) -> bool:
         """
         调用AI判断是否应该回复
@@ -231,27 +396,14 @@ class DecisionAI:
                     pass
                 return False
 
-            # 🔧 修复：直接使用 persona_manager 获取最新人格配置，支持多会话和实时更新
-            try:
-                default_persona = await resolve_session_persona(context, event=event)
-
-                persona_prompt = default_persona.get("prompt", "")
-
-                # 🔧 修复：不再将人格预设对话（begin_dialogs）注入 contexts
-                # 原因：begin_dialogs 是人设示例对话，不是真实历史消息。
-                # 如果将其作为 contexts 传入 LLM，LLM 会把它们当成真实对话轮次，
-                # 导致预设对话内容污染决策判断上下文。
-                # 人格行为已通过 system_prompt（persona_prompt）体现，无需重复注入。
-                persona_contexts = []
-
-                if DEBUG_MODE:
-                    logger.info(
-                        f"✅ [决策AI] 已获取当前人格配置，人格名: {default_persona.get('name', 'default')}, 长度: {len(persona_prompt)} 字符"
-                    )
-            except Exception as e:
-                logger.warning(f"获取人格设定失败: {e}，使用空人格")
-                persona_prompt = ""
-                persona_contexts = []
+            persona_result = await DecisionAI.resolve_judgment_persona(
+                context=context,
+                event=event,
+                include_persona=include_persona,
+                configured_persona_name=configured_persona_name,
+                log_prefix="[决策AI]",
+            )
+            persona_prompt = persona_result.get("system_prompt", "") or ""
 
             # 🆕 提取当前发送者信息，用于强化识别（仅在开启 include_sender_info 时添加）
             sender_emphasis = ""
@@ -452,11 +604,18 @@ class DecisionAI:
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
             # 即使AI服务商不支持前缀缓存，此顺序调整也不影响功能。
             if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
+                static_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
+                    extra_prompt.strip(),
+                    enable_reasoning,
+                    reasoning_start_marker,
+                    reasoning_end_marker,
+                    allowed_answers=["yes", "no"],
+                )
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
                 # 🔧 v1.3.0: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前发送者身份
                 full_prompt = (
-                    extra_prompt.strip()
+                    static_prompt
                     + sender_emphasis
                     + "\n\n"
                     + formatted_message
@@ -480,6 +639,13 @@ class DecisionAI:
                         )
 
                 # 添加结束指令（静态）
+                full_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
+                    full_prompt,
+                    enable_reasoning,
+                    reasoning_start_marker,
+                    reasoning_end_marker,
+                    allowed_answers=["yes", "no"],
+                )
                 full_prompt += DecisionAI.SYSTEM_DECISION_PROMPT_ENDING
 
                 # 动态内容放在最后
@@ -510,11 +676,26 @@ class DecisionAI:
             # 使用用户配置的超时时间
             ai_response = await asyncio.wait_for(call_decision_ai(), timeout=timeout)
 
-            # 🆕 v1.1.2: 过滤AI响应中的思考链标记
-            ai_response = AIResponseFilter.filter_thinking_chain(ai_response)
-
-            # 解析AI的回复
-            decision = DecisionAI._parse_decision(ai_response)
+            parse_result = AIResponseFilter.parse_decision_response(
+                ai_response,
+                reasoning_start_marker if enable_reasoning else "",
+                reasoning_end_marker if enable_reasoning else "",
+            )
+            DecisionAI.log_reasoning_output(
+                "[决策AI]",
+                ai_response,
+                parse_result,
+                reasoning_log_enabled,
+                reasoning_log_mode,
+            )
+            parsed_answer = (parse_result.get("normalized_answer") or "").lower()
+            if parsed_answer in ("yes", "y", "是", "应该", "回复", "适合"):
+                decision = True
+            elif parsed_answer in ("no", "n", "否", "不应该", "不回复", "不适合"):
+                decision = False
+            else:
+                filtered_text = parse_result.get("filtered_text") or ""
+                decision = DecisionAI._parse_decision(filtered_text)
 
             if decision:
                 logger.info("决策AI判断: 应该回复这条消息 (yes)")
@@ -533,7 +714,7 @@ class DecisionAI:
                 pass
             return False
         except Exception as e:
-            logger.error(f"调用决策AI时发生错误: {e}")
+            logger.error(format_ai_error(e, "读空气判断"))
             try:
                 event._decision_ai_error = True
             except Exception:
@@ -620,7 +801,7 @@ class DecisionAI:
             logger.warning(f"AI调用超时（超过 {timeout} 秒）")
             return ""
         except Exception as e:
-            logger.error(f"调用AI时发生错误: {e}")
+            logger.error(format_ai_error(e, "通用判断AI调用"))
             return ""
 
     @staticmethod

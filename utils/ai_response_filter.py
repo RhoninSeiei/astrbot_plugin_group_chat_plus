@@ -7,7 +7,7 @@ AI响应过滤器 - 处理带思考链的AI返回
 """
 
 import re
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 from astrbot.api import logger
 
 # 详细日志开关
@@ -53,6 +53,13 @@ class AIResponseFilter:
         r"^评估[：:]\s*",
         r"^我的想法[：:]\s*",
         r"^让我想想[：:]\s*",
+    ]
+
+    ANSWER_PREFIXES = [
+        r"^回答[：:]\s*",
+        r"^答[：:]\s*",
+        r"^结论[：:]\s*",
+        r"^结果[：:]\s*",
     ]
 
     @staticmethod
@@ -144,14 +151,7 @@ class AIResponseFilter:
         response = response.strip()
 
         # 第四步：移除可能存在的"回答："、"答："等前缀
-        answer_prefixes = [
-            r"^回答[：:]\s*",
-            r"^答[：:]\s*",
-            r"^结论[：:]\s*",
-            r"^结果[：:]\s*",
-        ]
-
-        for prefix_pattern in answer_prefixes:
+        for prefix_pattern in AIResponseFilter.ANSWER_PREFIXES:
             response = re.sub(prefix_pattern, "", response, flags=re.IGNORECASE)
 
         response = response.strip()
@@ -165,64 +165,178 @@ class AIResponseFilter:
         return response
 
     @staticmethod
-    def extract_decision_answer(response: str) -> Optional[str]:
-        """
-        从可能包含思考链的响应中提取决策答案（yes/no）
-
-        这是一个增强版提取器，专门用于决策AI的场景
-
-        Args:
-            response: AI响应文本
-
-        Returns:
-            提取到的答案（yes/no/是/否等），如果无法提取则返回None
-        """
-        if not response:
-            return None
-
-        # 先进行标准过滤
-        filtered = AIResponseFilter.filter_thinking_chain(response)
-
-        # 清理文本
-        cleaned = filtered.strip().lower()
-
-        # 移除标点符号
-        cleaned = cleaned.rstrip(".,!?。,!?")
-
-        # 优先检查完整匹配
-        if cleaned in [
-            "yes",
-            "y",
-            "no",
-            "n",
-            "是",
-            "否",
-            "应该",
-            "不应该",
-            "回复",
-            "不回复",
-        ]:
-            return cleaned
-
-        # 尝试提取第一个有效的yes/no
-        yes_pattern = r"\b(yes|y|是|应该|回复)\b"
-        no_pattern = r"\b(no|n|否|不应该|不回复)\b"
-
-        # 先找no（因为"不应该"等否定词更具体）
-        no_match = re.search(no_pattern, cleaned, re.IGNORECASE)
-        if no_match:
-            return no_match.group(1)
-
-        # 再找yes
-        yes_match = re.search(yes_pattern, cleaned, re.IGNORECASE)
-        if yes_match:
-            return yes_match.group(1)
-
-        # 如果都找不到，返回清理后的文本（让调用者自己判断）
-        return cleaned
+    def _strip_answer_prefixes(response: str) -> str:
+        cleaned = (response or "").strip()
+        for prefix_pattern in AIResponseFilter.ANSWER_PREFIXES:
+            cleaned = re.sub(prefix_pattern, "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
 
     @staticmethod
-    def extract_frequency_decision(response: str) -> Optional[str]:
+    def _extract_custom_reasoning_block(
+        response: str, start_marker: str = "", end_marker: str = ""
+    ) -> Tuple[str, str]:
+        if not response:
+            return response, ""
+
+        start_marker = (start_marker or "").strip()
+        end_marker = (end_marker or "").strip()
+        if not start_marker or not end_marker:
+            return response, ""
+
+        pattern = re.compile(
+            re.escape(start_marker) + r"([\s\S]*?)" + re.escape(end_marker),
+            re.IGNORECASE,
+        )
+        reasoning_blocks = [
+            match.group(1).strip()
+            for match in pattern.finditer(response)
+            if match.group(1).strip()
+        ]
+        filtered = pattern.sub("", response).strip()
+        reasoning_text = "\n\n".join(reasoning_blocks).strip()
+        filtered = re.sub(r"\n{3,}", "\n\n", filtered).strip()
+        return AIResponseFilter._strip_answer_prefixes(filtered), reasoning_text
+
+    @staticmethod
+    def _extract_last_non_empty_line(text: str) -> str:
+        if not text:
+            return ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    @staticmethod
+    def _normalize_tail_token(token: str) -> str:
+        cleaned = AIResponseFilter._strip_answer_prefixes(token or "")
+        cleaned = cleaned.strip().rstrip(".,!?。,!？；;:：")
+        return cleaned.strip()
+
+    @staticmethod
+    def _decision_exact_map() -> Dict[str, str]:
+        return {
+            "yes": "yes",
+            "y": "y",
+            "no": "no",
+            "n": "n",
+            "是": "是",
+            "否": "否",
+            "应该": "应该",
+            "不应该": "不应该",
+            "回复": "回复",
+            "不回复": "不回复",
+            "适合": "适合",
+            "合适": "适合",
+            "不适合": "不适合",
+            "不合适": "不适合",
+            "跳过": "不适合",
+            "跳过这次": "不适合",
+            "跳过本次": "不适合",
+        }
+
+    @staticmethod
+    def parse_decision_response(
+        response: str, start_marker: str = "", end_marker: str = ""
+    ) -> Dict[str, Any]:
+        if not response:
+            return {
+                "filtered_text": "",
+                "reasoning_text": "",
+                "normalized_answer": None,
+                "parse_success": False,
+                "tail_line": "",
+                "tail_candidate": "",
+                "protocol_followed": False,
+            }
+
+        filtered = AIResponseFilter.filter_thinking_chain(response)
+        final_text, reasoning_text = AIResponseFilter._extract_custom_reasoning_block(
+            filtered, start_marker, end_marker
+        )
+        tail_line = AIResponseFilter._extract_last_non_empty_line(final_text)
+        tail_cleaned = AIResponseFilter._normalize_tail_token(tail_line).lower()
+        exact_map = AIResponseFilter._decision_exact_map()
+        if tail_cleaned in exact_map:
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": exact_map[tail_cleaned],
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": True,
+            }
+
+        cleaned = AIResponseFilter._strip_answer_prefixes(
+            final_text.strip().lower().rstrip(".,!?。,!？；;:：")
+        )
+        negative_patterns = (
+            r"不适合",
+            r"不合适",
+            r"不建议",
+            r"跳过(?:这次|本次)?",
+            r"不应该",
+            r"不回复",
+            r"\b(no|n)\b",
+            r"否",
+        )
+        for pattern in negative_patterns:
+            if re.search(pattern, cleaned, re.IGNORECASE):
+                return {
+                    "filtered_text": final_text,
+                    "reasoning_text": reasoning_text,
+                    "normalized_answer": "no",
+                    "parse_success": True,
+                    "tail_line": tail_line,
+                    "tail_candidate": tail_cleaned,
+                    "protocol_followed": False,
+                }
+
+        positive_patterns = (
+            r"适合",
+            r"合适",
+            r"可以主动",
+            r"可以发起",
+            r"应该",
+            r"回复",
+            r"\b(yes|y)\b",
+            r"(^|[\s，。])是($|[\s，。])",
+        )
+        for pattern in positive_patterns:
+            if re.search(pattern, cleaned, re.IGNORECASE):
+                return {
+                    "filtered_text": final_text,
+                    "reasoning_text": reasoning_text,
+                    "normalized_answer": "yes",
+                    "parse_success": True,
+                    "tail_line": tail_line,
+                    "tail_candidate": tail_cleaned,
+                    "protocol_followed": False,
+                }
+
+        if DEBUG_MODE:
+            logger.warning(f"[AI响应过滤] 无法从响应中提取决策判断: {final_text[:80]}")
+
+        return {
+            "filtered_text": final_text,
+            "reasoning_text": reasoning_text,
+            "normalized_answer": None,
+            "parse_success": False,
+            "tail_line": tail_line,
+            "tail_candidate": tail_cleaned,
+            "protocol_followed": False,
+        }
+
+    @staticmethod
+    def extract_decision_answer(
+        response: str, start_marker: str = "", end_marker: str = ""
+    ) -> Optional[str]:
+        return AIResponseFilter.parse_decision_response(
+            response, start_marker, end_marker
+        ).get("normalized_answer")
+
+    @staticmethod
+    def parse_frequency_response(
+        response: str, start_marker: str = "", end_marker: str = ""
+    ) -> Dict[str, Any]:
         """
         从可能包含思考链的响应中提取频率判断（正常/过于频繁/过少）
 
@@ -235,26 +349,86 @@ class AIResponseFilter:
             提取到的判断结果，如果无法提取则返回None
         """
         if not response:
-            return None
+            return {
+                "filtered_text": "",
+                "reasoning_text": "",
+                "normalized_answer": None,
+                "parse_success": False,
+                "tail_line": "",
+                "tail_candidate": "",
+                "protocol_followed": False,
+            }
 
-        # 先进行标准过滤
         filtered = AIResponseFilter.filter_thinking_chain(response)
+        final_text, reasoning_text = AIResponseFilter._extract_custom_reasoning_block(
+            filtered, start_marker, end_marker
+        )
+        tail_line = AIResponseFilter._extract_last_non_empty_line(final_text)
+        tail_cleaned = AIResponseFilter._normalize_tail_token(tail_line)
+        exact_map = {
+            "正常": "正常",
+            "过于频繁": "过于频繁",
+            "过少": "过少",
+            "合适": "正常",
+            "适当": "正常",
+            "偏少": "过少",
+            "太少": "过少",
+            "偏频繁": "过于频繁",
+            "太频繁": "过于频繁",
+        }
+        if tail_cleaned in exact_map:
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": exact_map[tail_cleaned],
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": True,
+            }
 
-        # 清理文本
-        cleaned = filtered.strip().replace("。", "").replace("!", "").replace("！", "")
+        cleaned = (
+            final_text.strip().replace("。", "").replace("!", "").replace("！", "")
+        )
+        cleaned = cleaned.replace("?", "").replace("？", "").strip()
+        cleaned = AIResponseFilter._strip_answer_prefixes(cleaned)
 
         # 检查完整匹配
         if cleaned in ["正常", "过于频繁", "过少"]:
-            return cleaned
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": cleaned,
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": False,
+            }
 
         # 扩展关键词匹配（更宽松的匹配，因为思考链过滤后可能只剩下简短的词）
         # 优先匹配"过于频繁"相关
         if "过于频繁" in cleaned or "过度频繁" in cleaned or "太频繁" in cleaned:
-            return "过于频繁"
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": "过于频繁",
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": False,
+            }
 
         # 单独的"频繁"也算（但要排除"不频繁"等否定情况）
         if "频繁" in cleaned and "不" not in cleaned and "过" not in cleaned:
-            return "过于频繁"
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": "过于频繁",
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": False,
+            }
 
         # 匹配"过少"相关（包括"太少"）
         if (
@@ -263,14 +437,46 @@ class AIResponseFilter:
             or "过于少" in cleaned
             or cleaned == "少"
         ):
-            return "过少"
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": "过少",
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": False,
+            }
 
         # 匹配"正常"相关
         if "正常" in cleaned or "合适" in cleaned or "适当" in cleaned:
-            return "正常"
+            return {
+                "filtered_text": final_text,
+                "reasoning_text": reasoning_text,
+                "normalized_answer": "正常",
+                "parse_success": True,
+                "tail_line": tail_line,
+                "tail_candidate": tail_cleaned,
+                "protocol_followed": False,
+            }
 
         # 无法识别
         if DEBUG_MODE:
             logger.warning(f"[AI响应过滤] 无法从响应中提取频率判断: {cleaned[:50]}")
 
-        return None
+        return {
+            "filtered_text": final_text,
+            "reasoning_text": reasoning_text,
+            "normalized_answer": None,
+            "parse_success": False,
+            "tail_line": tail_line,
+            "tail_candidate": tail_cleaned,
+            "protocol_followed": False,
+        }
+
+    @staticmethod
+    def extract_frequency_decision(
+        response: str, start_marker: str = "", end_marker: str = ""
+    ) -> Optional[str]:
+        return AIResponseFilter.parse_frequency_response(
+            response, start_marker, end_marker
+        ).get("normalized_answer")

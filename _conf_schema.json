@@ -96,6 +96,36 @@
         "hint": "被防爬虫系统识别为爬虫后，临时封禁的时长（秒）。默认 300 秒（5分钟）。注意：此封禁会显示在「IP 封禁管理」中，可手动解封（需开启「防爬虫系统」）",
         "default": 300
     },
+    "web_panel_authenticated_rate_limit": {
+        "description": "🌐 已登录请求速率阈值",
+        "type": "int",
+        "hint": "已登录后的请求使用独立速率阈值，避免面板轮询和正常操作被匿名防爬虫阈值误伤。设置为 0 可关闭该保护。默认 240 次。",
+        "default": 240
+    },
+    "web_panel_authenticated_rate_window": {
+        "description": "🌐 已登录请求速率窗口（秒）",
+        "type": "int",
+        "hint": "已登录请求速率阈值对应的滑动窗口长度。默认 60 秒。",
+        "default": 60
+    },
+    "web_panel_brute_force_window": {
+        "description": "🔒 暴力破解：失败计数重置窗口（秒）",
+        "type": "int",
+        "hint": "超过该时间没有新的登录失败时，自动清除该 IP 的失败计数，避免偶发输错长期累积。设置为 0 表示永不过期。默认 3600 秒。",
+        "default": 3600
+    },
+    "web_panel_brute_force_rate_window": {
+        "description": "🔒 暴力破解：频率检测窗口（秒）",
+        "type": "int",
+        "hint": "在该时间窗口内，如果同一 IP 的登录失败次数达到频率检测触发次数，则立即进入短锁定。设置为 0 可关闭该保护。默认 10 秒。",
+        "default": 10
+    },
+    "web_panel_brute_force_rate_count": {
+        "description": "🔒 暴力破解：频率检测触发次数",
+        "type": "int",
+        "hint": "在频率检测窗口内，登录失败次数达到该值时触发短锁定。默认 3 次。",
+        "default": 3
+    },
     "enable_group_chat": {
         "description": "🔘 启用群聊功能",
         "type": "bool",
@@ -202,6 +232,49 @@
         "default": "",
         "promptDataRef": "decision-ai"
     },
+    "decision_ai_include_persona": {
+        "description": "读空气AI使用人格",
+        "type": "bool",
+        "hint": "开启后，读空气AI使用当前群会话在 AstrBot 中配置的人格；关闭后采用中性判断模式。默认开启，以保持每个群的自定义规则有效。",
+        "default": true
+    },
+    "decision_ai_persona_name": {
+        "description": "读空气AI指定人格名",
+        "type": "string",
+        "hint": "留空时使用当前会话人格。填写人格名或人格ID时，读空气AI优先使用该人格；找不到时回退到当前会话人格。",
+        "default": ""
+    },
+    "enable_decision_ai_reasoning": {
+        "description": "启用读空气AI短推理协议",
+        "type": "bool",
+        "hint": "开启后，读空气AI先输出由下方标记包裹的简短推理块，最后一行输出 yes/no。此功能会增加 token 与耗时，默认关闭。",
+        "default": false
+    },
+    "decision_ai_reasoning_log": {
+        "description": "记录读空气AI推理日志",
+        "type": "bool",
+        "hint": "开启后记录读空气AI的额外推理块，便于观察判断依据。建议调试时使用，日常保持关闭。",
+        "default": false
+    },
+    "decision_ai_reasoning_log_mode": {
+        "description": "读空气AI推理日志模式",
+        "type": "string",
+        "options": ["processed", "raw"],
+        "hint": "processed=只记录提取后的推理块；raw=记录AI完整原始输出。raw可能包含较长文本。",
+        "default": "processed"
+    },
+    "judgment_reasoning_start_marker": {
+        "description": "判断AI推理起始标记",
+        "type": "string",
+        "hint": "读空气AI与主动对话AI预判断共用的推理块起始标记。仅在启用对应推理协议时生效。",
+        "default": "<gcp_judgment_reasoning>"
+    },
+    "judgment_reasoning_end_marker": {
+        "description": "判断AI推理结束标记",
+        "type": "string",
+        "hint": "读空气AI与主动对话AI预判断共用的推理块结束标记。仅在启用对应推理协议时生效。",
+        "default": "</gcp_judgment_reasoning>"
+    },
     "decision_ai_timeout": {
         "description": "读空气AI超时时间(秒)",
         "type": "int",
@@ -232,6 +305,37 @@
         "hint": "每次循环检测之间的等待时间(秒)。默认1秒。总最大等待时间 = 循环次数 × 等待间隔。例如：10次 × 1秒 = 最多等待10秒。此配置同时用于普通消息并发保护和主动对话并发保护",
         "default": 1.0
     },
+    "concurrent_mode": {
+        "description": "并发处理模式",
+        "type": "string",
+        "options": ["legacy", "smart"],
+        "hint": "legacy=沿用传统同会话等待；smart=由最早到达的消息吸收后续已准备消息，减少同一群短时间内多条消息各自触发回复。默认legacy。",
+        "default": "legacy"
+    },
+    "enable_smart_batch_reply_hint": {
+        "description": "启用Smart并发批次提示",
+        "type": "bool",
+        "hint": "开启后，Smart并发吸收多条后续消息时，会在当前上下文中追加批次提示，提醒回复AI综合处理追加消息。仅 concurrent_mode=smart 时生效。",
+        "default": true
+    },
+    "smart_concurrent_merge_wait": {
+        "description": "Smart并发合并有效期(秒)",
+        "type": "float",
+        "hint": "Smart并发 pending 与 consumed 状态的最长保留时间。超过后自动清理，避免异常分支留下状态。默认15秒。",
+        "default": 15.0
+    },
+    "smart_concurrent_max_batch_size": {
+        "description": "Smart并发单批最大吸收消息数",
+        "type": "int",
+        "hint": "同一批次最多吸收多少条后续消息。用于防止极端并发导致上下文过长。默认20。",
+        "default": 20
+    },
+    "smart_concurrent_claim_delay": {
+        "description": "Smart并发吸收等待(秒)",
+        "type": "float",
+        "hint": "最早消息在决策前等待后续消息挂载载荷的短暂时间。值越大越容易合并连续消息，但回复会稍慢。默认0.3秒。",
+        "default": 0.3
+    },
     "reply_ai_prompt_mode": {
         "description": "回复AI提示词模式",
         "type": "string",
@@ -245,6 +349,12 @@
         "hint": "给「生成最终回复内容」的AI填写自定义提示词。\n\n• append模式：此处内容追加在默认提示词后面，可只写补充说明，留空则完全沿用默认提示词\n• override模式：此处内容完全替换默认提示词，需自行包含所有回复逻辑（人格设定不受影响，仍会生效）\n\n提示：override模式下建议参照下方「📋 回复AI 默认系统提示词」的完整内容，在其基础上修改，而非从零编写。",
         "default": "",
         "promptDataRef": "reply-ai"
+    },
+    "enable_main_model_final_decision": {
+        "description": "启用主模型最终判断",
+        "type": "bool",
+        "hint": "开启后，第一阶段读空气AI放行后，回复模型会先执行一次短协议内部判断。该判断只输出内部标记，不进入正式回复提示词，可减少边界消息误回复。",
+        "default": true
     },
     "enable_tools_reminder": {
         "description": "启用工具提醒",
@@ -1228,6 +1338,37 @@
         "type": "int",
         "hint": "AI预判断的超时时间。超时则默认不触发本次主动对话（降级处理）。建议10-30秒，默认15秒",
         "default": 15
+    },
+    "proactive_ai_judge_include_persona": {
+        "description": "主动对话AI预判断使用人格",
+        "type": "bool",
+        "hint": "开启后，主动对话AI预判断会使用当前群会话人格；关闭后使用中性判断模式。默认开启。",
+        "default": true
+    },
+    "proactive_ai_judge_persona_name": {
+        "description": "主动对话AI预判断指定人格名",
+        "type": "string",
+        "hint": "留空时使用当前会话人格。填写人格名或人格ID时，主动对话AI预判断优先使用该人格；找不到时回退到当前会话人格。",
+        "default": ""
+    },
+    "enable_proactive_ai_reasoning": {
+        "description": "启用主动对话AI预判断短推理协议",
+        "type": "bool",
+        "hint": "开启后，主动对话AI预判断先输出由判断AI推理标记包裹的简短推理块，最后一行输出 yes/no。此功能会增加 token 与耗时，默认关闭。",
+        "default": false
+    },
+    "proactive_ai_reasoning_log": {
+        "description": "记录主动对话AI预判断推理日志",
+        "type": "bool",
+        "hint": "开启后记录主动对话AI预判断的额外推理块。建议调试时使用，日常保持关闭。",
+        "default": false
+    },
+    "proactive_ai_reasoning_log_mode": {
+        "description": "主动对话AI推理日志模式",
+        "type": "string",
+        "options": ["processed", "raw"],
+        "hint": "processed=只记录提取后的推理块；raw=记录AI完整原始输出。",
+        "default": "processed"
     },
     "enable_adaptive_proactive": {
         "description": "🆕 启用智能自适应主动对话",

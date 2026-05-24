@@ -17,6 +17,7 @@ from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.star.star_handler import EventType
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
+from .ai_error_formatter import format_ai_error
 from .session_preferences import resolve_session_persona
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
@@ -629,12 +630,16 @@ class ReplyHandler:
                 return reply_result
 
             logger.error(
-                f"直连 Provider {provider_id or 'default'} 返回空回复，prompt长度={len(req.prompt or '')}"
+                format_ai_error(
+                    RuntimeError("upstream_empty_output: provider returned empty reply"),
+                    f"回复生成 Provider {provider_id or 'default'}",
+                )
+                + f"，prompt长度={len(req.prompt or '')}"
             )
             return event.make_result()
 
         except Exception as e:
-            logger.error(f"生成AI回复时发生错误: {e}")
+            logger.error(format_ai_error(e, "回复生成"))
             # 返回错误消息
             return event.plain_result(f"生成回复时发生错误: {str(e)}")
 
@@ -752,7 +757,7 @@ class ReplyHandler:
                 )
             )
         except Exception as exc:
-            logger.warning("[主模型最终判断] gate 调用失败，默认不回复: %s", exc)
+            logger.warning("%s，默认不回复", format_ai_error(exc, "主模型最终判断"))
             return False
 
         gate_text = ReplyHandler._extract_llm_response_text(llm_resp)

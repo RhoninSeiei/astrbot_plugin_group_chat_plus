@@ -856,6 +856,9 @@ const App = {
             'web_panel_port',
             'web_panel_host',
             'web_panel_reset_password',
+            'web_panel_brute_force_window',
+            'web_panel_brute_force_rate_window',
+            'web_panel_brute_force_rate_count',
         ];
 
         readonlyKeys.forEach(key => {
@@ -904,6 +907,8 @@ const App = {
             'web_panel_anti_spider',
             'web_panel_anti_spider_rate_limit',
             'web_panel_anti_spider_ban_duration',
+            'web_panel_authenticated_rate_limit',
+            'web_panel_authenticated_rate_window',
         ];
 
         const pending = {};

@@ -92,6 +92,22 @@ class WebPanelServer:
             "web_panel_anti_spider_ban_duration": file_config.get(
                 "web_panel_anti_spider_ban_duration", 300
             ),
+            "web_panel_authenticated_rate_limit": file_config.get(
+                "web_panel_authenticated_rate_limit",
+                max(240, file_config.get("web_panel_anti_spider_rate_limit", 60) * 4),
+            ),
+            "web_panel_authenticated_rate_window": file_config.get(
+                "web_panel_authenticated_rate_window", 60
+            ),
+            "web_panel_brute_force_window": file_config.get(
+                "web_panel_brute_force_window", 3600
+            ),
+            "web_panel_brute_force_rate_window": file_config.get(
+                "web_panel_brute_force_rate_window", 10
+            ),
+            "web_panel_brute_force_rate_count": file_config.get(
+                "web_panel_brute_force_rate_count", 3
+            ),
             "web_panel_ip_bind_check": file_config.get("web_panel_ip_bind_check", True),
         }
 
@@ -259,6 +275,11 @@ class WebPanelServer:
                     ip, request.method, path, 403, note="无效 token 访问面板静态资源"
                 )
                 return web.Response(status=403, text="Forbidden")
+            rate_limit_response = self._check_authenticated_rate_limit_response(
+                ip, path, payload, method=request.method
+            )
+            if rate_limit_response is not None:
+                return rate_limit_response
             request["user"] = payload
             request["client_ip"] = ip
             response = await handler(request)
@@ -342,6 +363,11 @@ class WebPanelServer:
             payload = self.auth_mgr.verify_token(token, current_ip=verify_ip)
             if payload is None:
                 return web.HTTPFound("/")
+            rate_limit_response = self._check_authenticated_rate_limit_response(
+                ip, path, payload, method=request.method
+            )
+            if rate_limit_response is not None:
+                return rate_limit_response
             request["user"] = payload
             request["client_ip"] = ip
             response = await handler(request)
@@ -386,11 +412,60 @@ class WebPanelServer:
 
         request["user"] = payload
         request["client_ip"] = ip
+        rate_limit_response = self._check_authenticated_rate_limit_response(
+            ip,
+            path,
+            payload,
+            method=request.method,
+            is_heartbeat=path == "/api/auth/status",
+        )
+        if rate_limit_response is not None:
+            return rate_limit_response
         response = await handler(request)
         self.security.log_access(ip, request.method, path, response.status)
         if path.startswith("/api/"):
             self._add_security_headers(response)
         return response
+
+    def _check_authenticated_rate_limit_response(
+        self,
+        ip: str,
+        path: str,
+        payload: dict,
+        *,
+        method: str = "AUTH",
+        is_heartbeat: bool = False,
+    ) -> web.Response | None:
+        """已认证请求的独立限速检查"""
+        session_id = ""
+        if isinstance(payload, dict):
+            session_id = str(payload.get("sub") or payload.get("iat") or "")
+        allowed, wait_seconds = self.security.check_authenticated_rate_limit(
+            ip,
+            session_id=session_id,
+            path=path,
+            is_heartbeat=is_heartbeat,
+        )
+        if allowed:
+            return None
+
+        self.security.log_access(
+            ip,
+            method,
+            path,
+            429,
+            note=f"已认证请求过于频繁，建议等待 {wait_seconds} 秒",
+        )
+        if path.startswith("/api/"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "msg": f"请求过于频繁，请等待 {wait_seconds} 秒后再试",
+                    "wait_seconds": wait_seconds,
+                },
+                status=429,
+            )
+        return web.Response(status=429, text="Too Many Requests")
 
     def _extract_token(self, request: web.Request) -> str | None:
         """从 Authorization 头或 Cookie 中提取 JWT token"""
@@ -992,6 +1067,11 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
             "web_panel_anti_spider",
             "web_panel_anti_spider_rate_limit",
             "web_panel_anti_spider_ban_duration",
+            "web_panel_authenticated_rate_limit",
+            "web_panel_authenticated_rate_window",
+            "web_panel_brute_force_window",
+            "web_panel_brute_force_rate_window",
+            "web_panel_brute_force_rate_count",
             "web_panel_ip_bind_check",
         }
         if security_keys & set(validated.keys()):
