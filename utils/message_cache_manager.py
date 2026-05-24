@@ -664,6 +664,42 @@ class MessageCacheManager:
 
         return window_msgs
 
+    def convert_window_buffered_to_regular(
+        self,
+        chat_id: str,
+        sender_id: str,
+        gww_token: Optional[int] = None,
+    ) -> int:
+        """
+        将指定用户的窗口缓冲消息转为普通缓存。
+
+        决策 AI 判定不回复时调用，避免本轮等待窗口收集到的追加消息因
+        Phase-2 保存路径缺席而长期停留在窗口缓冲区。
+        """
+        if chat_id not in self.pending_messages_cache:
+            return 0
+
+        token = int(gww_token or 0)
+        converted_count = 0
+        for msg in self.pending_messages_cache[chat_id]:
+            if not (
+                isinstance(msg, dict)
+                and msg.get("window_buffered", False)
+                and str(msg.get("sender_id", "")) == str(sender_id)
+            ):
+                continue
+            if token > 0 and msg.get("gww_token") != token:
+                continue
+            msg.pop("window_buffered", None)
+            converted_count += 1
+
+        if converted_count > 0:
+            logger.info(
+                f"  [缓存管理器] 已将 {converted_count} 条窗口缓冲消息转为普通缓存"
+            )
+
+        return converted_count
+
     def prepare_window_buffered_for_save(
         self,
         chat_id: str,

@@ -729,6 +729,9 @@ class DecisionAI:
         provider_id: str = "",
         timeout: int = 30,
         prompt_mode: str = "append",
+        include_persona: bool = True,
+        configured_persona_name: str = "",
+        context_label: str = "通用判断AI调用",
     ) -> str:
         """
         通用AI调用方法（供其他模块使用）
@@ -758,25 +761,14 @@ class DecisionAI:
                 logger.error("无法获取AI提供商")
                 return ""
 
-            # 🔧 修复：直接使用 persona_manager 获取最新人格配置，支持多会话和实时更新
-            try:
-                default_persona = await resolve_session_persona(context, event=event)
-
-                persona_prompt = default_persona.get("prompt", "")
-
-                # 🔧 修复：不再将人格预设对话（begin_dialogs）注入 contexts
-                # 原因同 should_reply()：begin_dialogs 不是真实历史消息，
-                # 作为 contexts 传入会污染上下文判断。
-                persona_contexts = []
-
-                if DEBUG_MODE:
-                    logger.info(
-                        f"✅ [通用AI调用] 已获取当前人格配置，人格名: {default_persona.get('name', 'default')}, 长度: {len(persona_prompt)} 字符"
-                    )
-            except Exception as e:
-                logger.warning(f"获取人格设定失败: {e}，使用空人格")
-                persona_prompt = ""
-                persona_contexts = []
+            persona_result = await DecisionAI.resolve_judgment_persona(
+                context=context,
+                event=event,
+                include_persona=include_persona,
+                configured_persona_name=configured_persona_name,
+                log_prefix=f"[{context_label}]",
+            )
+            persona_prompt = persona_result.get("system_prompt", "") or ""
 
             # 调用AI
             async def _call_ai():
@@ -798,10 +790,10 @@ class DecisionAI:
             return ai_response or ""
 
         except asyncio.TimeoutError:
-            logger.warning(f"AI调用超时（超过 {timeout} 秒）")
+            logger.warning(f"{context_label}超时（超过 {timeout} 秒）")
             return ""
         except Exception as e:
-            logger.error(format_ai_error(e, "通用判断AI调用"))
+            logger.error(format_ai_error(e, context_label))
             return ""
 
     @staticmethod

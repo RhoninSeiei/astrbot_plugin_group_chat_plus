@@ -126,6 +126,42 @@
         "hint": "在频率检测窗口内，登录失败次数达到该值时触发短锁定。默认 3 次。",
         "default": 3
     },
+    "web_panel_brute_force_tiers": {
+        "description": "🔒 暴力破解：阶梯锁定规则",
+        "type": "string",
+        "hint": "登录失败后的阶梯锁定规则，JSON 数组格式，每项为 [失败次数, 锁定秒数]。默认 [[5,30],[10,60],[15,300],[20,600],[30,1800],[50,3600]]。此项属于 Web 安全敏感配置，请在 AstrBot 传统配置界面修改。",
+        "default": "[[5,30],[10,60],[15,300],[20,600],[30,1800],[50,3600]]"
+    },
+    "web_panel_brute_force_ban_duration": {
+        "description": "🔒 暴力破解：频率异常封禁时长（秒）",
+        "type": "int",
+        "hint": "同一 IP 在短时间内连续登录失败触发频率异常时，写入封禁列表的时长。0 表示永久封禁。默认 3600 秒。",
+        "default": 3600
+    },
+    "web_panel_heartbeat_visible_interval_seconds": {
+        "description": "🔒 Web 会话心跳：前台间隔（秒）",
+        "type": "int",
+        "hint": "浏览器标签页处于前台时，Web 面板向服务端报告会话存活的间隔。默认 300 秒，最小建议 30 秒。",
+        "default": 300
+    },
+    "web_panel_heartbeat_hidden_interval_seconds": {
+        "description": "🔒 Web 会话心跳：后台间隔（秒）",
+        "type": "int",
+        "hint": "浏览器标签页处于后台时，Web 面板向服务端报告会话存活的间隔。默认 1200 秒，最小建议 60 秒。",
+        "default": 1200
+    },
+    "web_panel_heartbeat_retry_base_seconds": {
+        "description": "🔒 Web 会话心跳：失败重试基准（秒）",
+        "type": "int",
+        "hint": "心跳请求网络失败后的首次重试间隔。后续重试会递增到上限，避免网络抖动造成误判。默认 15 秒。",
+        "default": 15
+    },
+    "web_panel_heartbeat_retry_max_seconds": {
+        "description": "🔒 Web 会话心跳：失败重试上限（秒）",
+        "type": "int",
+        "hint": "心跳请求网络失败后的最大重试间隔。默认 120 秒。",
+        "default": 120
+    },
     "enable_group_chat": {
         "description": "🔘 启用群聊功能",
         "type": "bool",
@@ -481,9 +517,10 @@
     "memory_plugin_mode": {
         "description": "记忆插件模式",
         "type": "string",
-        "hint": "选择使用哪个记忆存储插件：legacy=旧版strbot_plugin_play_sy(又叫ai_memory)插件；livingmemory=新版LivingMemory智能记忆插件。⚠️两者只能选其一⚠️。LivingMemory功能更强大(混合检索、智能总结、自动遗忘)，但需要配置Embedding Provider。注意：LivingMemory需要在其自身配置中启用'会话隔离'和'人格隔离'才能正常工作",
-        "default": "legacy",
+        "hint": "选择使用哪个记忆存储插件：auto=自动检测可用插件；legacy=旧版strbot_plugin_play_sy(又叫ai_memory)插件；livingmemory=新版LivingMemory智能记忆插件。LivingMemory功能更强大(混合检索、智能总结、自动遗忘)，但需要配置Embedding Provider。注意：LivingMemory需要在其自身配置中启用'会话隔离'和'人格隔离'才能正常工作",
+        "default": "auto",
         "options": [
+            "auto",
             "legacy",
             "livingmemory"
         ]
@@ -491,11 +528,24 @@
     "livingmemory_version": {
         "description": "LivingMemory插件版本",
         "type": "string",
-        "hint": "【仅在memory_plugin_mode=livingmemory时生效】选择LivingMemory插件的版本：\n• v2：新版本（2.x版本，推荐），使用initializer架构，memory_engine在initializer子对象中\n• v1：旧版本（1.x版本），插件实例直接包含memory_engine和_initialization_complete属性\n\n✅ 当前主流版本均为2.x，保持默认v2即可。只有使用极旧的1.x版本时才需要选v1。",
-        "default": "v2",
+        "hint": "【仅在memory_plugin_mode=livingmemory或auto检测到LivingMemory时生效】选择 LivingMemory 的架构版本适配方式：\n• auto（推荐）= 自动识别当前插件架构；优先按 v2 initializer 架构处理，检测不到时自动回退到 v1 直挂架构\n• v2 = 2.x 及后续新架构，使用 initializer / initializer.memory_engine\n• v1 = 1.x 旧架构，插件实例直接包含 memory_engine 和 _initialization_complete",
+        "default": "auto",
         "options": [
+            "auto",
             "v1",
             "v2"
+        ]
+    },
+    "livingmemory_persona_compat_mode": {
+        "description": "LivingMemory人格ID兼容模式",
+        "type": "string",
+        "hint": "【仅在memory_plugin_mode=livingmemory或auto检测到LivingMemory时生效】控制插件如何获取当前人格ID。auto=依次尝试新版 resolve_selected_persona、旧版 get_default_persona_v3、更早期 get_personas_by_key；resolver_only=只使用新版解析；legacy_only=只使用旧接口；off=不传 persona_id，只保留 session_id 隔离。",
+        "default": "auto",
+        "options": [
+            "auto",
+            "resolver_only",
+            "legacy_only",
+            "off"
         ]
     },
     "livingmemory_top_k": {
@@ -537,6 +587,18 @@
         "type": "int",
         "hint": "【上下文连续性】缓存消息的最大保留时间。如果长时间没有触发AI回复，超过此时间的缓存消息会被自动清理（认为已过时）。默认1800秒(30分钟)，建议600-3600秒。⚠️系统保护上限7200秒(2小时)",
         "default": 1800
+    },
+    "enable_idle_cache_flush": {
+        "description": "📦 启用冷群缓存自动转正",
+        "type": "bool",
+        "hint": "开启后，当群聊静默超过指定时间且仍有缓存消息时，自动将缓存消息保存到历史记录，避免长期无回复的消息在过期后丢失。每收到一条新群消息都会重新计时。",
+        "default": false
+    },
+    "idle_cache_flush_delay_seconds": {
+        "description": "📦 冷群转正触发延迟(秒)",
+        "type": "int",
+        "hint": "群聊多少秒没有新消息后触发一次缓存自动转正。建议小于或等于 pending_cache_ttl_seconds，范围 60-7200，默认 600。",
+        "default": 600
     },
     "enabled_groups": {
         "description": "启用的群组列表",
@@ -710,6 +772,19 @@
         "hint": "开启后，插件内部会额外过滤掉@全体成员的消息，即使AstrBot平台未配置忽略也能生效。这是一个双保险机制，防止在某些情况下@全体成员消息仍被插件读取处理。关闭则不进行此项检测（依赖平台配置）",
         "default": false
     },
+    "at_all_message_mode": {
+        "description": "@全体成员消息处理模式",
+        "type": "string",
+        "options": ["normal", "skip_probability", "skip_all", "probability_boost"],
+        "hint": "控制 @全体成员 消息如何进入回复流程。normal=按普通消息处理；skip_probability=跳过概率筛选但保留读空气判断；skip_all=跳过概率筛选和读空气判断；probability_boost=按普通消息处理但临时提高本条消息概率。默认 skip_probability。",
+        "default": "skip_probability"
+    },
+    "at_all_probability_boost_value": {
+        "description": "@全体成员临时概率提升值",
+        "type": "float",
+        "hint": "仅在 at_all_message_mode=probability_boost 时生效。为当前这一条@全体成员消息临时增加的概率值，不影响后续消息。范围 0-1，默认 0.3。",
+        "default": 0.3
+    },
     "enable_attention_mechanism": {
         "description": "启用增强注意力机制",
         "type": "bool",
@@ -868,7 +943,13 @@
     "enable_attention_cooldown": {
         "description": "❄️ 启用注意力冷却机制",
         "type": "bool",
-        "hint": "【防误判增强】开启后，当读空气AI判定不回复某用户时，会将该用户加入冷却列表，暂时阻止注意力自动增加。这可以防止AI因高注意力值而误判用户与他人的对话是在跟AI说话。冷却状态会在用户重新与AI互动（关键词/@触发或正常对话通过）时自动解除。需要启用注意力机制才生效",
+        "hint": "【防误判增强】开启后，当读空气AI判定不回复某用户时，会将该用户加入冷却流程，暂时阻止注意力自动增加。若启用未接续谈保护层，会先进入候选冷却，后续同用户消息仍未触发回复时再升级为正式冷却。需要启用注意力机制才生效",
+        "default": true
+    },
+    "enable_cooldown_auto_release": {
+        "description": "❄️ 启用正式冷却自动解除",
+        "type": "bool",
+        "hint": "开启后，正式冷却超过 cooldown_max_duration 后自动解除；关闭后，正式冷却只在该用户被实际回复时解除。默认开启。",
         "default": true
     },
     "cooldown_max_duration": {
@@ -888,6 +969,30 @@
         "type": "float",
         "hint": "触发冷却机制时，除了正常的注意力衰减外，额外降低的注意力分数。这可以更快地降低对不想聊天的用户的关注度。范围0-1，建议0.1-0.3，默认0.2",
         "default": 0.2
+    },
+    "enable_pending_attention_cooldown": {
+        "description": "⏳ 启用未接续谈保护层",
+        "type": "bool",
+        "hint": "开启后，读空气判断不回复不会立即进入正式冷却，而是先进入候选冷却并观察同一用户后续消息。若后续消息仍没有触发回复，再升级为正式冷却。默认开启。",
+        "default": true
+    },
+    "pending_cooldown_grace_user_messages": {
+        "description": "⏳ 未接续谈观察消息数",
+        "type": "int",
+        "hint": "候选冷却阶段最多观察同一发送者后续多少条自己的消息。只计算同一用户本人消息，不受其他群成员发言影响。建议 1-2，默认 1。",
+        "default": 1
+    },
+    "pending_cooldown_max_wait_seconds": {
+        "description": "⏳ 未接续谈最长等待时间(秒)",
+        "type": "int",
+        "hint": "候选冷却状态的最长保留时间。超过该时间后自动解除，不升级为正式冷却。建议 30-90 秒，默认 60。",
+        "default": 60
+    },
+    "pending_cooldown_same_user_probability_floor": {
+        "description": "⏳ 未接续谈最低概率保护",
+        "type": "float",
+        "hint": "同一用户处于候选冷却阶段时，后续消息保留的最低触发概率。用于减少误伤。范围 0-1，建议 0.1-0.3，默认 0.18。",
+        "default": 0.18
     },
     "enable_conversation_fatigue": {
         "description": "🔄 启用对话疲劳机制",
@@ -1115,6 +1220,38 @@
         "type": "float",
         "hint": "【新增可配置】频率调整后的概率上限。无论如何提升，概率不会超过此值。默认0.95(95%)。建议范围0.8-0.99，避免AI过于活跃",
         "default": 0.6
+    },
+    "frequency_ai_include_persona": {
+        "description": "频率判断AI使用人格",
+        "type": "bool",
+        "hint": "开启后，频率动态调整器在判断发言是否过多或过少时，会使用当前群会话的人格设定。默认开启，以便每个群的自定义人格和活跃风格参与判断。",
+        "default": true
+    },
+    "frequency_ai_persona_name": {
+        "description": "频率判断AI指定人格",
+        "type": "string",
+        "hint": "给频率判断AI指定固定人格名。留空时使用当前会话人格。只有在「频率判断AI使用人格」开启时生效。",
+        "default": "",
+        "promptDataRef": "frequency-ai"
+    },
+    "enable_frequency_ai_reasoning": {
+        "description": "🧠 频率判断AI启用额外推理",
+        "type": "bool",
+        "hint": "开启后，频率判断AI会按照统一判断协议输出简短推理块，并在最后一行输出 正常 / 过于频繁 / 过少。用于排查频率判断原因。",
+        "default": false
+    },
+    "frequency_ai_reasoning_log": {
+        "description": "🧠 频率判断AI输出推理日志",
+        "type": "bool",
+        "hint": "开启后，将频率判断AI的额外推理内容写入日志。仅在启用额外推理时生效。",
+        "default": false
+    },
+    "frequency_ai_reasoning_log_mode": {
+        "description": "🧠 频率判断AI推理日志模式",
+        "type": "string",
+        "options": ["processed", "raw"],
+        "hint": "processed=只输出解析后的推理内容；raw=输出模型原始响应，适合排查格式问题。",
+        "default": "processed"
     },
     "enable_typing_simulator": {
         "description": "启用回复延迟模拟",
@@ -1800,6 +1937,27 @@
         "type": "float",
         "hint": "【前置条件】此配置仅在同时启用「启用群聊等待窗口」和「启用注意力机制」时生效。若只开启其中一个，此项无任何效果。\n\n【作用】等待窗口将用户连续发送的多条消息合并为一次回复，但注意力每次回复固定增长（如+0.4）不会因合批而改变。此配置在注意力正常增长之后，额外施加一个向下修正，防止用户习惯性拆分消息导致注意力虚高。\n\n【计算方式】修正值 = 本值 × 窗口收集的额外消息条数。例如默认0.05时：额外1条→修正-0.05（净增+0.35），额外2条→修正-0.10（净增+0.30），额外3条→修正-0.15（净增+0.25）。注意力增长步长始终不变，修正是独立的后置操作，不影响疲劳、冷却等其他机制的正常运作。\n\n设为0则禁用修正（等待窗口仍正常工作，只是不对注意力做额外修正）。范围0-0.5，默认0.05。",
         "default": 0.05
+    },
+    "group_wait_window_at_mode": {
+        "description": "⏳ @消息窗口行为模式",
+        "type": "string",
+        "options": ["force_close", "intercept", "immediate", "bypass"],
+        "hint": "控制窗口期内同一用户再次 @AI 时的行为。force_close=结束窗口并让@消息进入普通回复流程；intercept=剥离@AI后吸收到窗口；immediate=尝试缓存后立刻结束窗口；bypass=不影响窗口，独立处理。旧 group_wait_window_merge_at_messages=true 会自动兼容为 intercept。",
+        "default": "force_close"
+    },
+    "group_wait_window_keyword_mode": {
+        "description": "⏳ 关键词消息窗口行为模式",
+        "type": "string",
+        "options": ["intercept", "force_close", "immediate", "bypass"],
+        "hint": "控制触发关键词消息与等待窗口的关系。intercept=关键词消息进入窗口缓存；force_close=窗口期内关键词结束窗口并正常处理；immediate=关键词消息不打开新窗口但会结束已有窗口；bypass=完全绕过等待窗口。默认 intercept。",
+        "default": "intercept"
+    },
+    "group_wait_window_poke_mode": {
+        "description": "⏳ 戳一戳窗口行为模式",
+        "type": "string",
+        "options": ["bypass", "force_close"],
+        "hint": "控制戳一戳消息与等待窗口的关系。bypass=戳一戳不影响窗口；force_close=窗口期内戳一戳会结束窗口。戳一戳自身始终不会开启等待窗口。",
+        "default": "bypass"
     },
     "group_wait_window_merge_at_messages": {
         "description": "⏳ 窗口期内合并@消息",

@@ -11,7 +11,7 @@ from pathlib import Path
 from aiohttp import web
 from astrbot.api import logger
 
-from .auth import AuthManager
+from .auth import AuthFailureReason, AuthManager
 from .security import SecurityManager
 
 # 合法 session 名称：仅允许字母、数字、下划线、短横线、点号、感叹号
@@ -108,6 +108,25 @@ class WebPanelServer:
             "web_panel_brute_force_rate_count": file_config.get(
                 "web_panel_brute_force_rate_count", 3
             ),
+            "web_panel_brute_force_tiers": file_config.get(
+                "web_panel_brute_force_tiers",
+                "[[5,30],[10,60],[15,300],[20,600],[30,1800],[50,3600]]",
+            ),
+            "web_panel_brute_force_ban_duration": file_config.get(
+                "web_panel_brute_force_ban_duration", 3600
+            ),
+            "web_panel_heartbeat_visible_interval_seconds": file_config.get(
+                "web_panel_heartbeat_visible_interval_seconds", 300
+            ),
+            "web_panel_heartbeat_hidden_interval_seconds": file_config.get(
+                "web_panel_heartbeat_hidden_interval_seconds", 1200
+            ),
+            "web_panel_heartbeat_retry_base_seconds": file_config.get(
+                "web_panel_heartbeat_retry_base_seconds", 15
+            ),
+            "web_panel_heartbeat_retry_max_seconds": file_config.get(
+                "web_panel_heartbeat_retry_max_seconds", 120
+            ),
             "web_panel_ip_bind_check": file_config.get("web_panel_ip_bind_check", True),
         }
 
@@ -143,6 +162,37 @@ class WebPanelServer:
                 return xff.split(",")[0].strip()
 
         return peer_ip
+
+    def _is_request_secure(self, request: web.Request) -> bool:
+        """判断当前请求是否处于 HTTPS 安全上下文。"""
+        if request.secure or request.scheme == "https":
+            return True
+        if self._trust_proxy_cached:
+            proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+            if proto.lower() == "https":
+                return True
+        return False
+
+    def _set_auth_cookie(
+        self, request: web.Request, response: web.StreamResponse, token: str
+    ):
+        response.set_cookie(
+            "gcp_token",
+            token,
+            httponly=True,
+            samesite="Strict",
+            secure=self._is_request_secure(request),
+            path="/",
+            max_age=24 * 60 * 60,
+        )
+
+    def _clear_auth_cookie(self, request: web.Request, response: web.StreamResponse):
+        response.del_cookie(
+            "gcp_token",
+            path="/",
+            samesite="Strict",
+            secure=self._is_request_secure(request),
+        )
 
     @property
     def _trust_proxy_cached(self) -> bool:
@@ -229,6 +279,25 @@ class WebPanelServer:
             response.headers["Content-Security-Policy"] = csp
         return response
 
+    @staticmethod
+    def _auth_failure_payload(reason: str | None) -> dict:
+        """把认证失败原因转换成前端可展示的消息。"""
+        reason = reason or AuthFailureReason.REVOKED
+        messages = {
+            AuthFailureReason.IP_CHANGED: "您的 IP 地址已变更，为安全起见请重新登录",
+            AuthFailureReason.EXPIRED: "登录已过期，请重新登录",
+            AuthFailureReason.PASSWORD_CHANGED: "密码已修改，请重新登录",
+            AuthFailureReason.PASSWORD_RESET: "密码已重置，请重新登录",
+            AuthFailureReason.SERVER_RESTART: "Web 面板已重载，请重新登录",
+            AuthFailureReason.SESSION_MISSING: "会话不存在，请重新登录",
+            AuthFailureReason.REVOKED: "会话已失效，请重新登录",
+        }
+        return {
+            "ok": False,
+            "msg": messages.get(reason, "登录已失效，请重新登录"),
+            "reason": reason,
+        }
+
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
         """安全中间件：路径校验 → robots.txt → 防爬虫 → IP 过滤 → JWT 认证（含 IP 绑定）"""
@@ -269,18 +338,19 @@ class WebPanelServer:
                 )
                 return web.Response(status=403, text="Forbidden")
             verify_ip = ip if self._ip_bind_check_cached else None
-            payload = self.auth_mgr.verify_token(token, current_ip=verify_ip)
-            if payload is None:
+            auth_result = self.auth_mgr.verify_token(token, current_ip=verify_ip)
+            if not auth_result.ok:
                 self.security.log_access(
                     ip, request.method, path, 403, note="无效 token 访问面板静态资源"
                 )
                 return web.Response(status=403, text="Forbidden")
             rate_limit_response = self._check_authenticated_rate_limit_response(
-                ip, path, payload, method=request.method
+                ip, path, auth_result.payload, method=request.method
             )
             if rate_limit_response is not None:
                 return rate_limit_response
-            request["user"] = payload
+            request["user"] = auth_result.payload or {}
+            request["auth"] = auth_result
             request["client_ip"] = ip
             response = await handler(request)
             self.security.log_access(ip, request.method, path, response.status)
@@ -323,8 +393,9 @@ class WebPanelServer:
         if self.security.anti_spider_enabled:
             token = self._extract_token(request)
             if token:
-                payload = self.auth_mgr.verify_token(token, current_ip=ip)
-                if payload is not None:
+                verify_ip = ip if self._ip_bind_check_cached else None
+                auth_result = self.auth_mgr.verify_token(token, current_ip=verify_ip)
+                if auth_result.ok:
                     _skip_spider = True
 
         if self.security.anti_spider_enabled and not _skip_spider:
@@ -360,15 +431,16 @@ class WebPanelServer:
             if not token:
                 return web.HTTPFound("/")
             verify_ip = ip if self._ip_bind_check_cached else None
-            payload = self.auth_mgr.verify_token(token, current_ip=verify_ip)
-            if payload is None:
+            auth_result = self.auth_mgr.verify_token(token, current_ip=verify_ip)
+            if not auth_result.ok:
                 return web.HTTPFound("/")
             rate_limit_response = self._check_authenticated_rate_limit_response(
-                ip, path, payload, method=request.method
+                ip, path, auth_result.payload, method=request.method
             )
             if rate_limit_response is not None:
                 return rate_limit_response
-            request["user"] = payload
+            request["user"] = auth_result.payload or {}
+            request["auth"] = auth_result
             request["client_ip"] = ip
             response = await handler(request)
             self.security.log_access(ip, request.method, path, response.status)
@@ -384,40 +456,26 @@ class WebPanelServer:
             return web.json_response({"ok": False, "msg": "未登录"}, status=401)
 
         verify_ip = ip if self._ip_bind_check_cached else None
-        payload = self.auth_mgr.verify_token(token, current_ip=verify_ip)
-        if payload is None:
+        auth_result = self.auth_mgr.verify_token(token, current_ip=verify_ip)
+        if not auth_result.ok:
             self.security.log_access(ip, request.method, path, 401)
-            # 区分 IP 变更和 token 过期/失效两种情况
-            token_payload_no_ip = self.auth_mgr.verify_token(token, current_ip=None)
             if not path.startswith("/api/"):
                 return web.HTTPFound("/")
-            if token_payload_no_ip is not None:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "msg": "您的 IP 地址已变更，为安全起见请重新登录",
-                        "reason": "ip_changed",
-                    },
-                    status=401,
-                )
-            else:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "msg": "登录已过期，请重新登录",
-                        "reason": "token_expired",
-                    },
-                    status=401,
-                )
+            response = web.json_response(
+                self._auth_failure_payload(auth_result.reason), status=401
+            )
+            self._clear_auth_cookie(request, response)
+            return response
 
-        request["user"] = payload
+        request["user"] = auth_result.payload or {}
+        request["auth"] = auth_result
         request["client_ip"] = ip
         rate_limit_response = self._check_authenticated_rate_limit_response(
             ip,
             path,
-            payload,
+            auth_result.payload,
             method=request.method,
-            is_heartbeat=path == "/api/auth/status",
+            is_heartbeat=path == "/api/auth/heartbeat",
         )
         if rate_limit_response is not None:
             return rate_limit_response
@@ -439,7 +497,7 @@ class WebPanelServer:
         """已认证请求的独立限速检查"""
         session_id = ""
         if isinstance(payload, dict):
-            session_id = str(payload.get("sub") or payload.get("iat") or "")
+            session_id = str(payload.get("sid") or payload.get("sub") or payload.get("iat") or "")
         allowed, wait_seconds = self.security.check_authenticated_rate_limit(
             ip,
             session_id=session_id,
@@ -495,6 +553,7 @@ class WebPanelServer:
         r.add_get("/api/auth/status", self._handle_auth_status)
         r.add_post("/api/auth/change-password", self._handle_change_password)
         r.add_get("/api/auth/verify", self._handle_verify)
+        r.add_get("/api/auth/heartbeat", self._handle_heartbeat)
         r.add_post("/api/auth/logout", self._handle_logout)
 
         # 配置
@@ -861,26 +920,64 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
         if not password:
             return web.json_response({"ok": False, "msg": "请输入密码"}, status=400)
 
-        token = self.auth_mgr.login(
-            password, client_ip=ip if self._ip_bind_check_cached else None
+        login_result = self.auth_mgr.login(
+            password,
+            client_ip=ip if self._ip_bind_check_cached else None,
+            device_id=body.get("device_id", ""),
+            user_agent=request.headers.get("User-Agent", ""),
         )
-        if token is None:
-            self.security.record_login_failure(ip)
+        if login_result is None:
+            failure = self.security.record_login_failure(ip)
             tracker = self.security.brute_force.get(ip)
             attempts = tracker.attempts if tracker else 0
             if attempts >= 5:
                 logger.warning(f"🔒 IP {ip} 密码错误第 {attempts} 次，可能遭受暴力破解")
+            if failure.get("action") == "rate_ban":
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "msg": "密码错误过于频繁，访问已被临时封禁",
+                        "blocked": True,
+                    },
+                    status=403,
+                )
+            if failure.get("action") == "permanent_ban":
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "msg": "密码错误次数过多，访问已被封禁",
+                        "blocked": True,
+                    },
+                    status=403,
+                )
+            if failure.get("action") == "tier_lock":
+                wait_seconds = int(failure.get("lock_seconds") or 0)
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "msg": f"密码错误次数过多，请等待 {wait_seconds} 秒后再试",
+                        "locked": True,
+                        "wait_seconds": wait_seconds,
+                    },
+                    status=429,
+                )
             return web.json_response({"ok": False, "msg": "密码错误"}, status=401)
 
         # 登录成功，重置失败计数
         self.security.reset_login_failures(ip)
-        return web.json_response(
+        response = web.json_response(
             {
                 "ok": True,
-                "token": token,
                 "password_changed": self.auth_mgr.password_changed,
+                "session": {
+                    "session_id": login_result["session_id"],
+                    "device_id": login_result["device_id"],
+                    "expires_at": login_result["expires_at"],
+                },
             }
         )
+        self._set_auth_cookie(request, response, login_result["token"])
+        return response
 
     async def _handle_auth_status(self, request: web.Request):
         """检查密码是否已修改"""
@@ -892,12 +989,16 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
         )
 
     async def _handle_change_password(self, request: web.Request):
-        """修改密码（需要持有有效 token，通过 Authorization 头传入）"""
+        """修改密码（需要持有有效会话 Cookie）"""
         ip = self._get_client_ip(request)
 
-        # 验证调用者持有有效 token（防止无 token 时调用）
+        # 验证调用者持有有效会话
         token = self._extract_token(request)
-        if not token or not self.auth_mgr.verify_token(token, current_ip=ip):
+        verify_ip = ip if self._ip_bind_check_cached else None
+        auth_result = (
+            self.auth_mgr.verify_token(token, current_ip=verify_ip) if token else None
+        )
+        if auth_result is None or not auth_result.ok:
             return web.json_response({"ok": False, "msg": "请先登录"}, status=401)
 
         try:
@@ -919,23 +1020,42 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}</style></head>
         if not self.auth_mgr.change_password(old_pw, new_pw):
             return web.json_response({"ok": False, "msg": "旧密码错误"}, status=401)
 
-        # 密码修改成功，auth_mgr内部已轮换 jwt_secret，导致所有其他端或旧 token 失效
-        # 此时不再直接登录并返回新 token，而是通过清除当前响应的 Cookie 让所有设备都必须重新登录
+        # 密码修改成功后所有旧会话都会失效，当前浏览器也需要重新登录。
         response = web.json_response({"ok": True})
-        response.del_cookie("gcp_token")
+        self._clear_auth_cookie(request, response)
         return response
 
     async def _handle_verify(self, request: web.Request):
-        """验证 Token 有效性（已通过中间件即有效）"""
-        return web.json_response({"ok": True})
+        """验证当前会话有效性（已通过中间件即有效）"""
+        auth_result = request.get("auth")
+        payload = {"ok": True}
+        if auth_result is not None:
+            payload.update(self.auth_mgr.build_session_status(auth_result))
+        return web.json_response(payload)
+
+    async def _handle_heartbeat(self, request: web.Request):
+        """浏览器会话心跳，用于延续服务端会话活跃时间。"""
+        auth_result = request.get("auth")
+        sid = ""
+        if auth_result and auth_result.payload:
+            sid = auth_result.payload.get("sid", "")
+            self.auth_mgr.touch_session(sid, heartbeat=True, persist=True)
+        payload = {"ok": True}
+        if auth_result is not None:
+            payload.update(self.auth_mgr.build_session_status(auth_result))
+        return web.json_response(payload)
 
     async def _handle_logout(self, request: web.Request):
-        """登出（清除客户端 token，服务端记录日志）"""
+        """登出（撤销当前服务端会话并清除 Cookie）"""
         ip = self._get_client_ip(request)
+        auth_result = request.get("auth")
+        if auth_result and auth_result.payload:
+            self.auth_mgr.revoke_session(
+                auth_result.payload.get("sid"), reason=AuthFailureReason.REVOKED
+            )
         logger.info(f"🔑 用户从 {ip} 主动登出")
         response = web.json_response({"ok": True})
-        # 清除 Cookie（如有设置）
-        response.del_cookie("gcp_token")
+        self._clear_auth_cookie(request, response)
         return response
 
     # ==================== 配置 Handler ====================

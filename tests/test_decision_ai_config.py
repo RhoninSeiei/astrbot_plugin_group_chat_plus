@@ -52,6 +52,11 @@ class DecisionAIConfigTest(unittest.TestCase):
             "enable_proactive_ai_reasoning",
             "proactive_ai_reasoning_log",
             "proactive_ai_reasoning_log_mode",
+            "frequency_ai_include_persona",
+            "frequency_ai_persona_name",
+            "enable_frequency_ai_reasoning",
+            "frequency_ai_reasoning_log",
+            "frequency_ai_reasoning_log_mode",
         ):
             self.assertIn(f'"{key}"', self.schema)
 
@@ -63,6 +68,9 @@ class DecisionAIConfigTest(unittest.TestCase):
             "reasoning_start_marker=self.judgment_reasoning_start_marker",
             "include_persona=self.decision_ai_include_persona",
             "configured_persona_name=self.decision_ai_persona_name",
+            "frequency_ai_include_persona",
+            "frequency_ai_persona_name",
+            "enable_frequency_ai_reasoning",
         ):
             self.assertIn(fragment, self.main_source)
 
@@ -82,6 +90,23 @@ class DecisionAIConfigTest(unittest.TestCase):
             "parse_decision_response",
         ):
             self.assertIn(fragment, self.proactive_source)
+
+    def test_frequency_judge_uses_persona_and_reasoning_options(self):
+        frequency_source = (
+            REPO_ROOT / "utils" / "frequency_adjuster.py"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "frequency_ai_include_persona",
+            "frequency_ai_persona_name",
+            "enable_frequency_ai_reasoning",
+            "DecisionAI._build_reasoning_protocol",
+            "include_persona=self.frequency_ai_include_persona",
+            "configured_persona_name=self.frequency_ai_persona_name",
+            "context_label=\"频率动态调整器\"",
+            "parse_frequency_response",
+            "log_reasoning_output",
+        ):
+            self.assertIn(fragment, frequency_source)
 
     def test_custom_reasoning_protocol_keeps_final_answer(self):
         response_filter = _load_ai_response_filter().AIResponseFilter

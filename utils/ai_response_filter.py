@@ -8,7 +8,16 @@ AI响应过滤器 - 处理带思考链的AI返回
 
 import re
 from typing import Optional, Dict, Any, Tuple
-from astrbot.api import logger
+
+try:
+    from astrbot.api import logger
+except Exception:
+    try:
+        from astrbot.api.all import logger
+    except Exception:
+        import logging
+
+        logger = logging.getLogger(__name__)
 
 # 详细日志开关
 DEBUG_MODE: bool = False

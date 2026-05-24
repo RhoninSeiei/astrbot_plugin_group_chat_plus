@@ -6,26 +6,27 @@
 const App = {
     _currentView: 'tech-tree',
     _initialized: false,
+    _heartbeatTimer: null,
 
     /** 应用入口（面板页面加载时调用） */
     async start() {
-        // 面板页已由服务端验证 token，这里做一次客户端 token 检查
-        if (!Api._token) {
-            window.location.href = '/';
-            return;
-        }
-
-        // 验证 token 有效性
         const verify = await Api.verify();
         if (!verify.ok) {
             Api.clearToken();
             window.location.href = '/';
             return;
         }
+        Api.onAuthEvent((event) => {
+            if (event.type === 'unauthorized') {
+                this._stopHeartbeat();
+                window.location.href = '/';
+            }
+        });
 
         // 进入主界面
         this.showPage('main');
         await this._initMain();
+        this._startHeartbeat();
     },
 
     /** 显示指定页面，隐藏其他 */
@@ -1311,6 +1312,46 @@ const App = {
         } else {
             section.style.opacity = '1';
             label.textContent = '黑名单 IP';
+        }
+    },
+
+    _normalizeHeartbeatSeconds(value, fallback, minimum) {
+        const num = Number(value);
+        if (!Number.isFinite(num) || num <= 0) return fallback * 1000;
+        return Math.max(minimum, Math.round(num)) * 1000;
+    },
+
+    async _startHeartbeat() {
+        this._stopHeartbeat();
+        const cfgRes = await Api.getConfig();
+        const cfg = cfgRes && cfgRes.ok ? (cfgRes.config || {}) : {};
+        const visibleInterval = this._normalizeHeartbeatSeconds(
+            cfg.web_panel_heartbeat_visible_interval_seconds,
+            300,
+            30,
+        );
+        const hiddenInterval = this._normalizeHeartbeatSeconds(
+            cfg.web_panel_heartbeat_hidden_interval_seconds,
+            1200,
+            60,
+        );
+        const tick = async () => {
+            const res = await Api.heartbeat();
+            if (!res.ok && !res.network_error) {
+                Api.clearToken();
+                window.location.href = '/';
+                return;
+            }
+            const nextDelay = document.hidden ? hiddenInterval : visibleInterval;
+            this._heartbeatTimer = window.setTimeout(tick, nextDelay);
+        };
+        this._heartbeatTimer = window.setTimeout(tick, visibleInterval);
+    },
+
+    _stopHeartbeat() {
+        if (this._heartbeatTimer) {
+            window.clearTimeout(this._heartbeatTimer);
+            this._heartbeatTimer = null;
         }
     }
 };

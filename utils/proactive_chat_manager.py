@@ -161,6 +161,7 @@ class ProactiveChatManager:
     _memory_plugin_mode: str = "legacy"
     _livingmemory_top_k: int = 5
     _livingmemory_version: str = "v1"
+    _livingmemory_persona_compat_mode: str = "auto"
     # 工具提醒配置
     _enable_tools_reminder: bool = False
     _tools_reminder_persona_filter: bool = False
@@ -338,7 +339,10 @@ class ProactiveChatManager:
         cls._enable_memory_injection = config["enable_memory_injection"]
         cls._memory_plugin_mode = config["memory_plugin_mode"]
         cls._livingmemory_top_k = config["livingmemory_top_k"]
-        cls._livingmemory_version = config.get("livingmemory_version", "v1")
+        cls._livingmemory_version = config.get("livingmemory_version", "auto")
+        cls._livingmemory_persona_compat_mode = config.get(
+            "livingmemory_persona_compat_mode", "auto"
+        )
         # 工具提醒配置
         cls._enable_tools_reminder = config["enable_tools_reminder"]
         cls._tools_reminder_persona_filter = config.get(
@@ -4300,9 +4304,13 @@ class ProactiveChatManager:
                 memory_mode = cls._memory_plugin_mode
                 livingmemory_top_k = cls._livingmemory_top_k
                 livingmemory_version = cls._livingmemory_version
+                livingmemory_persona_compat_mode = cls._livingmemory_persona_compat_mode
+                memory_mode, livingmemory_version = MemoryInjector.resolve_mode(
+                    context, memory_mode, livingmemory_version
+                )
 
                 # 使用新的 get_memories_by_session 方法获取记忆（无需 event 对象）
-                if MemoryInjector.check_memory_plugin_available(
+                if memory_mode and MemoryInjector.check_memory_plugin_available(
                     context, mode=memory_mode, version=livingmemory_version
                 ):
                     try:
@@ -4312,6 +4320,7 @@ class ProactiveChatManager:
                             mode=memory_mode,
                             top_k=livingmemory_top_k,
                             version=livingmemory_version,
+                            persona_compat_mode=livingmemory_persona_compat_mode,
                         )
                         if memories:
                             old_len = len(final_message)

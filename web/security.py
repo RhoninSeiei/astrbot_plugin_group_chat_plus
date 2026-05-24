@@ -43,6 +43,8 @@ class BruteForceTracker:
     attempts: int = 0
     locked_until: float = 0.0
     first_attempt: float = 0.0
+    last_attempt: float = 0.0
+    reached_max_tier: bool = False
     recent_attempts: List[float] = field(default_factory=list)
 
 
@@ -52,6 +54,8 @@ _BRUTE_FORCE_TIERS = [
     (10, 60),
     (15, 300),
     (20, 600),
+    (30, 1800),
+    (50, 3600),
 ]
 
 # 访问日志文件最大大小（1MB）
@@ -158,6 +162,12 @@ class SecurityManager:
         self.brute_force_rate_count: int = self._get_int_config(
             config, "web_panel_brute_force_rate_count", 3
         )
+        self.brute_force_ban_duration: int = self._get_int_config(
+            config, "web_panel_brute_force_ban_duration", 0
+        )
+        self.brute_force_tiers: List[Tuple[int, int]] = self._parse_tiers(
+            config.get("web_panel_brute_force_tiers", "")
+        )
 
         # 启动时清理受保护 IP 误写入的封禁记录
         self._purge_protected_from_bans()
@@ -176,6 +186,38 @@ class SecurityManager:
     def _is_protected(self, ip: str) -> bool:
         """检查 IP 是否在受保护名单中"""
         return ip in self.protected_ips
+
+    @staticmethod
+    def _parse_tiers(raw_value) -> List[Tuple[int, int]]:
+        """解析暴力破解阶梯配置，异常时使用默认阶梯。"""
+        try:
+            if isinstance(raw_value, list):
+                parsed = [
+                    (int(item[0]), int(item[1]))
+                    for item in raw_value
+                    if isinstance(item, (list, tuple)) and len(item) == 2
+                ]
+                parsed.sort(key=lambda item: item[0])
+                if parsed:
+                    return parsed
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if isinstance(raw_value, str) and raw_value.strip():
+                loaded = json.loads(raw_value)
+                parsed = [
+                    (int(item[0]), int(item[1]))
+                    for item in loaded
+                    if isinstance(item, (list, tuple)) and len(item) == 2
+                ]
+                parsed.sort(key=lambda item: item[0])
+                if parsed:
+                    return parsed
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        return list(_BRUTE_FORCE_TIERS)
 
     def _purge_protected_from_bans(self):
         """
@@ -621,40 +663,48 @@ class SecurityManager:
             return False, 0
 
         now = time.time()
-        if tracker.locked_until > now:
-            remaining = int(tracker.locked_until - now) + 1
-            return True, remaining
-
         if (
             self.brute_force_window > 0
-            and tracker.first_attempt > 0
-            and now - tracker.first_attempt > self.brute_force_window
+            and tracker.last_attempt > 0
+            and now - tracker.last_attempt > self.brute_force_window
         ):
             self.brute_force.pop(ip, None)
             return False, 0
 
+        if tracker.locked_until > now:
+            remaining = int(tracker.locked_until - now) + 1
+            return True, remaining
+
         return False, 0
 
-    def record_login_failure(self, ip: str):
-        """记录一次登录失败"""
+    def record_login_failure(self, ip: str) -> dict:
+        """记录一次登录失败并返回处理动作。"""
         now = time.time()
         tracker = self.brute_force.get(ip)
         if tracker is None:
-            tracker = BruteForceTracker(attempts=0, locked_until=0.0, first_attempt=now)
+            tracker = BruteForceTracker(
+                attempts=0,
+                locked_until=0.0,
+                first_attempt=now,
+                last_attempt=now,
+            )
             self.brute_force[ip] = tracker
         elif (
             self.brute_force_window > 0
-            and tracker.first_attempt > 0
-            and now - tracker.first_attempt > self.brute_force_window
+            and tracker.last_attempt > 0
+            and now - tracker.last_attempt > self.brute_force_window
         ):
             tracker.attempts = 0
             tracker.locked_until = 0.0
             tracker.first_attempt = now
+            tracker.last_attempt = now
+            tracker.reached_max_tier = False
             tracker.recent_attempts.clear()
         elif tracker.first_attempt <= 0:
             tracker.first_attempt = now
 
         tracker.attempts += 1
+        tracker.last_attempt = now
         if self.brute_force_rate_window > 0 and self.brute_force_rate_count > 1:
             cutoff = now - self.brute_force_rate_window
             tracker.recent_attempts = [
@@ -664,8 +714,9 @@ class SecurityManager:
             ]
             tracker.recent_attempts.append(now)
 
+        max_threshold, _max_seconds = self.brute_force_tiers[-1]
         lock_seconds = 0
-        for threshold, seconds in _BRUTE_FORCE_TIERS:
+        for threshold, seconds in self.brute_force_tiers:
             if tracker.attempts >= threshold:
                 lock_seconds = seconds
 
@@ -674,13 +725,75 @@ class SecurityManager:
             and self.brute_force_rate_count > 1
             and len(tracker.recent_attempts) >= self.brute_force_rate_count
         ):
-            lock_seconds = max(lock_seconds, self.brute_force_rate_window)
+            duration = self.brute_force_ban_duration
+            ban_duration = duration if duration > 0 else None
+            self.ban_ip(
+                ip,
+                reason=(
+                    f"[暴力破解] 频率异常（第{tracker.attempts}次，"
+                    f"{self.brute_force_rate_window}秒内失败{len(tracker.recent_attempts)}次）"
+                ),
+                duration=ban_duration,
+            )
+            logger.warning(
+                f"🔒 IP {ip} 登录频率异常，已封禁。"
+                f"（第{tracker.attempts}次，"
+                f"{self.brute_force_rate_window}秒内{len(tracker.recent_attempts)}次失败）"
+            )
+            return {
+                "action": "rate_ban",
+                "attempts": tracker.attempts,
+                "banned": True,
+                "lock_seconds": 0,
+                "rate_count": len(tracker.recent_attempts),
+                "rate_window": self.brute_force_rate_window,
+            }
+
+        if tracker.attempts >= max_threshold:
+            tracker.reached_max_tier = True
+        if (
+            tracker.reached_max_tier
+            and tracker.locked_until <= now
+            and tracker.attempts > max_threshold
+        ):
+            duration = self.brute_force_ban_duration
+            ban_duration = duration if duration > 0 else None
+            self.ban_ip(
+                ip,
+                reason=(
+                    f"[暴力破解] 已达最大阶梯阈值（第{tracker.attempts}次），"
+                    "解锁后继续尝试"
+                ),
+                duration=ban_duration,
+            )
+            logger.warning(
+                f"🔒 IP {ip} 登录失败次数已达最大阈值（{tracker.attempts}次），已封禁"
+            )
+            return {
+                "action": "permanent_ban",
+                "attempts": tracker.attempts,
+                "banned": True,
+                "lock_seconds": 0,
+            }
 
         if lock_seconds > 0:
             tracker.locked_until = now + lock_seconds
             logger.warning(
                 f"🔒 IP {ip} 密码错误第 {tracker.attempts} 次，锁定 {lock_seconds} 秒"
             )
+            return {
+                "action": "tier_lock",
+                "attempts": tracker.attempts,
+                "banned": False,
+                "lock_seconds": lock_seconds,
+            }
+
+        return {
+            "action": "recorded",
+            "attempts": tracker.attempts,
+            "banned": False,
+            "lock_seconds": 0,
+        }
 
     def reset_login_failures(self, ip: str):
         """登录成功后重置失败计数"""
@@ -717,6 +830,12 @@ class SecurityManager:
         )
         self.brute_force_rate_count = self._get_int_config(
             config, "web_panel_brute_force_rate_count", 3
+        )
+        self.brute_force_ban_duration = self._get_int_config(
+            config, "web_panel_brute_force_ban_duration", 0
+        )
+        self.brute_force_tiers = self._parse_tiers(
+            config.get("web_panel_brute_force_tiers", "")
         )
 
         # 若受保护 IP 名单发生变化，重新检查封禁表

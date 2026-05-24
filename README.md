@@ -1,5 +1,11 @@
 # 群聊增强插件 (Chat Plus)
 
+> **自用版本说明**
+>
+> 本仓库是基于 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 修改后的自用维护版本，面向 RhoninSeiei 的 AstrBot 实际部署场景。代码会参考上游更新，但以线上运行效果和自用需求为准，保留与上游不同的实现。
+>
+> 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、会话级人格与模型选择、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、Web 面板安全强化、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
+
 <div align="center">
 
 [![Version](https://img.shields.io/badge/version-v1.2.1-blue.svg)](https://github.com/Him666233/astrbot_plugin_group_chat_plus)

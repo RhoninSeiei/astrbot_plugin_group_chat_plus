@@ -54,7 +54,11 @@ class ProbabilityManager:
     """
 
     # 使用字典保存每个聊天的概率状态
-    # 格式: {chat_key: {"probability": float, "boosted_until": timestamp}}
+    # 格式:
+    # {chat_key: {
+    #   "base_probability": float, "base_until": timestamp,
+    #   "reply_boost_probability": float, "reply_boost_until": timestamp
+    # }}
     _probability_status: Dict[str, Dict[str, Any]] = {}
     _lock = asyncio.Lock()  # 异步锁
 
@@ -160,28 +164,49 @@ class ProbabilityManager:
         # 生成本次会话的运行时签名
         guard_session(chat_key, probability=0.05)
 
-        # ========== 第一步：获取基础概率（考虑常规提升） ==========
+        # ========== 第一步：获取基础概率（基础覆盖 + 回复后临时提升） ==========
         base_probability = initial_probability
 
         async with ProbabilityManager._lock:
             if chat_key in ProbabilityManager._probability_status:
                 status = ProbabilityManager._probability_status[chat_key]
-                boosted_until = status.get("boosted_until", 0)
 
-                # 检查是否还在提升期内
-                if current_time < boosted_until:
-                    base_probability = status.get("probability", initial_probability)
+                # 兼容旧状态结构：probability/boosted_until 视为基础概率覆盖。
+                if "probability" in status or "boosted_until" in status:
+                    status["base_probability"] = status.pop(
+                        "probability", initial_probability
+                    )
+                    status["base_until"] = status.pop("boosted_until", 0)
+                    status.setdefault("base_source", "legacy_probability_state")
+
+                base_until = float(status.get("base_until") or 0)
+                if current_time < base_until:
+                    base_probability = status.get("base_probability", initial_probability)
                     if DEBUG_MODE:
                         logger.info(
-                            f"会话 {chat_key} 使用常规提升概率: {base_probability:.2f}"
+                            f"会话 {chat_key} 使用基础概率覆盖: {base_probability:.2f}"
                         )
                 else:
-                    # 超时了，清理记录
-                    del ProbabilityManager._probability_status[chat_key]
+                    status.pop("base_probability", None)
+                    status.pop("base_until", None)
+                    status.pop("base_source", None)
+
+                reply_boost_until = float(status.get("reply_boost_until") or 0)
+                if current_time < reply_boost_until:
+                    base_probability = status.get(
+                        "reply_boost_probability", base_probability
+                    )
                     if DEBUG_MODE:
                         logger.info(
-                            f"会话 {chat_key} 概率提升已超时，恢复为初始概率: {initial_probability:.2f}"
+                            f"会话 {chat_key} 使用回复后临时提升概率: {base_probability:.2f}"
                         )
+                else:
+                    status.pop("reply_boost_probability", None)
+                    status.pop("reply_boost_until", None)
+                    status.pop("reply_boost_source", None)
+
+                if not status:
+                    del ProbabilityManager._probability_status[chat_key]
 
         # ========== 第二步：应用动态时间段调整 ==========
         if ProbabilityManager._enable_dynamic_reply_probability:
@@ -338,10 +363,12 @@ class ProbabilityManager:
         boosted_until = current_time + duration
 
         async with ProbabilityManager._lock:
-            ProbabilityManager._probability_status[chat_key] = {
-                "probability": boosted_probability,
-                "boosted_until": boosted_until,
-            }
+            status = ProbabilityManager._probability_status.setdefault(chat_key, {})
+            status["reply_boost_probability"] = max(
+                0.0, min(1.0, float(boosted_probability))
+            )
+            status["reply_boost_until"] = boosted_until
+            status["reply_boost_source"] = "after_reply_probability"
 
         logger.info(
             f"会话 {chat_key} 概率已提升至 {boosted_probability}, "
@@ -395,10 +422,10 @@ class ProbabilityManager:
         boosted_until = current_time + duration
 
         async with ProbabilityManager._lock:
-            ProbabilityManager._probability_status[chat_key] = {
-                "probability": new_probability,
-                "boosted_until": boosted_until,
-            }
+            status = ProbabilityManager._probability_status.setdefault(chat_key, {})
+            status["base_probability"] = max(0.0, min(1.0, float(new_probability)))
+            status["base_until"] = boosted_until
+            status["base_source"] = "frequency_adjuster"
 
         logger.info(
             f"[频率调整] 会话 {chat_key} 基础概率已调整为 {new_probability:.2f}, "

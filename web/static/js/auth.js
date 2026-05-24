@@ -32,15 +32,13 @@ const Auth = {
 
         if (!res.ok) return this._showError('login-error', res.msg);
 
-        Api.setToken(res.token);
         document.getElementById('login-password').value = '';
         this._hideError('login-error');
 
         if (!res.password_changed) {
             App.showPage('password-change');
         } else {
-            App.showPage('main');
-            App._initMain();
+            window.location.href = '/panel';
         }
     },
 
@@ -56,11 +54,11 @@ const Auth = {
         const res = await Api.changePassword(oldPw, newPw);
         if (!res.ok) return this._showError('pw-change-error', res.msg);
 
-        Api.setToken(res.token);
         this._hideError('pw-change-error');
-        Utils.toast('密码修改成功', 'success');
-        App.showPage('main');
-        App._initMain();
+        Utils.alert(res.msg || '密码修改成功，请重新登录').then(() => {
+            Api.clearToken();
+            window.location.href = '/';
+        });
     },
 
     logout() {

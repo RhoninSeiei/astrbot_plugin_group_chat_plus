@@ -2521,6 +2521,202 @@ class ContextManager:
             return False
 
     @staticmethod
+    async def flush_cached_messages_by_params(
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+        unified_msg_origin: str,
+        cached_messages: list,
+        context: "Context",
+        self_id: str = None,
+        platform_id: str = None,
+    ) -> bool:
+        """无 event 场景下将缓存消息转正到官方历史和自定义存储。"""
+        try:
+            from .message_cleaner import MessageCleaner
+
+            if not cached_messages:
+                return True
+            if not context:
+                logger.warning("[冷群转正] Context 为空，无法保存缓存消息")
+                return False
+            if not chat_id or not unified_msg_origin:
+                logger.warning(
+                    "[冷群转正] chat_id 或 unified_msg_origin 为空，跳过保存"
+                )
+                return False
+
+            normalized_cached_messages = []
+            for msg in cached_messages:
+                if not isinstance(msg, dict) or "content" not in msg:
+                    continue
+                normalized_msg = dict(msg)
+                content = normalized_msg.get("content", "")
+                if isinstance(content, str):
+                    normalized_msg["content"] = (
+                        MessageCleaner.clean_message(content) or content
+                    )
+                normalized_cached_messages.append(normalized_msg)
+
+            if not normalized_cached_messages:
+                return True
+
+            normalized_cached_messages.sort(
+                key=lambda m: m.get("message_timestamp") or m.get("timestamp", 0)
+            )
+
+            if ContextManager._is_custom_storage_enabled():
+                file_path = ContextManager._get_storage_path(
+                    platform_name, is_private, chat_id
+                )
+                if file_path is not None:
+                    loop = asyncio.get_event_loop()
+                    for cached_msg in normalized_cached_messages:
+                        msg_content = cached_msg.get("content", "")
+                        if not msg_content:
+                            continue
+                        user_msg_dict = {
+                            "message_str": msg_content,
+                            "platform_name": platform_name,
+                            "timestamp": int(
+                                cached_msg.get("message_timestamp")
+                                or cached_msg.get("timestamp")
+                                or datetime.now().timestamp()
+                            ),
+                            "type": MessageType.GROUP_MESSAGE.value
+                            if not is_private
+                            else MessageType.FRIEND_MESSAGE.value,
+                            "group_id": chat_id if not is_private else None,
+                            "self_id": self_id,
+                            "session_id": unified_msg_origin,
+                            "message_id": cached_msg.get(
+                                "message_id",
+                                f"idle_flush_{int(time.time() * 1000)}",
+                            ),
+                            "sender": {
+                                "user_id": cached_msg.get("sender_id") or "unknown",
+                                "nickname": cached_msg.get("sender_name")
+                                or "未知用户",
+                            },
+                        }
+                        append_ok = await loop.run_in_executor(
+                            None,
+                            ContextManager._append_message_to_file,
+                            file_path,
+                            user_msg_dict,
+                        )
+                        if not append_ok:
+                            logger.warning(
+                                f"[冷群转正] 自定义存储追加失败: {file_path}"
+                            )
+
+                    effective_limit = ContextManager._get_effective_storage_limit()
+                    await loop.run_in_executor(
+                        None,
+                        ContextManager._trim_messages_in_file,
+                        file_path,
+                        effective_limit,
+                    )
+
+            history_mgr = getattr(context, "message_history_manager", None)
+            if history_mgr and platform_id:
+                for cached_msg in normalized_cached_messages:
+                    try:
+                        msg_content = cached_msg.get("content", "")
+                        if not msg_content:
+                            continue
+                        await history_mgr.insert(
+                            platform_id=platform_id,
+                            user_id=chat_id,
+                            content=[{"type": "text", "data": {"text": msg_content}}],
+                            sender_id=cached_msg.get("sender_id", "unknown"),
+                            sender_name=cached_msg.get("sender_name", "未知用户"),
+                        )
+                    except Exception as e:
+                        logger.warning(f"[冷群转正] platform_message_history 写入失败: {e}")
+
+            cm = context.conversation_manager
+            curr_cid = await cm.get_curr_conversation_id(unified_msg_origin)
+            if not curr_cid:
+                title = f"群聊 {chat_id}" if not is_private else f"私聊 {chat_id}"
+                curr_cid = await cm.new_conversation(
+                    unified_msg_origin=unified_msg_origin,
+                    platform_id=platform_id,
+                    title=title,
+                    content=[],
+                )
+
+            if not curr_cid:
+                logger.warning(f"[冷群转正] 无法获取或创建对话ID: {unified_msg_origin}")
+                return False
+
+            conversation = await cm.get_conversation(
+                unified_msg_origin=unified_msg_origin, conversation_id=curr_cid
+            )
+            history_list = ContextManager._extract_official_history_list(conversation)
+
+            def make_content_hashable(content):
+                if isinstance(content, list):
+                    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+                return content
+
+            existing_contents = set()
+            for history_msg in history_list:
+                if isinstance(history_msg, dict) and "content" in history_msg:
+                    try:
+                        existing_contents.add(
+                            make_content_hashable(history_msg["content"])
+                        )
+                    except (TypeError, ValueError):
+                        continue
+
+            added_count = 0
+            for cached_msg in normalized_cached_messages:
+                content = cached_msg.get("content", "")
+                if not content:
+                    continue
+                try:
+                    hashable_content = make_content_hashable(content)
+                except (TypeError, ValueError):
+                    hashable_content = None
+                if hashable_content is not None and hashable_content in existing_contents:
+                    continue
+
+                image_urls = cached_msg.get("image_urls", [])
+                if image_urls:
+                    multimodal_content = []
+                    if content:
+                        multimodal_content.append({"type": "text", "text": content})
+                    for img_url in image_urls:
+                        if img_url:
+                            multimodal_content.append(
+                                {"type": "image_url", "image_url": {"url": img_url}}
+                            )
+                    history_list.append({"role": "user", "content": multimodal_content})
+                else:
+                    history_list.append({"role": "user", "content": content})
+
+                if hashable_content is not None:
+                    existing_contents.add(hashable_content)
+                added_count += 1
+
+            if len(history_list) > 150:
+                history_list = history_list[-150:]
+
+            success = await ContextManager._try_official_save(
+                cm, unified_msg_origin, curr_cid, history_list
+            )
+            if success:
+                logger.info(f"✅ [冷群转正] 已保存 {added_count} 条缓存消息")
+                return True
+
+            logger.warning("[冷群转正] 保存到官方历史失败")
+            return False
+        except Exception as e:
+            logger.error(f"[冷群转正] 保存缓存消息失败: {e}", exc_info=True)
+            return False
+
+    @staticmethod
     async def save_to_official_conversation_with_cache(
         event: AstrMessageEvent,
         cached_messages: list,

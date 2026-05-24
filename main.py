@@ -429,6 +429,30 @@ class ChatPlus(Star):
             )
             _cache_ttl = 0
         self.pending_cache_ttl_seconds = _cache_ttl
+        self.enable_idle_cache_flush = config.get("enable_idle_cache_flush", False)
+        _idle_flush_delay_raw = config.get("idle_cache_flush_delay_seconds", 600)
+        try:
+            _idle_flush_delay = (
+                int(_idle_flush_delay_raw)
+                if _idle_flush_delay_raw is not None
+                else 600
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                f"⚠️ idle_cache_flush_delay_seconds 配置值 '{_idle_flush_delay_raw}' 无法转换为整数，使用默认值 600"
+            )
+            _idle_flush_delay = 600
+        if _idle_flush_delay < 60:
+            logger.warning(
+                f"⚠️ idle_cache_flush_delay_seconds 配置值 {_idle_flush_delay} 小于60秒，已自动调整为 60 秒"
+            )
+            _idle_flush_delay = 60
+        elif _idle_flush_delay > 7200:
+            logger.warning(
+                f"⚠️ idle_cache_flush_delay_seconds 配置值 {_idle_flush_delay} 超过7200秒，已自动调整为 7200 秒"
+            )
+            _idle_flush_delay = 7200
+        self.idle_cache_flush_delay_seconds = _idle_flush_delay
 
         # === ⏳ 群聊等待窗口配置 ===
         _GWW_TIMEOUT_MIN_MS = 200
@@ -516,9 +540,45 @@ class ChatPlus(Star):
             0.0, min(0.5, _gww_attention_decay)
         )  # 等待窗口每条额外消息的注意力修正衰减值
 
-        # ⏳ 窗口期内@消息合并配置
-        self.group_wait_window_merge_at_messages = config.get(
-            "group_wait_window_merge_at_messages", False
+        # ⏳ 窗口期内触发消息行为模式
+        _valid_at_modes = ("force_close", "intercept", "immediate", "bypass")
+        _valid_keyword_modes = ("intercept", "force_close", "immediate", "bypass")
+        _valid_poke_modes = ("bypass", "force_close")
+        _gww_at_mode_raw = config.get("group_wait_window_at_mode", None)
+        if _gww_at_mode_raw is None:
+            self.group_wait_window_at_mode = (
+                "intercept"
+                if config.get("group_wait_window_merge_at_messages", False)
+                else "force_close"
+            )
+        else:
+            if _gww_at_mode_raw not in _valid_at_modes:
+                logger.warning(
+                    f"⚠️ group_wait_window_at_mode 配置值 '{_gww_at_mode_raw}' 无效，使用默认值 'force_close'"
+                )
+                _gww_at_mode_raw = "force_close"
+            self.group_wait_window_at_mode = _gww_at_mode_raw
+
+        _gww_keyword_mode_raw = config.get(
+            "group_wait_window_keyword_mode", "intercept"
+        )
+        if _gww_keyword_mode_raw not in _valid_keyword_modes:
+            logger.warning(
+                f"⚠️ group_wait_window_keyword_mode 配置值 '{_gww_keyword_mode_raw}' 无效，使用默认值 'intercept'"
+            )
+            _gww_keyword_mode_raw = "intercept"
+        self.group_wait_window_keyword_mode = _gww_keyword_mode_raw
+
+        _gww_poke_mode_raw = config.get("group_wait_window_poke_mode", "bypass")
+        if _gww_poke_mode_raw not in _valid_poke_modes:
+            logger.warning(
+                f"⚠️ group_wait_window_poke_mode 配置值 '{_gww_poke_mode_raw}' 无效，使用默认值 'bypass'"
+            )
+            _gww_poke_mode_raw = "bypass"
+        self.group_wait_window_poke_mode = _gww_poke_mode_raw
+
+        self.group_wait_window_merge_at_messages = (
+            self.group_wait_window_at_mode == "intercept"
         )
         _gww_merge_at_list_mode_raw = config.get(
             "group_wait_window_merge_at_list_mode", "whitelist"
@@ -600,7 +660,7 @@ class ChatPlus(Star):
             "enable_memory_injection", False
         )  # 启用记忆植入
         self.memory_plugin_mode = config.get(
-            "memory_plugin_mode", "legacy"
+            "memory_plugin_mode", "auto"
         )  # 记忆插件模式
         self.memory_insertion_timing = config.get(
             "memory_insertion_timing", "post_decision"
@@ -609,8 +669,11 @@ class ChatPlus(Star):
             "livingmemory_top_k", 5
         )  # LivingMemory召回数量
         self.livingmemory_version = config.get(
-            "livingmemory_version", "v2"
-        )  # LivingMemory插件版本（v1旧版1.x/v2新版2.x+）
+            "livingmemory_version", "auto"
+        )  # LivingMemory插件版本（auto/v1/v2）
+        self.livingmemory_persona_compat_mode = config.get(
+            "livingmemory_persona_compat_mode", "auto"
+        )  # LivingMemory人格ID兼容模式
 
         # === 工具提醒配置 ===
         self.enable_tools_reminder = config.get(
@@ -675,6 +738,23 @@ class ChatPlus(Star):
         self.enable_ignore_at_all = config.get(
             "enable_ignore_at_all", False
         )  # 启用忽略@全体成员
+        self.at_all_message_mode = config.get(
+            "at_all_message_mode", "skip_probability"
+        )
+        if self.at_all_message_mode not in (
+            "normal",
+            "skip_probability",
+            "skip_all",
+            "probability_boost",
+        ):
+            logger.warning(
+                f"⚠️ at_all_message_mode 配置值 '{self.at_all_message_mode}' 无效，使用 skip_probability"
+            )
+            self.at_all_message_mode = "skip_probability"
+        self.at_all_probability_boost_value = max(
+            0.0,
+            min(1.0, config.get("at_all_probability_boost_value", 0.3)),
+        )
 
         # === 戳一戳配置 ===
         self.poke_message_mode = config.get(
@@ -799,6 +879,25 @@ class ChatPlus(Star):
         self.cooldown_attention_decrease = config.get(
             "cooldown_attention_decrease", 0.2
         )  # 冷却时额外降低的注意力值
+        self.enable_cooldown_auto_release = config.get(
+            "enable_cooldown_auto_release", True
+        )
+        self.enable_pending_attention_cooldown = config.get(
+            "enable_pending_attention_cooldown", True
+        )
+        self.pending_cooldown_grace_user_messages = max(
+            1, int(config.get("pending_cooldown_grace_user_messages", 1))
+        )
+        self.pending_cooldown_max_wait_seconds = max(
+            5, int(config.get("pending_cooldown_max_wait_seconds", 60))
+        )
+        self.pending_cooldown_same_user_probability_floor = max(
+            0.0,
+            min(
+                1.0,
+                float(config.get("pending_cooldown_same_user_probability_floor", 0.18)),
+            ),
+        )
 
         # === 🆕 对话疲劳机制配置 ===
         self.enable_conversation_fatigue = config.get(
@@ -1003,6 +1102,19 @@ class ChatPlus(Star):
         self.frequency_max_probability = config.get(
             "frequency_max_probability", 0.95
         )  # 最大概率
+        self.frequency_ai_include_persona = config.get(
+            "frequency_ai_include_persona", True
+        )
+        self.frequency_ai_persona_name = config.get("frequency_ai_persona_name", "")
+        self.enable_frequency_ai_reasoning = config.get(
+            "enable_frequency_ai_reasoning", False
+        )
+        self.frequency_ai_reasoning_log = config.get(
+            "frequency_ai_reasoning_log", False
+        )
+        self.frequency_ai_reasoning_log_mode = config.get(
+            "frequency_ai_reasoning_log_mode", "processed"
+        )
 
         # === 回复延迟模拟配置 ===
         self.enable_typing_simulator = config.get(
@@ -1595,6 +1707,8 @@ class ChatPlus(Star):
         # 🔧 为了兼容性，保留对原字典的引用（指向缓存管理器的内部字典）
         # 这样旧代码仍然可以访问 self.pending_messages_cache[chat_id]
         self.pending_messages_cache = self.cache_manager.pending_messages_cache
+        self._idle_flush_tasks = {}
+        self._idle_flush_meta = {}
 
         # 标记本插件正在处理的消息（用于after_message_sent筛选）
         # 🔧 修复：使用message_id作为键，避免同一会话中多条消息并发时标记冲突
@@ -1735,6 +1849,13 @@ class ChatPlus(Star):
                 "frequency_analysis_message_count": self.frequency_analysis_message_count,
                 "frequency_analysis_timeout": self.frequency_analysis_timeout,
                 "frequency_adjust_duration": self.frequency_adjust_duration,
+                "frequency_ai_include_persona": self.frequency_ai_include_persona,
+                "frequency_ai_persona_name": self.frequency_ai_persona_name,
+                "enable_frequency_ai_reasoning": self.enable_frequency_ai_reasoning,
+                "frequency_ai_reasoning_log": self.frequency_ai_reasoning_log,
+                "frequency_ai_reasoning_log_mode": self.frequency_ai_reasoning_log_mode,
+                "judgment_reasoning_start_marker": self.judgment_reasoning_start_marker,
+                "judgment_reasoning_end_marker": self.judgment_reasoning_end_marker,
                 # 动态时间段配置（频率调整器也需要）
                 "enable_dynamic_reply_probability": self.enable_dynamic_reply_probability,
                 "reply_time_periods": self.reply_time_periods,
@@ -1802,6 +1923,11 @@ class ChatPlus(Star):
             "cooldown_max_duration": self.cooldown_max_duration,
             "cooldown_trigger_threshold": self.cooldown_trigger_threshold,
             "cooldown_attention_decrease": self.cooldown_attention_decrease,
+            "enable_pending_attention_cooldown": self.enable_pending_attention_cooldown,
+            "pending_cooldown_grace_user_messages": self.pending_cooldown_grace_user_messages,
+            "pending_cooldown_max_wait_seconds": self.pending_cooldown_max_wait_seconds,
+            "pending_cooldown_same_user_probability_floor": self.pending_cooldown_same_user_probability_floor,
+            "enable_cooldown_auto_release": self.enable_cooldown_auto_release,
         }
         # 初始化冷却管理器（持久化存储和配置参数）
         self.cooldown_enabled = self.enable_attention_cooldown
@@ -2181,6 +2307,7 @@ class ChatPlus(Star):
             "memory_plugin_mode": self.memory_plugin_mode,
             "livingmemory_top_k": self.livingmemory_top_k,
             "livingmemory_version": self.livingmemory_version,
+            "livingmemory_persona_compat_mode": self.livingmemory_persona_compat_mode,
             # 工具提醒配置
             "enable_tools_reminder": self.enable_tools_reminder,
             "tools_reminder_persona_filter": self.tools_reminder_persona_filter,
@@ -2215,6 +2342,154 @@ class ChatPlus(Star):
             "judgment_reasoning_end_marker": self.judgment_reasoning_end_marker,
             "decision_ai_provider_id": self.decision_ai_provider_id,
         }
+
+    def _reset_idle_flush_timer(
+        self,
+        chat_id: str,
+        unified_msg_origin: str,
+        platform_name: str,
+        is_private: bool,
+        self_id: str,
+        platform_id: str,
+    ) -> None:
+        """收到新群消息后重置冷群缓存自动转正计时器。"""
+        if (
+            not self.enable_idle_cache_flush
+            or self.idle_cache_flush_delay_seconds <= 0
+            or not chat_id
+            or is_private
+        ):
+            return
+
+        self._idle_flush_meta[chat_id] = {
+            "unified_msg_origin": unified_msg_origin,
+            "platform_name": platform_name,
+            "is_private": is_private,
+            "chat_id": chat_id,
+            "self_id": self_id,
+            "platform_id": platform_id,
+        }
+
+        old_task = self._idle_flush_tasks.get(chat_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        self._idle_flush_tasks[chat_id] = asyncio.create_task(
+            self._idle_flush_worker(chat_id)
+        )
+
+    async def _idle_flush_worker(self, chat_id: str) -> None:
+        """会话静默指定时间后，将缓存消息自动保存到历史。"""
+        try:
+            await asyncio.sleep(self.idle_cache_flush_delay_seconds)
+            current_task = self._idle_flush_tasks.get(chat_id)
+            if current_task is not asyncio.current_task():
+                return
+            if not self.cache_manager.has_cache(chat_id):
+                return
+            if self.debug_mode:
+                logger.info(
+                    f"[冷群转正] 会话 {chat_id} 静默 {self.idle_cache_flush_delay_seconds} 秒，开始自动转正缓存"
+                )
+            await self._do_idle_flush(chat_id)
+        except asyncio.CancelledError:
+            if self.debug_mode:
+                logger.info(f"[冷群转正] 会话 {chat_id} 计时器已重置")
+            raise
+        except Exception as e:
+            logger.warning(f"[冷群转正] 执行自动转正失败: {e}", exc_info=True)
+        finally:
+            current_task = self._idle_flush_tasks.get(chat_id)
+            if current_task is asyncio.current_task():
+                self._idle_flush_tasks.pop(chat_id, None)
+
+    async def _do_idle_flush(self, chat_id: str) -> None:
+        """执行冷群缓存转正。"""
+        if not self.cache_manager.has_cache(chat_id):
+            return
+
+        meta = self._idle_flush_meta.get(chat_id)
+        if not meta:
+            logger.warning(f"[冷群转正] 会话 {chat_id} 缺少元信息，跳过自动转正")
+            return
+
+        for _ in range(max(1, self.concurrent_wait_max_loops)):
+            async with self.concurrent_lock:
+                proactive_processing = chat_id in self.proactive_processing_sessions
+                session_processing = any(
+                    processing_chat_id == chat_id
+                    for processing_chat_id in self.processing_sessions.values()
+                )
+            if not proactive_processing and not session_processing:
+                break
+            await asyncio.sleep(self.concurrent_wait_interval)
+        else:
+            logger.warning(
+                f"[冷群转正] 会话 {chat_id} 等待并发处理结束超时，跳过本次自动转正"
+            )
+            return
+
+        cached_messages_to_convert = self.cache_manager.prepare_cache_for_save(
+            chat_id=chat_id,
+            current_msg_id=None,
+            current_msg_timestamp=None,
+            processing_msg_ids=set(),
+            proactive_processing=False,
+        )
+
+        window_buffered_to_convert = []
+        wb_saved_msg_ids = set()
+        try:
+            window_buffered_to_convert = self.cache_manager.prepare_window_buffered_for_save(
+                chat_id=chat_id,
+                processing_msg_ids=set(),
+            )
+            for item in window_buffered_to_convert:
+                if isinstance(item, dict) and item.get("message_id"):
+                    wb_saved_msg_ids.add(item["message_id"])
+        except Exception as e:
+            logger.warning(f"[冷群转正] 获取窗口缓冲消息失败，降级为普通缓存转正: {e}")
+
+        all_messages_to_convert = [
+            m
+            for m in (cached_messages_to_convert + window_buffered_to_convert)
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+        if not all_messages_to_convert:
+            return
+        all_messages_to_convert.sort(
+            key=lambda m: m.get("message_timestamp") or m.get("timestamp", 0)
+        )
+
+        success = await ContextManager.flush_cached_messages_by_params(
+            platform_name=meta["platform_name"],
+            is_private=meta["is_private"],
+            chat_id=meta["chat_id"],
+            unified_msg_origin=meta["unified_msg_origin"],
+            cached_messages=all_messages_to_convert,
+            context=self.context,
+            self_id=meta.get("self_id"),
+            platform_id=meta.get("platform_id"),
+        )
+        if not success:
+            logger.warning(f"[冷群转正] 会话 {chat_id} 自动转正保存失败")
+            return
+
+        self.cache_manager.clear_saved_cache(
+            chat_id=chat_id,
+            current_msg_id=None,
+            current_msg_timestamp=None,
+            processing_msg_ids=set(),
+            proactive_processing=False,
+        )
+        if wb_saved_msg_ids:
+            self.cache_manager.clear_window_buffered_cache(
+                chat_id, saved_msg_ids=wb_saved_msg_ids
+            )
+        self._idle_flush_meta.pop(chat_id, None)
+        logger.info(
+            f"[冷群转正] 会话 {chat_id} 已自动转正 {len(all_messages_to_convert)} 条缓存消息"
+        )
 
     def _emit_session_metadata(self):
         """输出运行时指纹信息"""
@@ -2302,6 +2577,12 @@ class ChatPlus(Star):
                 await self._web_server.stop()
             except Exception as e:
                 logger.error(f"🌐 Web 配置面板停止失败: {e}", exc_info=True)
+
+        for task in list(getattr(self, "_idle_flush_tasks", {}).values()):
+            if task and not task.done():
+                task.cancel()
+        self._idle_flush_tasks.clear()
+        self._idle_flush_meta.clear()
 
     @filter.on_platform_loaded()
     async def on_platform_loaded(self):
@@ -2591,6 +2872,16 @@ class ChatPlus(Star):
                     logger.info("消息已被标记为指令，跳过处理")
                 return
 
+            if self.enable_idle_cache_flush and self._is_enabled(event):
+                self._reset_idle_flush_timer(
+                    chat_id=event.get_group_id(),
+                    unified_msg_origin=getattr(event, "unified_msg_origin", ""),
+                    platform_name=event.get_platform_name(),
+                    is_private=event.is_private_chat(),
+                    self_id=event.get_self_id(),
+                    platform_id=event.get_platform_id(),
+                )
+
             # 【v1.0.7】检测用户是否在黑名单中
             if self._is_user_blacklisted(event):
                 # 用户在黑名单中，本插件直接跳过处理
@@ -2644,7 +2935,11 @@ class ChatPlus(Star):
                         f"[转发消息] 群聊：解析转发消息时出错（已跳过，不影响后续处理）: {e}"
                     )
 
-            # 【🆕】检测是否应该忽略@全体成员消息
+            # 【🆕】检测@全体成员消息，供后续概率/决策流程使用
+            if self._is_at_all_message(event):
+                event.set_extra("is_at_all_message", True)
+                event.set_extra("at_all_message_mode", self.at_all_message_mode)
+
             if self._should_ignore_at_all(event):
                 # 消息包含@全体成员，根据配置忽略处理
                 # 不阻止消息传播，其他插件仍可处理此消息
@@ -3697,6 +3992,8 @@ class ChatPlus(Star):
         has_trigger_keyword: bool,
         poke_info: dict = None,
         is_emoji_message: bool = False,
+        pending_cooldown_context: Optional[dict] = None,
+        is_at_all_message: bool = False,
     ) -> bool:
         """
         执行概率判断（在图片处理之前）
@@ -3775,6 +4072,26 @@ class ChatPlus(Star):
                     f"【步骤5】新成员入群消息，模式={welcome_mode}，跳过概率筛选"
                 )
 
+        skip_probability_for_at_all = False
+        at_all_transient_probability_boost = 0.0
+        if is_at_all_message:
+            at_all_mode = self.at_all_message_mode or "skip_probability"
+            if at_all_mode in ("skip_probability", "skip_all"):
+                skip_probability_for_at_all = True
+                if self.debug_mode:
+                    logger.info(
+                        f"【步骤5】@全体成员消息，模式={at_all_mode}，跳过概率筛选"
+                    )
+            elif at_all_mode == "probability_boost":
+                at_all_transient_probability_boost = max(
+                    0.0, min(1.0, self.at_all_probability_boost_value)
+                )
+                if self.debug_mode:
+                    logger.info(
+                        "【步骤5】@全体成员消息，模式=probability_boost，"
+                        f"临时提升概率 +{at_all_transient_probability_boost:.2f}"
+                    )
+
         # @消息、触发关键词消息、符合条件的戳一戳消息、或入群消息跳过概率判断
         # v1.1.2: 关键词智能模式下，关键词也会跳过概率判断
         if (
@@ -3782,6 +4099,7 @@ class ChatPlus(Star):
             and not has_trigger_keyword
             and not skip_probability_for_poke
             and not skip_probability_for_welcome
+            and not skip_probability_for_at_all
         ):
             # 概率判断
             if self.debug_mode:
@@ -3794,6 +4112,8 @@ class ChatPlus(Star):
                 event,
                 poke_info=poke_info,
                 is_emoji_message=is_emoji_message,
+                pending_cooldown_context=pending_cooldown_context,
+                transient_probability_boost=at_all_transient_probability_boost,
             )
             if not should_process:
                 if self.debug_mode:
@@ -3831,7 +4151,197 @@ class ChatPlus(Star):
                         f"【步骤5】新成员入群消息,跳过概率判断,模式={welcome_mode}"
                     )
 
+            if skip_probability_for_at_all:
+                if self.debug_mode:
+                    logger.info(
+                        f"【步骤5】@全体成员消息,跳过概率判断,模式={self.at_all_message_mode}"
+                    )
+
         return True
+
+    async def _collect_pending_cooldown_context(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        is_at_message: bool,
+        has_trigger_keyword: bool,
+        mention_info: dict = None,
+    ) -> dict:
+        """收集同一用户候选冷却上下文，仅用于群聊普通概率路径。"""
+        if event.is_private_chat() or not self.cooldown_enabled:
+            return {}
+
+        try:
+            chat_key = ProbabilityManager.get_chat_key(
+                event.get_platform_name(), event.is_private_chat(), chat_id
+            )
+            user_id = event.get_sender_id()
+            raw_text = MessageCleaner.extract_raw_message_from_event(event)
+            is_empty_at = MessageCleaner.is_empty_at_message(raw_text, is_at_message)
+            mention_other_flag = bool(mention_info)
+
+            await CooldownManager.check_and_release_expired_pending(chat_key)
+            await self._sync_cooldown_with_attention_tracking(
+                event.get_platform_name(), event.is_private_chat(), chat_id
+            )
+
+            pending_before = await CooldownManager.get_pending_info(chat_key, user_id)
+            active_before = await CooldownManager.is_in_cooldown(chat_key, user_id)
+            progress = await CooldownManager.consume_pending_by_same_user_message(
+                chat_key=chat_key,
+                user_id=user_id,
+                message_id=self._get_message_id(event),
+                message_timestamp=time.time(),
+                is_at_ai=is_at_message,
+                mention_other=mention_other_flag,
+                has_trigger_keyword=has_trigger_keyword,
+                is_empty_at=is_empty_at,
+            )
+
+            reengage_result = {"cleared_pending": False, "cleared_active": False}
+            if (
+                is_at_message
+                or is_empty_at
+                or (has_trigger_keyword and not mention_other_flag)
+            ):
+                reengage_result = await CooldownManager.handle_same_user_reengage(
+                    chat_key, user_id, is_at_ai=is_at_message
+                )
+
+            pending_after = await CooldownManager.get_pending_info(chat_key, user_id)
+            return {
+                "chat_key": chat_key,
+                "user_id": user_id,
+                "user_name": event.get_sender_name() or "未知用户",
+                "message_id": self._get_message_id(event),
+                "raw_text": raw_text,
+                "is_empty_at": is_empty_at,
+                "pending_before": pending_before,
+                "pending_progress": progress,
+                "pending_after": pending_after,
+                "active_before": active_before,
+                "same_user_reengage": bool(reengage_result.get("cleared_pending")),
+                "same_user_active_released": bool(
+                    reengage_result.get("cleared_active")
+                ),
+                "same_sender_recent_unanswered": bool(pending_before),
+                "mention_other": mention_other_flag,
+            }
+        except Exception as e:
+            logger.warning(f"[候选冷却] 收集上下文失败，已跳过: {e}")
+            return {}
+
+    async def _sync_cooldown_with_attention_tracking(
+        self,
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+    ) -> None:
+        """确保正式/候选冷却只作用于仍在注意力追踪表中的用户。"""
+        if not self.cooldown_enabled or not self.enable_attention_mechanism:
+            return
+
+        try:
+            chat_key = ProbabilityManager.get_chat_key(
+                platform_name, is_private, chat_id
+            )
+            attention_map = await AttentionManager.get_attention_info(
+                platform_name, is_private, chat_id
+            )
+            removed_users = await CooldownManager.sync_with_attention_map(
+                chat_key, attention_map
+            )
+            if removed_users and self.debug_mode:
+                logger.info(
+                    f"[注意力冷却] 已同步关注列表，移除 {len(removed_users)} 个不再被追踪的冷却用户"
+                )
+        except Exception as e:
+            logger.warning(f"[注意力冷却] 同步关注列表失败，已跳过: {e}")
+
+    async def _apply_attention_no_reply_decay(
+        self,
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+    ) -> bool:
+        """在冷却关闭或正式冷却确认后执行一次不回复衰减。"""
+        if not self.enable_attention_mechanism:
+            return False
+
+        try:
+            await AttentionManager.decrease_attention_on_no_reply(
+                platform_name,
+                is_private,
+                chat_id,
+                user_id,
+                user_name,
+                attention_decrease_step=self.attention_decrease_on_no_reply_step,
+                min_attention_threshold=self.attention_decrease_threshold,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[注意力衰减] 读空气未回复衰减执行失败: {e}", exc_info=True)
+            return False
+
+    async def _trigger_attention_cooldown_after_no_reply(
+        self,
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+        trigger_message_id: str = "",
+        trigger_message_timestamp: float = 0,
+    ) -> bool:
+        """首次确认不回复后，根据配置进入候选冷却或正式冷却。"""
+        if not self.enable_attention_mechanism or not self.cooldown_enabled:
+            return False
+
+        try:
+            profile = await AttentionManager.get_attention_info(
+                platform_name, is_private, chat_id, user_id
+            )
+            if not profile:
+                return False
+
+            current_attention = float(profile.get("attention_score", 0.0) or 0.0)
+            if current_attention < self.cooldown_trigger_threshold:
+                return False
+
+            chat_key = ProbabilityManager.get_chat_key(
+                platform_name, is_private, chat_id
+            )
+            if self.enable_pending_attention_cooldown:
+                await CooldownManager.add_pending_cooldown(
+                    chat_key=chat_key,
+                    user_id=user_id,
+                    user_name=user_name,
+                    reason="decision_ai_no_reply",
+                    trigger_message_id=trigger_message_id,
+                    trigger_message_timestamp=trigger_message_timestamp,
+                    trigger_attention_before=current_attention,
+                    trigger_attention_after=current_attention,
+                )
+                return True
+
+            activated = await CooldownManager.add_to_cooldown(
+                chat_key,
+                user_id,
+                user_name,
+                reason="decision_ai_no_reply_direct_active",
+                trigger_message_id=trigger_message_id,
+                trigger_message_timestamp=trigger_message_timestamp,
+            )
+            if activated:
+                await self._apply_attention_no_reply_decay(
+                    platform_name, is_private, chat_id, user_id, user_name
+                )
+            return activated
+        except Exception as e:
+            logger.warning(f"[注意力冷却] 首次不回复后触发冷却失败: {e}", exc_info=True)
+            return False
 
     async def _check_ai_decision(
         self,
@@ -3842,6 +4352,7 @@ class ChatPlus(Star):
         image_urls: Optional[List[str]] = None,
         matched_trigger_keyword: str = "",  # 🆕 v1.2.0: 匹配到的触发关键词
         original_message_text: str = "",  # 🆕 v1.2.0: 原始消息文本（用于关键词检测）
+        pending_cooldown_context: Optional[dict] = None,
     ) -> bool:
         """
         执行AI决策判断（在处理完消息内容后）
@@ -3856,6 +4367,7 @@ class ChatPlus(Star):
         platform_name = event.get_platform_name()
         is_private = event.is_private_chat()
         chat_id = event.get_group_id() if not is_private else event.get_sender_id()
+        pending_cooldown_context = pending_cooldown_context or {}
 
         # 🆕 v1.2.0: 检查是否为主动对话后的回复（在临时提升期内）
         is_proactive_reply = False
@@ -3889,8 +4401,12 @@ class ChatPlus(Star):
             memory_mode = self.memory_plugin_mode
             livingmemory_top_k = self.livingmemory_top_k
             livingmemory_version = self.livingmemory_version
+            livingmemory_persona_compat_mode = self.livingmemory_persona_compat_mode
+            memory_mode, livingmemory_version = MemoryInjector.resolve_mode(
+                self.context, memory_mode, livingmemory_version
+            )
 
-            if MemoryInjector.check_memory_plugin_available(
+            if memory_mode and MemoryInjector.check_memory_plugin_available(
                 self.context, mode=memory_mode, version=livingmemory_version
             ):
                 try:
@@ -3900,6 +4416,7 @@ class ChatPlus(Star):
                         mode=memory_mode,
                         top_k=livingmemory_top_k,
                         version=livingmemory_version,
+                        persona_compat_mode=livingmemory_persona_compat_mode,
                     )
                     mem_text = str(memories).strip() if memories is not None else ""
                     if mem_text and ("当前没有任何记忆" not in mem_text):
@@ -4197,24 +4714,74 @@ class ChatPlus(Star):
                         except Exception as e:
                             logger.warning(f"[拟人增强] 记录决策失败: {e}")
 
-                    # 🆕 注意力衰减：如果注意力机制启用且对该用户注意力较高，进行衰减
                     if self.enable_attention_mechanism:
                         try:
                             user_id = event.get_sender_id()
                             user_name = event.get_sender_name() or "未知用户"
-
-                            # 调用注意力衰减方法
-                            await AttentionManager.decrease_attention_on_no_reply(
-                                platform_name,
-                                is_private,
-                                chat_id,
-                                user_id,
-                                user_name,
-                                attention_decrease_step=self.attention_decrease_on_no_reply_step,
-                                min_attention_threshold=self.attention_decrease_threshold,
+                            pending_chat_key = pending_cooldown_context.get(
+                                "chat_key"
+                            ) or ProbabilityManager.get_chat_key(
+                                platform_name, is_private, chat_id
                             )
+                            had_pending_before = bool(
+                                pending_cooldown_context.get("pending_before")
+                            )
+
+                            if had_pending_before:
+                                pending_action = (
+                                    await CooldownManager.mark_pending_decision_result(
+                                        chat_key=pending_chat_key,
+                                        user_id=user_id,
+                                        should_reply=False,
+                                        explicitly_to_other=bool(
+                                            pending_cooldown_context.get(
+                                                "mention_other"
+                                            )
+                                        ),
+                                    )
+                                )
+                                if pending_action == "cancel":
+                                    await CooldownManager.clear_pending_cooldown(
+                                        pending_chat_key,
+                                        user_id,
+                                        reason="decision_result_cancel",
+                                    )
+                                elif pending_action == "promote":
+                                    await CooldownManager.promote_pending_to_active(
+                                        pending_chat_key,
+                                        user_id,
+                                        reason="same_user_followup_no_reply",
+                                    )
+                                    await self._apply_attention_no_reply_decay(
+                                        platform_name,
+                                        is_private,
+                                        chat_id,
+                                        user_id,
+                                        user_name,
+                                    )
+                            elif self.cooldown_enabled:
+                                await self._trigger_attention_cooldown_after_no_reply(
+                                    platform_name,
+                                    is_private,
+                                    chat_id,
+                                    user_id,
+                                    user_name,
+                                    trigger_message_id=pending_cooldown_context.get(
+                                        "message_id", ""
+                                    )
+                                    or self._get_message_id(event),
+                                    trigger_message_timestamp=time.time(),
+                                )
+                            else:
+                                await self._apply_attention_no_reply_decay(
+                                    platform_name,
+                                    is_private,
+                                    chat_id,
+                                    user_id,
+                                    user_name,
+                                )
                         except Exception as e:
-                            logger.warning(f"[注意力衰减] 执行失败: {e}", exc_info=True)
+                            logger.warning(f"[候选冷却] 不回复后推进状态失败: {e}")
 
                 # 🔧 清理pre_decision缓存（防止内存残留）
                 try:
@@ -5224,8 +5791,12 @@ class ChatPlus(Star):
             memory_mode = self.memory_plugin_mode
             livingmemory_top_k = self.livingmemory_top_k
             livingmemory_version = self.livingmemory_version
+            livingmemory_persona_compat_mode = self.livingmemory_persona_compat_mode
+            memory_mode, livingmemory_version = MemoryInjector.resolve_mode(
+                self.context, memory_mode, livingmemory_version
+            )
 
-            if MemoryInjector.check_memory_plugin_available(
+            if memory_mode and MemoryInjector.check_memory_plugin_available(
                 self.context, mode=memory_mode, version=livingmemory_version
             ):
                 memories = await MemoryInjector.get_memories(
@@ -5234,6 +5805,7 @@ class ChatPlus(Star):
                     mode=memory_mode,
                     top_k=livingmemory_top_k,
                     version=livingmemory_version,
+                    persona_compat_mode=livingmemory_persona_compat_mode,
                 )
                 if memories:
                     final_message = MemoryInjector.inject_memories_to_message(
@@ -5305,6 +5877,8 @@ class ChatPlus(Star):
             {
                 "message_text": message_text or "",
                 "wait_window_extra_count": int(wait_window_extra_count or 0),
+                "has_trigger_keyword": bool(has_trigger_keyword),
+                "is_at_message": bool(is_at_message),
             },
         )
 
@@ -5971,8 +6545,10 @@ class ChatPlus(Star):
         event: AstrMessageEvent,
         chat_id: str,
         is_at_message: bool,
+        has_trigger_keyword: bool,
         poke_info_for_probability,
         platform_name: str,
+        mention_info: Optional[dict] = None,
     ) -> bool:
         """
         检查此消息是否应被群聊等待窗口拦截（直接缓存，不走概率筛选）。
@@ -5996,17 +6572,40 @@ class ChatPlus(Star):
             window = self._group_wait_windows.get(window_key)
             if window is None:
                 return False  # 无活跃窗口，不拦截
+            current_window_token = window.get("token")
+
+        async def _force_complete_window(reason: str) -> None:
+            async with self._group_wait_window_lock:
+                w = self._group_wait_windows.get(window_key)
+                if w:
+                    w["force_complete"] = True
+            if self.debug_mode:
+                logger.info(
+                    f"[等待窗口] 用户{sender_id}在窗口期内发送{reason}，结束等待窗口"
+                )
+
+        count_after_buffer = True
+        force_complete_after_buffer = False
 
         # 有活跃窗口 —— 处理 @消息特殊情况
         if is_at_message:
+            at_mode = self.group_wait_window_at_mode
+            if at_mode == "bypass":
+                if self.debug_mode:
+                    logger.info(
+                        f"[等待窗口] 用户{sender_id}在窗口期内发送@消息，配置为bypass，继续后续流程"
+                    )
+                return False
+
             # 判断是否为@机器人（而非@他人）
             bot_id = str(event.get_self_id())
             is_at_bot = any(
                 isinstance(c, At) and str(c.qq) == bot_id for c in event.get_messages()
             )
+            should_merge_at = is_at_bot and self._should_merge_at_for_user(sender_id)
 
             # 检查是否应将此@消息合并到窗口
-            if is_at_bot and self._should_merge_at_for_user(sender_id):
+            if should_merge_at:
                 # 🆕 合并模式：剥离@组件，作为普通消息缓存到窗口
                 # 1. 从消息链中移除指向bot的At组件
                 original_chain = event.get_messages()
@@ -6029,23 +6628,18 @@ class ChatPlus(Star):
                 remaining_text = event.message_str
                 has_remaining_image = PlatformLTMHelper.has_image_in_message(event)
                 if not remaining_text and not has_remaining_image:
-                    # 纯空@消息（无文字、无图片）：不缓存，但更新窗口计数
-                    # event 已被修改（At移除、is_at_or_wake_command=False）
-                    # 后续插件看到的是空的非@消息，不会触发回复
-                    async with self._group_wait_window_lock:
-                        w = self._group_wait_windows.get(window_key)
-                        if w:
-                            w["extra_count"] += 1
-                            w["deadline"] = (
-                                time.time() + self.group_wait_window_timeout_ms / 1000.0
-                            )
+                    if at_mode in ("immediate", "force_close"):
+                        await _force_complete_window("空@机器人消息")
                     if self.debug_mode:
                         logger.info(
                             f"[等待窗口] 用户{sender_id}在窗口期内发送空@消息，"
-                            f"已剥离@组件，不缓存但更新窗口计数"
+                            f"已剥离@组件，不缓存"
                         )
                     return True  # 拦截，我们插件不再处理
                 # 有内容（文字和/或图片）：fall through 到下方普通消息缓存分支
+                if at_mode in ("immediate", "force_close"):
+                    count_after_buffer = False
+                    force_complete_after_buffer = True
                 if self.debug_mode:
                     _content_desc = []
                     if remaining_text:
@@ -6058,10 +6652,7 @@ class ChatPlus(Star):
                     )
             else:
                 # 原有逻辑：@他人 / 未开启合并 / 不在名单内 → force_complete
-                async with self._group_wait_window_lock:
-                    w = self._group_wait_windows.get(window_key)
-                    if w:
-                        w["force_complete"] = True
+                await _force_complete_window("@消息")
                 if self.debug_mode:
                     logger.info(
                         f"[等待窗口] 用户{sender_id}在窗口期内发送@消息，"
@@ -6069,9 +6660,24 @@ class ChatPlus(Star):
                     )
                 return False  # 不拦截，让 @消息正常处理
 
-        # 戳一戳也不拦截
+        # 戳一戳按配置决定是否结束等待窗口
         if poke_info_for_probability is not None:
+            if self.group_wait_window_poke_mode == "force_close":
+                await _force_complete_window("戳一戳")
             return False
+
+        # 关键词消息按配置决定合并、放行或结束等待窗口
+        if has_trigger_keyword and not is_at_message:
+            keyword_mode = self.group_wait_window_keyword_mode
+            if keyword_mode == "bypass":
+                if self.debug_mode:
+                    logger.info(
+                        f"[等待窗口] 用户{sender_id}在窗口期内发送关键词消息，配置为bypass，继续后续流程"
+                    )
+                return False
+            if keyword_mode in ("immediate", "force_close"):
+                await _force_complete_window("关键词消息")
+                return False
 
         # 普通消息（含关键词触发消息）：拦截并缓存
         # 处理逻辑与概率过滤失败时的缓存路径完全一致
@@ -6169,7 +6775,7 @@ class ChatPlus(Star):
                         and hasattr(event.message_obj, "timestamp")
                         else None
                     ),
-                    "mention_info": None,
+                    "mention_info": mention_info,
                     # 关键词标记"打掉"：窗口期内的消息统一按普通消息处理
                     "is_at_message": False,
                     "has_trigger_keyword": False,
@@ -6177,6 +6783,7 @@ class ChatPlus(Star):
                     "probability_filtered": False,
                     "wait_window_intercepted": True,  # 标记为等待窗口拦截的消息
                     "window_buffered": True,  # 标记为窗口缓冲消息，用于上下文分离
+                    "gww_token": current_window_token,
                     "image_urls": [],
                 }
                 self.cache_manager.add_to_cache(
@@ -6197,7 +6804,10 @@ class ChatPlus(Star):
             async with self._group_wait_window_lock:
                 w = self._group_wait_windows.get(window_key)
                 if w:
-                    w["extra_count"] += 1
+                    if count_after_buffer:
+                        w["extra_count"] += 1
+                    if force_complete_after_buffer:
+                        w["force_complete"] = True
                     w["deadline"] = (
                         time.time() + self.group_wait_window_timeout_ms / 1000.0
                     )
@@ -6340,6 +6950,12 @@ class ChatPlus(Star):
         if self.concurrent_mode == "smart":
             event.set_extra("_gcp_smart_chat_id", chat_id)
 
+        is_at_all_message = bool(
+            event.get_extra("is_at_all_message")
+            if hasattr(event, "get_extra")
+            else False
+        )
+
         # 🆕 v1.0.2: 记录消息（用于频率调整统计）
         if self.frequency_adjuster_enabled and self.frequency_adjuster:
             # 使用完整的会话标识，确保不同会话的状态隔离
@@ -6447,6 +7063,9 @@ class ChatPlus(Star):
             else None
         )
 
+        # 步骤2.6: 检测@提及信息，供等待窗口和候选冷却共用
+        mention_info = await self._check_mention_others(event)
+
         # 🆕 v1.2.0: 群聊等待窗口拦截
         # 如果该用户在本群有活跃的等待窗口，将此消息直接缓存并跳过后续流程
         # - @消息：触发窗口提前结束（force_complete），自身不被拦截，正常走后续流程
@@ -6455,7 +7074,13 @@ class ChatPlus(Star):
         # - 普通消息：被拦截缓存
         if self.enable_group_wait_window and self._group_wait_window_max_extra > 0:
             _gww_intercepted = await self._maybe_intercept_for_wait_window(
-                event, chat_id, is_at_message, poke_info_for_probability, platform_name
+                event,
+                chat_id,
+                is_at_message,
+                has_trigger_keyword,
+                poke_info_for_probability,
+                platform_name,
+                mention_info=mention_info,
             )
             if _gww_intercepted:
                 return
@@ -6500,6 +7125,16 @@ class ChatPlus(Star):
                     f"【步骤2.7】🎭 当前平台 ({platform_name}) 不支持表情包检测，仅支持 QQ 平台"
                 )
 
+        pending_cooldown_context = {}
+        if not is_at_message and not has_trigger_keyword:
+            pending_cooldown_context = await self._collect_pending_cooldown_context(
+                event,
+                chat_id,
+                is_at_message,
+                has_trigger_keyword,
+                mention_info,
+            )
+
         # 步骤3: 概率判断（第一道核心过滤，避免后续耗时处理）
         should_process = await self._check_probability_before_processing(
             event,
@@ -6510,6 +7145,8 @@ class ChatPlus(Star):
             has_trigger_keyword,
             poke_info_for_probability,  # 传递戳一戳信息
             is_emoji_message=is_emoji_message,  # 🆕 v1.2.0: 传递表情包检测结果
+            pending_cooldown_context=pending_cooldown_context,
+            is_at_all_message=is_at_all_message,
         )
         if not should_process:
             # 🆕 概率判断失败时，也进行简化的消息缓存（避免上下文断裂）
@@ -6643,6 +7280,7 @@ class ChatPlus(Star):
                         else None,
                         "mention_info": None,  # 概率失败时简化处理
                         "is_at_message": is_at_message,
+                        "is_at_all_message": is_at_all_message,
                         "has_trigger_keyword": has_trigger_keyword,
                         "poke_info": None,  # 概率失败时简化处理
                         "probability_filtered": True,  # 标记为概率筛查过滤的消息
@@ -6673,9 +7311,24 @@ class ChatPlus(Star):
         # 普通消息/关键词消息/@消息通过后，启动等待窗口收集同一用户紧接着的多条消息
         # @消息同样激活等待窗口；戳一戳不进入等待窗口（直接处理）
         _gww_extra_count = 0  # 🔧 等待窗口收集的额外消息数（用于注意力机制补偿）
+        _gww_can_open = True
+        if poke_info_for_probability is not None:
+            _gww_can_open = False
+        elif is_at_message and self.group_wait_window_at_mode in (
+            "immediate",
+            "bypass",
+        ):
+            _gww_can_open = False
+        elif (
+            has_trigger_keyword
+            and not is_at_message
+            and self.group_wait_window_keyword_mode in ("immediate", "bypass")
+        ):
+            _gww_can_open = False
+
         if (
             self.enable_group_wait_window
-            and poke_info_for_probability is None
+            and _gww_can_open
             and self._group_wait_window_max_extra > 0
             and self.pending_cache_max_count > 0
         ):
@@ -6686,16 +7339,19 @@ class ChatPlus(Star):
             # 改为以"额外消息"身份被吸收，从而确保只有一条消息继续走完整流程
             await asyncio.sleep(0.03)
             _gww_recheck = await self._maybe_intercept_for_wait_window(
-                event, chat_id, is_at_message, poke_info_for_probability, platform_name
+                event,
+                chat_id,
+                is_at_message,
+                has_trigger_keyword,
+                poke_info_for_probability,
+                platform_name,
+                mention_info=mention_info,
             )
             if _gww_recheck:
                 return
             _gww_extra_count = await self._run_group_wait_window(
                 chat_id, _gww_sender_id
             )
-
-        # 步骤3.5: 检测@提及信息（在图片处理之前，避免不必要的开销）
-        mention_info = await self._check_mention_others(event)
 
         # 步骤3.6: 使用之前检测的戳一戳信息（避免重复检测）
         # 提取内嵌的poke_info用于后续处理
@@ -6924,13 +7580,19 @@ class ChatPlus(Star):
             if hasattr(event, "get_extra")
             else False
         )
+        _at_all_skip_all = is_at_all_message and self.at_all_message_mode == "skip_all"
 
-        if _welcome_skip_all:
+        if _welcome_skip_all or _at_all_skip_all:
             should_reply = True
             if self.debug_mode:
-                logger.info(
-                    "【步骤7】新成员入群消息(skip_all模式)，跳过AI决策，强制处理"
-                )
+                if _welcome_skip_all:
+                    logger.info(
+                        "【步骤7】新成员入群消息(skip_all模式)，跳过AI决策，强制处理"
+                    )
+                if _at_all_skip_all:
+                    logger.info(
+                        "【步骤7】@全体成员消息(skip_all模式)，跳过AI决策，强制处理"
+                    )
         else:
             # 🆕 v1.2.0: 传递匹配到的触发关键词
             # 🆕 v1.2.0: 传递原始消息文本用于关键词检测
@@ -6942,6 +7604,7 @@ class ChatPlus(Star):
                 merged_image_urls,
                 matched_trigger_keyword=matched_trigger_keyword,
                 original_message_text=original_message_text,
+                pending_cooldown_context=pending_cooldown_context,
             )
 
         if not should_reply:
@@ -7036,36 +7699,6 @@ class ChatPlus(Star):
 
         # 🔧 成功回复相关的主动对话/回复密度状态已后移到 after_message_sent，
         # 避免“判定通过但最终空回复”时提前污染状态。
-
-        # 🆕 v1.2.0: 冷却解除检测 (Requirements 2.1, 2.2)
-        # 当AI决定回复时，尝试解除用户的冷却状态
-        if should_reply and self.cooldown_enabled:
-            try:
-                chat_key = ProbabilityManager.get_chat_key(
-                    platform_name, is_private, chat_id
-                )
-                user_id = event.get_sender_id()
-
-                # 确定触发类型
-                if has_trigger_keyword:
-                    trigger_type = "keyword"
-                elif is_at_message:
-                    trigger_type = "at"
-                else:
-                    trigger_type = "normal"
-
-                # 尝试解除冷却状态
-                released = await CooldownManager.try_release_cooldown_on_reply(
-                    chat_key, user_id, trigger_type
-                )
-
-                if released:
-                    logger.info(
-                        f"🧊 [冷却解除] 用户 {event.get_sender_name()}(ID:{user_id}) "
-                        f"已从冷却列表移除，触发方式: {trigger_type}"
-                    )
-            except Exception as e:
-                logger.warning(f"[冷却解除] 检测失败: {e}")
 
         # 🆕 v1.2.0: 对话疲劳重置（在AI决策确认回复后、生成回复前执行）
         # 重要：必须在 record_replied_user() 之前执行，否则会先累加再重置
@@ -7313,6 +7946,25 @@ class ChatPlus(Star):
         )
 
         chat_key = ProbabilityManager.get_chat_key(platform_name, is_private, chat_id)
+
+        if self.cooldown_enabled:
+            try:
+                if effect_ctx.get("has_trigger_keyword"):
+                    trigger_type = "keyword"
+                elif effect_ctx.get("is_at_message"):
+                    trigger_type = "at"
+                else:
+                    trigger_type = "normal"
+                released = await CooldownManager.try_release_cooldown_on_reply(
+                    chat_key, event.get_sender_id(), trigger_type
+                )
+                if released:
+                    logger.info(
+                        f"🧊 [冷却解除] 用户 {event.get_sender_name()}(ID:{event.get_sender_id()}) "
+                        f"已从冷却列表移除，触发方式: {trigger_type}"
+                    )
+            except Exception as e:
+                logger.warning(f"[冷却解除] 发送成功后检测失败: {e}")
 
         if self.proactive_enabled:
             try:
@@ -9456,6 +10108,27 @@ class ChatPlus(Star):
             logger.error(f"[用户黑名单检测] 发生错误: {e}", exc_info=True)
             return False
 
+    def _is_at_all_message(self, event: AstrMessageEvent) -> bool:
+        """检测消息链中是否包含 @全体成员。"""
+        try:
+            if not hasattr(event, "message_obj") or not hasattr(
+                event.message_obj, "message"
+            ):
+                return False
+            original_messages = event.message_obj.message
+            if not original_messages:
+                return False
+
+            for component in original_messages:
+                if isinstance(component, AtAll):
+                    return True
+                if isinstance(component, At) and str(component.qq).lower() == "all":
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"[@全体成员检测] 发生错误: {e}", exc_info=True)
+            return False
+
     def _should_ignore_at_all(self, event: AstrMessageEvent) -> bool:
         """
         检测是否应该忽略@全体成员的消息
@@ -9476,55 +10149,10 @@ class ChatPlus(Star):
                     logger.info("[@全体成员检测] 功能未启用，跳过检测")
                 return False
 
-            # 【修复】使用原始消息链，与指令检测保持一致
-            # event.get_messages() 可能返回处理后的消息链，AtAll组件可能已被移除或转换
-            if not hasattr(event, "message_obj") or not hasattr(
-                event.message_obj, "message"
-            ):
-                if self.debug_mode:
-                    logger.info("[@全体成员检测] 无法获取原始消息链")
-                return False
-
-            original_messages = event.message_obj.message
-            if not original_messages:
-                if self.debug_mode:
-                    logger.info("[@全体成员检测] 原始消息链为空")
-                return False
-
-            # 【调试】输出消息链详细信息
-            if self.debug_mode:
-                logger.info(f"[@全体成员检测] 消息链组件数: {len(original_messages)}")
-                for i, component in enumerate(original_messages):
-                    component_type = type(component).__name__
-                    logger.info(f"[@全体成员检测] 组件{i}: 类型={component_type}")
-                    if isinstance(component, At):
-                        logger.info(f"[@全体成员检测] At组件详情: qq={component.qq}")
-                    elif isinstance(component, AtAll):
-                        logger.info(f"[@全体成员检测] 检测到AtAll组件")
-
-            # 检查消息中是否包含AtAll组件或At组件(qq="all")
-            for component in original_messages:
-                # 检查AtAll类型
-                if isinstance(component, AtAll):
-                    if self.debug_mode:
-                        logger.info(
-                            "[@全体成员检测] 检测到AtAll类型组件，根据配置忽略处理"
-                        )
-                    return True
-                # 检查At类型且qq为"all"的情况
-                if isinstance(component, At):
-                    qq_value = str(component.qq).lower()
-                    if qq_value == "all":
-                        if self.debug_mode:
-                            logger.info(
-                                f"[@全体成员检测] 检测到At(qq='all')组件，根据配置忽略处理"
-                            )
-                        return True
-
-            # 没有检测到@全体成员
-            if self.debug_mode:
-                logger.info("[@全体成员检测] 未检测到@全体成员相关组件")
-            return False
+            detected = self._is_at_all_message(event)
+            if detected and self.debug_mode:
+                logger.info("[@全体成员检测] 检测到@全体成员，根据配置忽略处理")
+            return detected
 
         except Exception as e:
             logger.error(f"[@全体成员检测] 发生错误: {e}", exc_info=True)
@@ -10066,6 +10694,8 @@ class ChatPlus(Star):
         event: AstrMessageEvent,
         poke_info: dict = None,
         is_emoji_message: bool = False,
+        pending_cooldown_context: Optional[dict] = None,
+        transient_probability_boost: float = 0.0,
     ) -> bool:
         """
         读空气概率检查，决定是否处理消息
@@ -10082,6 +10712,7 @@ class ChatPlus(Star):
             True=处理，False=跳过
         """
         # 获取当前概率
+        pending_cooldown_context = pending_cooldown_context or {}
         current_probability = await ProbabilityManager.get_current_probability(
             platform_name,
             is_private,
@@ -10132,6 +10763,12 @@ class ChatPlus(Star):
                 self.attention_duration,
                 attention_enabled,
                 poke_boost_reference=poke_boost_ref,
+                pending_probability_floor=(
+                    self.pending_cooldown_same_user_probability_floor
+                    if pending_cooldown_context.get("pending_before")
+                    or pending_cooldown_context.get("pending_after")
+                    else None
+                ),
             )
 
             if abs(adjusted_probability - current_probability) > 1e-9:
@@ -10257,6 +10894,14 @@ class ChatPlus(Star):
             logger.info(
                 f"  【回复积极性缩放】概率调整: {old_probability:.2f} -> {current_probability:.2f} "
                 f"(缩放={self.reply_probability_scale:.2f})"
+            )
+
+        if transient_probability_boost > 0:
+            old_probability = current_probability
+            current_probability = current_probability + transient_probability_boost
+            logger.info(
+                f"  【@全体成员-当前消息临时提升】概率调整: {old_probability:.2f} -> {current_probability:.2f} "
+                f"(+{transient_probability_boost:.2f})"
             )
 
         # === 最终硬性边界限制 ===

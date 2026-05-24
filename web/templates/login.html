@@ -98,8 +98,6 @@
 
         // 检查是否已登录（有效 token 则直接跳转面板）
         async function checkExistingSession() {
-            var token = Api.getToken ? Api.getToken() : localStorage.getItem('gcp_token');
-            if (!token) return;
             try {
                 var res = await Api.request('GET', '/api/auth/verify');
                 if (res && res.ok) {
@@ -132,7 +130,6 @@
                     return;
                 }
 
-                Api.setToken(res.token);
                 if (input) input.value = '';
                 hideError('login-error');
 
@@ -166,9 +163,9 @@
                 var res = await Api.changePassword(oldPw, newPw);
                 if (!res.ok) { showError('pw-change-error', res.msg || '修改失败'); return; }
 
-                Api.setToken(res.token);
                 hideError('pw-change-error');
-                window.location.href = '/panel';
+                if (Api.clearToken) Api.clearToken();
+                window.location.href = '/';
             } catch(e) {
                 showError('pw-change-error', '网络错误，请重试');
             } finally {

@@ -1166,6 +1166,7 @@ class AttentionManager:
         attention_duration: int,
         enabled: bool,
         poke_boost_reference: float = 0.0,
+        pending_probability_floor: Optional[float] = None,
     ) -> float:
         """
 
@@ -1218,6 +1219,7 @@ class AttentionManager:
             enabled: 是否启用注意力机制
 
             poke_boost_reference: 戳一戳概率增值参考值（0表示无戳一戳）
+            pending_probability_floor: 候选冷却期间的最低概率保护值
 
 
 
@@ -1288,6 +1290,22 @@ class AttentionManager:
         # 如果用户在冷却列表中，跳过注意力增加，直接返回原始概率
         try:
             if CooldownManager._initialized:
+                if await CooldownManager.is_in_pending_cooldown(
+                    chat_key, current_user_id
+                ):
+                    protected_probability = max(
+                        current_probability,
+                        pending_probability_floor
+                        if pending_probability_floor is not None
+                        else CooldownManager.PENDING_COOLDOWN_SAME_USER_PROBABILITY_FLOOR,
+                    )
+                    protected_probability = max(0.0, min(1.0, protected_probability))
+                    logger.info(
+                        f"[注意力-候选冷却] 用户 {current_user_name}(ID:{current_user_id}) "
+                        f"处于候选冷却中，应用最低概率保护: {current_probability:.2f} -> {protected_probability:.2f}"
+                    )
+                    return protected_probability
+
                 is_in_cooldown = await CooldownManager.is_in_cooldown(
                     chat_key, current_user_id
                 )
@@ -1957,12 +1975,16 @@ class AttentionManager:
 
         # Check if user is in cooldown list
 
-        is_in_cooldown = await CooldownManager.is_in_cooldown(chat_key, user_id)
+        under_control, control_type = await CooldownManager.is_user_under_cooldown_control(
+            chat_key, user_id
+        )
 
-        if is_in_cooldown and DEBUG_MODE:
-            logger.info(f"[注意力-冷却] 用户 {user_id} 在等待列表中，跳过注意力提升")
+        if under_control and DEBUG_MODE:
+            logger.info(
+                f"[注意力-冷却] 用户 {user_id} 处于{control_type}状态，跳过注意力提升"
+            )
 
-        return is_in_cooldown
+        return under_control
 
     @staticmethod
     async def decrease_attention_on_no_reply(
