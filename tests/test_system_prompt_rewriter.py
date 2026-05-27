@@ -65,13 +65,14 @@ class SystemPromptRewriterTest(unittest.TestCase):
         self.assertTrue(result.merged_system_prompt.startswith("persona body"))
         self.assertIn("unknown platform prompt", result.merged_system_prompt)
 
-    def test_main_uses_system_prompt_rewriter_without_tool_merge(self):
+    def test_main_uses_system_prompt_rewriter_with_tool_merge(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
         self.assertIn("SystemPromptRewriter", main_source)
         self.assertIn("rewrite_preserving_plugin_base", main_source)
-        self.assertIn("req.func_tool = plugin_tool_set", main_source)
-        self.assertNotIn("merge_tool", main_source)
+        self.assertIn("plugin_tools = _get_compatible_tools(plugin_tool_set)", main_source)
+        self.assertIn("req.func_tool.merge(plugin_tool_set)", main_source)
+        self.assertIn("TOOL_CALL_PROMPT", main_source)
 
 
 if __name__ == "__main__":

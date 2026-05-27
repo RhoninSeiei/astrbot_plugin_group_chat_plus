@@ -593,6 +593,8 @@
 | `enable_tools_reminder` | bool | `false` | 在回复提示词中告知AI当前可用的工具（如搜索、画图等） |
 | `tools_reminder_persona_filter` | bool | `false` | 根据当前AI人格过滤工具列表 |
 
+工具执行边界：读空气判断 AI 与主模型最终判断均使用无工具调用方式，避免判断阶段产生外部副作用；正式回复生成交由 AstrBot 原生 LLM 请求流程处理，当前会话可见的搜索、MCP、知识库、沙箱和其他 `@llm_tool` 工具会随 `req.func_tool` 进入工具循环。
+
 ---
 
 ## 内容过滤

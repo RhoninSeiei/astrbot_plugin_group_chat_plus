@@ -15,7 +15,6 @@ import re
 
 from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent
-from astrbot.core.star.star_handler import EventType
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
 from .ai_error_formatter import format_ai_error
 from .session_preferences import resolve_session_persona
@@ -391,11 +390,22 @@ class ReplyHandler:
             func_tools_mgr = context.get_llm_tool_manager()
             plugin_tool_set = None
             try:
-                plugin_tool_set = func_tools_mgr.get_full_tool_set()
-                # 过滤未激活的工具（与平台 _ensure_persona_and_skills 行为一致）
-                for tool in list(plugin_tool_set.tools):
-                    if hasattr(tool, "active") and not tool.active:
-                        plugin_tool_set.remove_tool(tool.name)
+                if hasattr(func_tools_mgr, "get_full_tool_set"):
+                    plugin_tool_set = func_tools_mgr.get_full_tool_set()
+                else:
+                    plugin_tool_set = func_tools_mgr
+
+                plugin_tools = getattr(plugin_tool_set, "tools", None)
+                if plugin_tools is None:
+                    plugin_tools = getattr(plugin_tool_set, "func_list", None)
+
+                if plugin_tools is not None:
+                    for tool in list(plugin_tools):
+                        if hasattr(tool, "active") and not tool.active:
+                            if hasattr(plugin_tool_set, "remove_tool"):
+                                plugin_tool_set.remove_tool(tool.name)
+                            elif hasattr(plugin_tool_set, "remove_func"):
+                                plugin_tool_set.remove_func(tool.name)
             except Exception:
                 pass
 
@@ -465,178 +475,47 @@ class ReplyHandler:
                         for i, url in enumerate(image_urls):
                             logger.info(f"  图片 {i}: {url}")
 
-            # 保存插件上下文后手动触发 on_llm_request 钩子，再直连 Provider。
-            # 这样可以保留其他插件的提示词注入，同时绕开框架的 ToolLoopAgentRunner。
+            # 保存插件上下文，交给 AstrBot 正常 LLM 请求流程处理。
+            # 这样可以保留其他插件的提示词注入，并允许平台工具循环执行搜索、MCP 等工具。
             event.set_extra(PLUGIN_REQUEST_MARKER, True)
             event.set_extra(PLUGIN_CUSTOM_CONTEXTS, contexts)
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, system_prompt)
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
             event.set_extra(PLUGIN_IMAGE_URLS, image_urls)
             event.set_extra(PLUGIN_FUNC_TOOL, plugin_tool_set)
+            event.set_extra(
+                PLUGIN_FALLBACK_PAYLOAD,
+                {
+                    "prompt": full_prompt,
+                    "image_urls": image_urls,
+                    "system_prompt": system_prompt,
+                },
+            )
 
             current_message_for_retrieval = event.get_message_str() or ""
             prompt_for_request = current_message_for_retrieval or "[空消息]"
             event.set_extra(PLUGIN_CURRENT_MESSAGE, current_message_for_retrieval)
-            event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
-
-            req = ProviderRequest(
-                prompt=prompt_for_request,
-                session_id=event.session_id,
-                image_urls=image_urls,
-                func_tool=plugin_tool_set,
-                contexts=contexts,
-                system_prompt=system_prompt,
-            )
-
-            try:
-                from astrbot.core.pipeline.context_utils import call_event_hook
-
-                await call_event_hook(event, EventType.OnLLMRequestEvent, req)
-            except ImportError as e:
-                if DEBUG_MODE:
-                    logger.warning(f"无法导入 LLM 请求钩子模块: {e}，继续使用原始请求")
-            except Exception as e:
-                logger.warning(f"触发 on_llm_request 钩子失败: {e}，继续使用原始请求")
-
-            if not req.prompt and not req.contexts:
-                req.prompt = full_prompt
-
-            llm_resp, primary_provider_id, provider_id, fallback_count = await ReplyHandler._request_with_astrbot_fallback(
-                event,
-                context,
-                req,
-            )
-
-            if llm_resp is None:
-                raise RuntimeError("未找到可用的AI提供商")
+            event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
 
             if DEBUG_MODE:
-                logger.info("🔧 [直连模式] 已手动触发 on_llm_request，将直连 AstrBot 默认 Provider 生成回复")
-                logger.info(f"  - primary_provider: {primary_provider_id or 'default'}")
-                logger.info(f"  - final_provider: {provider_id or primary_provider_id or 'default'}")
-                logger.info(f"  - fallback_count: {fallback_count}")
-                logger.info(f"  - req.contexts 数量: {len(req.contexts or [])}")
-                logger.info(f"  - req.system_prompt 长度: {len(req.system_prompt or '')}")
-                logger.info(f"  - req.prompt 长度: {len(req.prompt or '')}")
-                logger.info(f"  - req.image_urls 数量: {len(req.image_urls or [])}")
+                logger.info("🔧 [平台工具模式] 已设置插件标记，将通过 event.request_llm() 调用 AI")
+                logger.info(f"  - contexts 数量: {len(contexts)}")
+                logger.info(f"  - system_prompt 长度: {len(system_prompt or '')}")
+                logger.info(f"  - full_prompt 长度: {len(full_prompt or '')}")
+                logger.info(f"  - image_urls 数量: {len(image_urls or [])}")
                 logger.info(
                     f"  - 向量检索用短消息长度: {len(current_message_for_retrieval)}"
                 )
 
-            result_chain = getattr(llm_resp, "result_chain", None)
-            if result_chain and getattr(result_chain, "chain", None):
-                plain_text = ""
-                try:
-                    plain_text = (result_chain.get_plain_text() or "").strip()
-                except Exception:
-                    plain_text = ""
-                has_non_text_component = any(
-                    getattr(comp.__class__, "__name__", "") != "Plain"
-                    for comp in result_chain.chain
-                )
-                if (
-                    enable_final_decision_gate
-                    and plain_text
-                    and not has_non_text_component
-                    and ReplyHandler._is_final_gate_decline(plain_text)
-                ):
-                    logger.info("[主模型最终判断] 当前消息无需回复，跳过发送")
-                    event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
-                    return None
-                if plain_text or has_non_text_component:
-                    if enable_final_decision_gate:
-                        logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
-                    event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
-                    if plain_text and not has_non_text_component:
-                        if ReplyHandler._contains_final_gate_sentinel(plain_text):
-                            sanitized_text = ReplyHandler._strip_final_gate_sentinel(
-                                plain_text
-                            )
-                            if (
-                                not sanitized_text
-                                or ReplyHandler._looks_like_final_gate_meta(
-                                    sanitized_text
-                                )
-                            ):
-                                logger.warning(
-                                    "[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送"
-                                )
-                                event.set_extra(
-                                    PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True
-                                )
-                                return None
-                            logger.warning(
-                                "[主模型最终判断] 检测到 NO_REPLY 残留，发送前已清理"
-                            )
-                            plain_text = sanitized_text
-                        brief_text = ReplyHandler._apply_group_chat_brevity_limit(
-                            event, plain_text
-                        )
-                        if brief_text != plain_text:
-                            logger.info(
-                                f"[群聊短回复限制] 已裁剪回复长度: {len(plain_text)} -> {len(brief_text)} 字符"
-                            )
-                            if DEBUG_MODE:
-                                logger.info(f"  原回复: {plain_text[:120]}")
-                                logger.info(f"  裁剪后: {brief_text[:120]}")
-                        reply_result = event.plain_result(brief_text)
-                    else:
-                        reply_result = event.chain_result(result_chain.chain)
-                    reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
-                    return reply_result
-
-            completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
-            if completion_text:
-                if enable_final_decision_gate and ReplyHandler._is_final_gate_decline(
-                    completion_text
-                ):
-                    logger.info("[主模型最终判断] 当前消息无需回复，跳过发送")
-                    event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
-                    return None
-                if enable_final_decision_gate:
-                    logger.info("[主模型最终判断] 当前消息值得回复，继续发送")
-                    if ReplyHandler._contains_final_gate_sentinel(completion_text):
-                        sanitized_text = ReplyHandler._strip_final_gate_sentinel(
-                            completion_text
-                        )
-                        if (
-                            not sanitized_text
-                            or ReplyHandler._looks_like_final_gate_meta(sanitized_text)
-                        ):
-                            logger.warning(
-                                "[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送"
-                            )
-                            event.set_extra(
-                                PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True
-                            )
-                            return None
-                        logger.warning(
-                            "[主模型最终判断] 检测到 NO_REPLY 残留，发送前已清理"
-                        )
-                        completion_text = sanitized_text
-                brief_text = ReplyHandler._apply_group_chat_brevity_limit(
-                    event, completion_text
-                )
-                if brief_text != completion_text:
-                    logger.info(
-                        f"[群聊短回复限制] 已裁剪回复长度: {len(completion_text)} -> {len(brief_text)} 字符"
-                    )
-                    if DEBUG_MODE:
-                        logger.info(f"  原回复: {completion_text[:120]}")
-                        logger.info(f"  裁剪后: {brief_text[:120]}")
-                event.set_extra(PLUGIN_DIRECT_REPLY_MODE, True)
-                reply_result = event.plain_result(brief_text)
-                reply_result.set_result_content_type(ResultContentType.LLM_RESULT)
-                return reply_result
-
-            logger.error(
-                format_ai_error(
-                    RuntimeError("upstream_empty_output: provider returned empty reply"),
-                    f"回复生成 Provider {provider_id or 'default'}",
-                )
-                + f"，prompt长度={len(req.prompt or '')}"
+            return event.request_llm(
+                prompt=prompt_for_request,
+                func_tool_manager=func_tools_mgr,
+                tool_set=plugin_tool_set,
+                session_id=event.session_id,
+                image_urls=image_urls,
+                contexts=contexts,
+                system_prompt=system_prompt,
             )
-            return event.make_result()
 
         except Exception as e:
             logger.error(format_ai_error(e, "回复生成"))

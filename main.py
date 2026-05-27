@@ -8362,14 +8362,37 @@ class ChatPlus(Star):
         req.prompt = plugin_prompt
         req.image_urls = plugin_image_urls
 
-        # 🔧 修复：用插件自身保存的工具集替换框架注入的工具
-        # 新版 AstrBot (>=4.14) 的 build_main_agent 会自动注入 shell/python/cron/send_message 等工具，
-        # 这些工具会导致 LLM 进入工具调用循环从而卡死。
-        # 旧版 AstrBot (<=4.13) 中 func_tool_manager 参数直接生效，不存在此问题。
-        # 这里统一恢复为插件保存的 ToolSet（由 reply_handler 中 get_full_tool_set() 获取），
-        # 确保两个版本行为一致：只保留插件注册的工具，移除框架自动注入的工具。
+        def _get_compatible_tools(tool_container):
+            if not tool_container:
+                return []
+            tools = getattr(tool_container, "tools", None)
+            if tools is not None:
+                return list(tools)
+            func_list = getattr(tool_container, "func_list", None)
+            if func_list is not None:
+                return list(func_list)
+            return []
+
+        # 正式回复阶段保留平台 build_main_agent 注入的工具，并合并插件注册工具。
+        # 读空气判断与最终判断仍走无工具的 Provider 直连，避免判断阶段产生外部副作用。
         plugin_tool_set = event.get_extra(PLUGIN_FUNC_TOOL)
-        req.func_tool = plugin_tool_set  # 可能是 ToolSet 或 None（获取失败时）
+        if plugin_tool_set is not None:
+            plugin_tools = _get_compatible_tools(plugin_tool_set)
+            if req.func_tool is None:
+                req.func_tool = plugin_tool_set
+            elif hasattr(req.func_tool, "merge") and hasattr(plugin_tool_set, "tools"):
+                req.func_tool.merge(plugin_tool_set)
+            elif hasattr(req.func_tool, "add_tool"):
+                for tool in plugin_tools:
+                    req.func_tool.add_tool(tool)
+            elif hasattr(req.func_tool, "remove_func") and hasattr(
+                req.func_tool, "func_list"
+            ):
+                for tool in plugin_tools:
+                    req.func_tool.remove_func(tool.name)
+                    req.func_tool.func_list.append(tool)
+            else:
+                req.func_tool = plugin_tool_set
 
         req.system_prompt = rewrite_result.merged_system_prompt
 
@@ -8392,6 +8415,16 @@ class ChatPlus(Star):
                     logger.info(f"  ✅ 已注入 Skills 提示词，技能数量: {len(skills)}")
         except Exception as e:
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
+
+        current_tools = _get_compatible_tools(req.func_tool)
+        if current_tools:
+            try:
+                from astrbot.core.astr_main_agent_resources import TOOL_CALL_PROMPT
+
+                if TOOL_CALL_PROMPT not in req.system_prompt:
+                    req.system_prompt += f"\n{TOOL_CALL_PROMPT}\n"
+            except ImportError:
+                pass
 
         if self.debug_mode:
             logger.info(f"  ✅ 已恢复插件自定义上下文:")
@@ -8524,6 +8557,47 @@ class ChatPlus(Star):
                     ).strip()
                 if not reply_text:
                     return
+
+            def _replace_result_text(new_text: str) -> None:
+                first_text_comp = True
+                for comp in result.chain:
+                    if hasattr(comp, "text"):
+                        if first_text_comp:
+                            comp.text = new_text
+                            first_text_comp = False
+                        else:
+                            comp.text = ""
+
+            if ReplyHandler._is_final_gate_decline(reply_text):
+                logger.warning("[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送")
+                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                event.clear_result()
+                return
+
+            if ReplyHandler._contains_final_gate_sentinel(reply_text):
+                sanitized_text = ReplyHandler._strip_final_gate_sentinel(reply_text)
+                if (
+                    not sanitized_text
+                    or ReplyHandler._looks_like_final_gate_meta(sanitized_text)
+                ):
+                    logger.warning("[主模型最终判断] 检测到判断标记污染输出，已跳过发送")
+                    event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                    event.clear_result()
+                    return
+                logger.warning("[主模型最终判断] 检测到判断标记残留，发送前已清理")
+                _replace_result_text(sanitized_text)
+                reply_text = sanitized_text
+
+            brief_text = ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
+            if brief_text != reply_text:
+                logger.info(
+                    f"[群聊短回复限制] 已裁剪回复长度: {len(reply_text)} -> {len(brief_text)} 字符"
+                )
+                if self.debug_mode:
+                    logger.info(f"  原回复: {reply_text[:120]}")
+                    logger.info(f"  裁剪后: {brief_text[:120]}")
+                _replace_result_text(brief_text)
+                reply_text = brief_text
 
             self.raw_reply_cache[message_id] = reply_text
 
