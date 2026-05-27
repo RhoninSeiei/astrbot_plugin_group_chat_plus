@@ -95,7 +95,9 @@ class StepImageService:
     def resolve_settings(self) -> StepImageSettings:
         model = str(self.config.get("step_image_model") or DEFAULT_MODEL).strip()
         provider = self._resolve_provider(model)
-        provider_config = getattr(provider, "provider_config", {}) or {}
+        provider_config = self._merge_provider_source_config(
+            getattr(provider, "provider_config", {}) or {}
+        )
 
         provider_id = str(provider_config.get("id") or "").strip()
         api_key = self._extract_api_key(provider, provider_config)
@@ -199,11 +201,27 @@ class StepImageService:
 
         if hasattr(self.context, "get_all_providers"):
             for provider in self.context.get_all_providers():
-                provider_config = getattr(provider, "provider_config", {}) or {}
+                provider_config = self._merge_provider_source_config(
+                    getattr(provider, "provider_config", {}) or {}
+                )
                 if str(provider_config.get("model") or "").strip() == model:
                     return provider
 
         raise StepImageConfigError("未找到 step-image-edit-2 provider")
+
+    def _merge_provider_source_config(self, provider_config: dict) -> dict:
+        provider_source_id = str(provider_config.get("provider_source_id") or "").strip()
+        if not provider_source_id:
+            return provider_config
+
+        provider_manager = getattr(self.context, "provider_manager", None)
+        provider_sources = getattr(provider_manager, "provider_sources_config", []) or []
+        for source_config in provider_sources:
+            if source_config.get("id") == provider_source_id:
+                merged_config = {**source_config, **provider_config}
+                merged_config["id"] = provider_config.get("id", merged_config.get("id"))
+                return merged_config
+        return provider_config
 
     @staticmethod
     def _extract_api_key(provider: Any, provider_config: dict) -> str:

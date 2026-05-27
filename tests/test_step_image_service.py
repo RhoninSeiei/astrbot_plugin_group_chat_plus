@@ -40,6 +40,41 @@ class _Context:
         return [self.provider]
 
 
+class _SplitProvider:
+    def __init__(self):
+        self.provider_config = {
+            "id": "stepfun/split-step-image",
+            "model": "step-image-edit-2",
+            "provider_source_id": "stepfun-source",
+        }
+
+
+class _SplitContext:
+    def __init__(self):
+        self.provider = _SplitProvider()
+        self.provider_manager = type(
+            "ProviderManager",
+            (),
+            {
+                "provider_sources_config": [
+                    {
+                        "id": "stepfun-source",
+                        "api_base": "https://api.stepfun.com/step_plan/v1",
+                        "key": ["sk-source-secret"],
+                        "timeout": 45,
+                        "proxy": "",
+                    }
+                ]
+            },
+        )()
+
+    def get_provider_by_id(self, provider_id):
+        return self.provider if provider_id == "stepfun/split-step-image" else None
+
+    def get_all_providers(self):
+        return [self.provider]
+
+
 class _Response:
     def __init__(self, payload=None, error=None):
         self._payload = payload or {
@@ -146,6 +181,21 @@ class StepImageServiceTest(unittest.TestCase):
         settings = service.resolve_settings()
         self.assertEqual(settings.provider_id, "stepfun/step-image-edit-2")
         self.assertEqual(settings.api_base, "https://api.stepfun.com/v1")
+
+    def test_resolves_provider_source_split_config(self):
+        module = _load_service_module()
+
+        service = module.StepImageService(
+            context=_SplitContext(),
+            config={"step_image_provider_id": "stepfun/split-step-image"},
+            output_dir=Path(tempfile.gettempdir()),
+            client_factory=lambda **_: _Client([], _Response()),
+        )
+
+        settings = service.resolve_settings()
+        self.assertEqual(settings.provider_id, "stepfun/split-step-image")
+        self.assertEqual(settings.api_base, "https://api.stepfun.com/step_plan/v1")
+        self.assertEqual(settings.timeout, 45)
 
     def test_rejects_oversized_prompt_and_invalid_size(self):
         module = _load_service_module()
