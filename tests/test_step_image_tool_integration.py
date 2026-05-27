@@ -21,10 +21,22 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "StepImageService.is_enabled(self.step_image_config)", self.main_source
         )
         self.assertIn("if not self._is_enabled(event):", self.main_source)
+        self.assertIn("await self._send_step_image_progress", self.main_source)
+        self.assertIn("yield self._build_step_image_direct_result", self.main_source)
+
+    def test_tool_direct_image_result_is_cleared_after_send(self):
+        self.assertIn("PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT", self.main_source)
         self.assertIn(
-            "MessageEventResult().file_image(result.path).stop_event()",
+            "self._clear_sent_step_image_direct_result(event, result)",
             self.main_source,
         )
+        self.assertIn("event.clear_result()", self.main_source)
+
+    def test_intermediate_step_image_text_becomes_progress_message(self):
+        self.assertIn("_maybe_replace_step_image_intermediate_text", self.main_source)
+        self.assertIn("self._infer_step_image_action(event)", self.main_source)
+        self.assertIn("阶跃星辰 Step Image Edit 2", self.main_source)
+        self.assertIn("PLUGIN_STEP_IMAGE_PROGRESS_SENT", self.main_source)
 
     def test_tool_uses_current_message_image_for_editing(self):
         self.assertIn("async def _extract_first_current_image_path", self.main_source)
@@ -49,6 +61,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
         self.assertIn("1080p", self.main_source)
         self.assertIn("16:9", self.main_source)
+        self.assertIn("工具会发送进度提示和图片结果", self.main_source)
 
 
 if __name__ == "__main__":

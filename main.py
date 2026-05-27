@@ -169,6 +169,9 @@ from .utils.reply_handler import (
 PLUGIN_PENDING_MAIN_MODEL_DECISION = (
     "_group_chat_plus_pending_main_model_decision"
 )
+PLUGIN_STEP_IMAGE_PROGRESS_SENT = "_group_chat_plus_step_image_progress_sent"
+PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT = "_group_chat_plus_step_image_direct_result_sent"
+PLUGIN_STEP_IMAGE_ACTION = "_group_chat_plus_step_image_action"
 
 
 @register(
@@ -8372,6 +8375,174 @@ class ChatPlus(Star):
             output_dir=self.step_image_output_dir,
         )
 
+    def _has_current_image_component(self, event: AstrMessageEvent) -> bool:
+        try:
+            message_chain = getattr(getattr(event, "message_obj", None), "message", [])
+            return any(isinstance(component, Image) for component in message_chain)
+        except Exception:
+            return False
+
+    def _infer_step_image_action(self, event: AstrMessageEvent) -> Optional[str]:
+        text = (event.get_message_str() or "").strip().lower()
+        has_image = self._has_current_image_component(event)
+
+        edit_keywords = (
+            "修图",
+            "改图",
+            "编辑图片",
+            "图片编辑",
+            "重绘",
+            "扩图",
+            "抠图",
+            "去掉",
+            "去除",
+            "换成",
+            "改成",
+            "变成",
+            "加上",
+            "添加",
+            "edit image",
+            "image edit",
+        )
+        if has_image and any(keyword in text for keyword in edit_keywords):
+            return "edit"
+
+        generate_keywords = (
+            "画一",
+            "画个",
+            "画张",
+            "画幅",
+            "画一下",
+            "绘制",
+            "生成图片",
+            "生成一张",
+            "生图",
+            "出图",
+            "做一张",
+            "做张图",
+            "来一张",
+            "来张",
+            "画图",
+            "draw",
+            "generate image",
+            "text to image",
+        )
+        if any(keyword in text for keyword in generate_keywords):
+            return "generate"
+
+        return None
+
+    def _build_step_image_progress_text(self, action: Optional[str] = None) -> str:
+        if action == "edit":
+            return "正在用阶跃星辰 Step Image Edit 2 编辑这张图，稍等一下。"
+        return "正在用阶跃星辰 Step Image Edit 2 生成图片，稍等一下。"
+
+    def _mark_step_image_progress_sent(
+        self,
+        event: AstrMessageEvent,
+        action: Optional[str],
+        progress_text: str,
+    ) -> None:
+        event.set_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, True)
+        event.set_extra(PLUGIN_STEP_IMAGE_ACTION, action or "")
+        event.set_extra("_group_chat_plus_step_image_progress_text", progress_text)
+
+    def _append_step_image_pending_progress(
+        self,
+        event: AstrMessageEvent,
+        progress_text: str,
+    ) -> None:
+        message_id = self._get_message_id(event)
+        if message_id not in self.processing_sessions:
+            return
+
+        pending_replies = self._pending_bot_replies.setdefault(message_id, [])
+        if not pending_replies or pending_replies[-1] != progress_text:
+            pending_replies.append(progress_text)
+        self.raw_reply_cache[message_id] = progress_text
+
+    async def _send_step_image_progress(
+        self,
+        event: AstrMessageEvent,
+        action: Optional[str],
+    ) -> None:
+        progress_text = self._build_step_image_progress_text(action)
+        self._mark_step_image_progress_sent(event, action, progress_text)
+        self._append_step_image_pending_progress(event, progress_text)
+        try:
+            await event.send(MessageChain().message(progress_text))
+        except Exception as exc:
+            logger.warning(f"[StepImage] 发送进度提示失败: {exc}", exc_info=True)
+
+    def _build_step_image_direct_result(
+        self,
+        event: AstrMessageEvent,
+        image_path,
+    ) -> MessageEventResult:
+        event.set_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, True)
+        return MessageEventResult().file_image(image_path).stop_event()
+
+    def _clear_sent_step_image_direct_result(
+        self,
+        event: AstrMessageEvent,
+        result: MessageEventResult,
+    ) -> bool:
+        if not event.get_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, False):
+            return False
+
+        try:
+            if result.is_llm_result():
+                return False
+        except Exception:
+            pass
+
+        has_image_result = any(
+            isinstance(component, Image)
+            or "image" in component.__class__.__name__.lower()
+            for component in getattr(result, "chain", []) or []
+        )
+        if not has_image_result:
+            return False
+
+        event.clear_result()
+        event.set_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, None)
+        logger.info("[StepImage] 图片已由工具发送，清理响应阶段遗留图片结果")
+        return True
+
+    def _maybe_replace_step_image_intermediate_text(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        reply_text: str,
+    ) -> Optional[str]:
+        if message_id in self._agent_done_flags:
+            return None
+        if event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
+            return None
+
+        action = self._infer_step_image_action(event)
+        if not action:
+            return None
+
+        progress_text = self._build_step_image_progress_text(action)
+        self._mark_step_image_progress_sent(event, action, progress_text)
+        logger.info(
+            "[StepImage] 工具调用前文本已改为进度提示，原文本长度=%s",
+            len(reply_text or ""),
+        )
+        return progress_text
+
+    def _build_step_image_tool_directive(self, tool_names: set[str]) -> str:
+        if not {"gcp_step_image_generate", "gcp_step_image_edit"} & tool_names:
+            return ""
+
+        return (
+            "\nStep Image 工具调用规则：如果决定调用 gcp_step_image_generate "
+            "或 gcp_step_image_edit，只提交工具参数，不要在同一轮回复里输出普通聊天正文。"
+            "工具会发送进度提示和图片结果。遇到图片编辑请求时，不要声称无法看图，"
+            "应优先调用 gcp_step_image_edit。\n"
+        )
+
     async def _extract_first_current_image_path(
         self, event: AstrMessageEvent
     ) -> Optional[str]:
@@ -8409,9 +8580,12 @@ class ChatPlus(Star):
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
-            return guard_message
+            yield guard_message
+            return
 
         try:
+            if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
+                await self._send_step_image_progress(event, "generate")
             self._cleanup_step_image_outputs()
             image_size = (
                 size or self.step_image_default_size or DEFAULT_GENERATION_SIZE
@@ -8420,18 +8594,18 @@ class ChatPlus(Star):
                 prompt=prompt,
                 size=image_size,
             )
-            return MessageEventResult().file_image(result.path).stop_event()
+            yield self._build_step_image_direct_result(event, result.path)
         except StepImageUserError as exc:
-            return str(exc)
+            yield str(exc)
         except StepImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
-            return "图片生成工具配置未就绪。"
+            yield "图片生成工具配置未就绪。"
         except StepImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
-            return "图片生成失败，稍后再试。"
+            yield "图片生成失败，稍后再试。"
         except Exception as exc:
             logger.error(f"[StepImage] 图片生成失败: {exc}", exc_info=True)
-            return "图片生成失败，稍后再试。"
+            yield "图片生成失败，稍后再试。"
 
     @filter.llm_tool(name="gcp_step_image_edit")
     async def gcp_step_image_edit(
@@ -8450,30 +8624,34 @@ class ChatPlus(Star):
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
-            return guard_message
+            yield guard_message
+            return
 
         image_path = await self._extract_first_current_image_path(event)
         if not image_path:
-            return "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+            yield "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+            return
 
         try:
+            if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
+                await self._send_step_image_progress(event, "edit")
             self._cleanup_step_image_outputs()
             result = await self._get_step_image_service().edit(
                 prompt=prompt,
                 image_path=image_path,
             )
-            return MessageEventResult().file_image(result.path).stop_event()
+            yield self._build_step_image_direct_result(event, result.path)
         except StepImageUserError as exc:
-            return str(exc)
+            yield str(exc)
         except StepImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
-            return "图片编辑工具配置未就绪。"
+            yield "图片编辑工具配置未就绪。"
         except StepImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
-            return "图片编辑失败，稍后再试。"
+            yield "图片编辑失败，稍后再试。"
         except Exception as exc:
             logger.error(f"[StepImage] 图片编辑失败: {exc}", exc_info=True)
-            return "图片编辑失败，稍后再试。"
+            yield "图片编辑失败，稍后再试。"
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -8608,6 +8786,11 @@ class ChatPlus(Star):
             except ImportError:
                 pass
 
+            tool_names = {getattr(tool, "name", "") for tool in current_tools}
+            step_image_directive = self._build_step_image_tool_directive(tool_names)
+            if step_image_directive and step_image_directive not in req.system_prompt:
+                req.system_prompt += step_image_directive
+
         if self.debug_mode:
             logger.info(f"  ✅ 已恢复插件自定义上下文:")
             logger.info(f"    - contexts 数量: {len(req.contexts)}")
@@ -8707,11 +8890,14 @@ class ChatPlus(Star):
             # 🔧 修复：使用message_id作为键进行检查
             message_id = self._get_message_id(event)
 
+            result = event.get_result()
+            if result and self._clear_sent_step_image_direct_result(event, result):
+                return
+
             # 仅处理由本插件触发的消息
             if message_id not in self.processing_sessions:
                 return
 
-            result = event.get_result()
             if not result:
                 return
 
@@ -8769,6 +8955,15 @@ class ChatPlus(Star):
                 logger.warning("[主模型最终判断] 检测到判断标记残留，发送前已清理")
                 _replace_result_text(sanitized_text)
                 reply_text = sanitized_text
+
+            step_image_progress_text = self._maybe_replace_step_image_intermediate_text(
+                event,
+                message_id,
+                reply_text,
+            )
+            if step_image_progress_text:
+                _replace_result_text(step_image_progress_text)
+                reply_text = step_image_progress_text
 
             brief_text = ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
             if brief_text != reply_text:
