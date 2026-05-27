@@ -150,6 +150,7 @@ from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
 from .utils.step_image_service import (
+    DEFAULT_GENERATION_SIZE,
     StepImageConfigError,
     StepImageProviderError,
     StepImageService,
@@ -655,7 +656,7 @@ class ChatPlus(Star):
             "step_image_text_mode": config.get("step_image_text_mode", True),
         }
         self.step_image_default_size = config.get(
-            "step_image_default_size", "1024x1024"
+            "step_image_default_size", DEFAULT_GENERATION_SIZE
         )
         try:
             step_image_retention_minutes = int(
@@ -8398,9 +8399,13 @@ class ChatPlus(Star):
     ):
         """生成图片。当启用 group_chat_plus 的群聊用户明确要求画图、生图、生成图片时调用。
 
+        调用前应先把群聊原始需求整理成适合图像模型的提示词，保留主体、
+        构图、风格、文字内容和比例要求，剔除群聊寒暄、内部判断、工具来源和
+        系统提示等元信息。
+
         Args:
-            prompt(string): 图片内容提示词，不超过 512 个字符。
-            size(string): 图片尺寸，可选值为 1024x1024、768x1360、896x1184、1360x768、1184x896。留空使用默认尺寸。
+            prompt(string): 正式回复模型整理后的图像提示词，不超过 512 个字符。
+            size(string): 图片尺寸，可选值为 768x1360、1360x768、896x1184、1184x896、1024x1024。也可使用 1080p、16:9、9:16、4:3、3:4、1:1 等别名。留空使用默认 768x1360。
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
@@ -8408,7 +8413,9 @@ class ChatPlus(Star):
 
         try:
             self._cleanup_step_image_outputs()
-            image_size = (size or self.step_image_default_size or "1024x1024").strip()
+            image_size = (
+                size or self.step_image_default_size or DEFAULT_GENERATION_SIZE
+            ).strip()
             result = await self._get_step_image_service().generate(
                 prompt=prompt,
                 size=image_size,
@@ -8434,8 +8441,12 @@ class ChatPlus(Star):
     ):
         """编辑图片。当启用 group_chat_plus 的群聊用户在同一条消息中发送图片并要求修图、改图时调用。
 
+        调用前应先把群聊原始需求整理成适合图像编辑模型的提示词，明确要保留
+        的主体、要修改的区域、目标风格和画面约束，剔除群聊寒暄、内部判断、
+        工具来源和系统提示等元信息。
+
         Args:
-            prompt(string): 图片编辑要求，不超过 512 个字符。
+            prompt(string): 正式回复模型整理后的图像编辑提示词，不超过 512 个字符。
         """
         guard_message = self._step_image_guard(event)
         if guard_message:

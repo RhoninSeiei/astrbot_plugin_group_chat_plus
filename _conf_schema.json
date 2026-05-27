@@ -470,9 +470,9 @@
     "step_image_default_size": {
         "description": "🖼️ 文生图默认尺寸",
         "type": "string",
-        "options": ["1024x1024", "768x1360", "896x1184", "1360x768", "1184x896"],
-        "hint": "用户未指定尺寸时使用的文生图尺寸。格式遵循 StepFun 文档。",
-        "default": "1024x1024"
+        "options": ["768x1360", "1360x768", "896x1184", "1184x896", "1024x1024"],
+        "hint": "用户未指定尺寸时使用的文生图尺寸。StepFun 文档格式为 height x width。默认 768x1360，接近常见 16:9 / 1080P 横屏。工具也会把 1080p、16:9、1920x1080、9:16、4:3、3:4、1:1 等别名归一到支持尺寸。",
+        "default": "768x1360"
     },
     "step_image_timeout": {
         "description": "🖼️ StepFun 图片调用超时时间(秒)",

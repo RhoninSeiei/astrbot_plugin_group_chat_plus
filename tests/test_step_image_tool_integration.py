@@ -43,6 +43,12 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         ):
             self.assertIn(key, self.schema_source)
         self.assertIn('"_special": "select_provider"', self.schema_source)
+        self.assertIn('"default": "768x1360"', self.schema_source)
+
+    def test_tool_description_requires_model_refined_prompt(self):
+        self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
+        self.assertIn("1080p", self.main_source)
+        self.assertIn("16:9", self.main_source)
 
 
 if __name__ == "__main__":

@@ -252,7 +252,7 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
   "step_image_provider_id": "",
   "step_image_model": "step-image-edit-2",
   "step_image_api_base": "",
-  "step_image_default_size": "1024x1024",
+  "step_image_default_size": "768x1360",
   "step_image_timeout": 60,
   "step_image_proxy": "",
   "step_image_cfg_scale": 1.0,

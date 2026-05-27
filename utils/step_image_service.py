@@ -16,13 +16,64 @@ import httpx
 
 DEFAULT_MODEL = "step-image-edit-2"
 DEFAULT_API_BASE = "https://api.stepfun.com/v1"
-VALID_GENERATION_SIZES = {
-    "1024x1024",
+DEFAULT_GENERATION_SIZE = "768x1360"
+GENERATION_SIZE_OPTIONS = (
     "768x1360",
-    "896x1184",
     "1360x768",
+    "896x1184",
     "1184x896",
+    "1024x1024",
+)
+VALID_GENERATION_SIZES = set(GENERATION_SIZE_OPTIONS)
+GENERATION_SIZE_ALIASES = {
+    "16:9": "768x1360",
+    "16比9": "768x1360",
+    "1080p": "768x1360",
+    "720p": "768x1360",
+    "2k": "768x1360",
+    "4k": "768x1360",
+    "横屏": "768x1360",
+    "横图": "768x1360",
+    "宽屏": "768x1360",
+    "landscape": "768x1360",
+    "wide": "768x1360",
+    "widescreen": "768x1360",
+    "1280x720": "768x1360",
+    "1366x768": "768x1360",
+    "1600x900": "768x1360",
+    "1920x1080": "768x1360",
+    "2560x1440": "768x1360",
+    "3840x2160": "768x1360",
+    "9:16": "1360x768",
+    "9比16": "1360x768",
+    "竖屏": "1360x768",
+    "竖图": "1360x768",
+    "portrait": "1360x768",
+    "720x1280": "1360x768",
+    "1080x1920": "1360x768",
+    "1440x2560": "1360x768",
+    "2160x3840": "1360x768",
+    "4:3": "896x1184",
+    "4比3": "896x1184",
+    "传统横屏": "896x1184",
+    "1024x768": "896x1184",
+    "1600x1200": "896x1184",
+    "3:4": "1184x896",
+    "3比4": "1184x896",
+    "传统竖屏": "1184x896",
+    "768x1024": "1184x896",
+    "1200x1600": "1184x896",
+    "1:1": "1024x1024",
+    "1比1": "1024x1024",
+    "方图": "1024x1024",
+    "方形": "1024x1024",
+    "square": "1024x1024",
+    "头像": "1024x1024",
 }
+GENERATION_SIZE_HINT = (
+    "16:9/1080p=768x1360, 9:16=1360x768, 4:3=896x1184, "
+    "3:4=1184x896, 1:1=1024x1024"
+)
 
 
 class StepImageUserError(Exception):
@@ -136,11 +187,17 @@ class StepImageService:
             text_mode=self._as_bool(self.config.get("step_image_text_mode"), True),
         )
 
-    async def generate(self, *, prompt: str, size: str = "1024x1024") -> StepImageResult:
+    async def generate(
+        self, *, prompt: str, size: str = DEFAULT_GENERATION_SIZE
+    ) -> StepImageResult:
         self._validate_prompt(prompt)
-        if size not in VALID_GENERATION_SIZES:
+        normalized_size = self.normalize_generation_size(size)
+        if normalized_size not in VALID_GENERATION_SIZES:
             raise StepImageUserError(
-                "图片尺寸仅支持: " + ", ".join(sorted(VALID_GENERATION_SIZES))
+                "图片尺寸仅支持: "
+                + ", ".join(GENERATION_SIZE_OPTIONS)
+                + "。可使用别名: "
+                + GENERATION_SIZE_HINT
             )
 
         settings = self.resolve_settings()
@@ -148,7 +205,7 @@ class StepImageService:
             "model": settings.model,
             "prompt": prompt.strip(),
             "response_format": "b64_json",
-            "size": size,
+            "size": normalized_size,
             "cfg_scale": settings.cfg_scale,
             "steps": settings.steps,
             "text_mode": settings.text_mode,
@@ -208,6 +265,25 @@ class StepImageService:
                     return provider
 
         raise StepImageConfigError("未找到 step-image-edit-2 provider")
+
+    @staticmethod
+    def normalize_generation_size(size: Any) -> str:
+        raw_size = str(size or "").strip()
+        if not raw_size:
+            return DEFAULT_GENERATION_SIZE
+
+        normalized = (
+            raw_size.lower()
+            .replace("×", "x")
+            .replace("＊", "x")
+            .replace("*", "x")
+            .replace("：", ":")
+        )
+        normalized = "".join(normalized.split())
+
+        if normalized in VALID_GENERATION_SIZES:
+            return normalized
+        return GENERATION_SIZE_ALIASES.get(normalized, raw_size)
 
     def _merge_provider_source_config(self, provider_config: dict) -> dict:
         provider_source_id = str(provider_config.get("provider_source_id") or "").strip()

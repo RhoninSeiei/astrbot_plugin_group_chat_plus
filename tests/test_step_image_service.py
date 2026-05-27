@@ -117,6 +117,35 @@ class StepImageServiceTest(unittest.TestCase):
             module.StepImageService.is_enabled({"enable_step_image_tools": "false"})
         )
 
+    def test_normalizes_common_display_size_aliases(self):
+        module = _load_service_module()
+
+        self.assertEqual(module.DEFAULT_GENERATION_SIZE, "768x1360")
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("1920x1080"),
+            "768x1360",
+        )
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("1080p"),
+            "768x1360",
+        )
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("16:9"),
+            "768x1360",
+        )
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("1080x1920"),
+            "1360x768",
+        )
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("4:3"),
+            "896x1184",
+        )
+        self.assertEqual(
+            module.StepImageService.normalize_generation_size("方图"),
+            "1024x1024",
+        )
+
     def test_generate_posts_json_and_writes_image(self):
         module = _load_service_module()
         calls = []
@@ -133,13 +162,14 @@ class StepImageServiceTest(unittest.TestCase):
             )
 
             result = asyncio.run(
-                service.generate(prompt="a small orange cat", size="1024x1024")
+                service.generate(prompt="a small orange cat", size="1920x1080")
             )
             image_bytes = Path(result.path).read_bytes()
 
         self.assertEqual(calls[0][0], "https://api.stepfun.com/v1/images/generations")
         self.assertEqual(calls[0][1]["json"]["model"], "step-image-edit-2")
         self.assertEqual(calls[0][1]["json"]["prompt"], "a small orange cat")
+        self.assertEqual(calls[0][1]["json"]["size"], "768x1360")
         self.assertEqual(calls[0][1]["json"]["response_format"], "b64_json")
         self.assertTrue(result.path.endswith(".png"))
         self.assertEqual(image_bytes, b"fake-png")

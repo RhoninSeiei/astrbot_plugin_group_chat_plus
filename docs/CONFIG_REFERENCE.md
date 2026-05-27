@@ -178,7 +178,7 @@
 | `step_image_provider_id` | string | `""` | StepFun 图片模型 Provider ID。留空时按 `step_image_model` 自动查找 |
 | `step_image_model` | string | `"step-image-edit-2"` | 文生图和修图使用的模型名 |
 | `step_image_api_base` | string | `""` | StepFun 图片 API Base。留空时复用 Provider 的 `api_base`，再回退到 `https://api.stepfun.com/v1` |
-| `step_image_default_size` | string | `"1024x1024"` | 文生图默认尺寸。支持 `1024x1024`、`768x1360`、`896x1184`、`1360x768`、`1184x896` |
+| `step_image_default_size` | string | `"768x1360"` | 文生图默认尺寸。接近 16:9 / 1080P 横屏。StepFun 尺寸格式为 `height x width`，支持 `768x1360`、`1360x768`、`896x1184`、`1184x896`、`1024x1024`，并可把 `1080p`、`16:9`、`1920x1080`、`9:16`、`4:3`、`3:4`、`1:1` 等别名归一到支持尺寸 |
 | `step_image_timeout` | int | `60` | StepFun 文生图和修图调用超时时间（秒） |
 | `step_image_proxy` | string | `""` | StepFun 图片调用代理。留空时复用 Provider 的代理配置 |
 | `step_image_cfg_scale` | float | `1.0` | 传给 `step-image-edit-2` 的 `cfg_scale` 参数 |
