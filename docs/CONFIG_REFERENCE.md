@@ -174,6 +174,18 @@
 | `image_to_text_prompt` | string | `"请详细描述这张图片的内容"` | 发送给图片AI的提示语 |
 | `image_to_text_timeout` | int | `60` | 图片处理API调用超时（秒） |
 | `max_images_per_message` | int | `10` | 单条消息最大处理图片数量（1-50） |
+| `enable_step_image_tools` | bool | `false` | 启用 StepFun 图片工具。仅在启用本插件的群聊正式回复阶段可用 |
+| `step_image_provider_id` | string | `""` | StepFun 图片模型 Provider ID。留空时按 `step_image_model` 自动查找 |
+| `step_image_model` | string | `"step-image-edit-2"` | 文生图和修图使用的模型名 |
+| `step_image_api_base` | string | `""` | StepFun 图片 API Base。留空时复用 Provider 的 `api_base`，再回退到 `https://api.stepfun.com/v1` |
+| `step_image_default_size` | string | `"1024x1024"` | 文生图默认尺寸。支持 `1024x1024`、`768x1360`、`896x1184`、`1360x768`、`1184x896` |
+| `step_image_timeout` | int | `60` | StepFun 文生图和修图调用超时时间（秒） |
+| `step_image_proxy` | string | `""` | StepFun 图片调用代理。留空时复用 Provider 的代理配置 |
+| `step_image_cfg_scale` | float | `1.0` | 传给 `step-image-edit-2` 的 `cfg_scale` 参数 |
+| `step_image_steps` | int | `8` | 传给 `step-image-edit-2` 的 `steps` 参数 |
+| `step_image_seed` | string | `""` | 固定随机种子。留空表示由模型自动决定 |
+| `step_image_text_mode` | bool | `true` | StepFun 文字场景优化开关 |
+| `step_image_output_retention_minutes` | int | `60` | 本地临时图片保留分钟数，工具调用前会清理过期文件 |
 | `enable_image_description_cache` | bool | `false` | 缓存图片描述结果，相同图片不重复调用API，节省费用 |
 | `image_description_cache_max_entries` | int | `500` | 图片描述缓存的最大条目数 |
 | `platform_image_caption_max_wait` | float | `2.0` | 等待平台图片说明的最大时间（秒） |

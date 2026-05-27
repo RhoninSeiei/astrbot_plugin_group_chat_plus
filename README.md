@@ -4,7 +4,7 @@
 >
 > 本仓库是基于 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 修改后的自用维护版本，面向 RhoninSeiei 的 AstrBot 实际部署场景。代码会参考上游更新，但以线上运行效果和自用需求为准，保留与上游不同的实现。
 >
-> 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、正式回复阶段放行 AstrBot 工具循环（搜索、MCP、知识库与其他 `@llm_tool` 工具）、会话级人格与模型选择、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、Web 面板安全强化、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
+> 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、正式回复阶段放行 AstrBot 工具循环（搜索、MCP、知识库与其他 `@llm_tool` 工具）、会话级人格与模型选择、StepFun `step-image-edit-2` 群聊生图与修图工具、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、Web 面板安全强化、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
 
 <div align="center">
 
@@ -138,6 +138,7 @@
 ### 消息处理
 
 - **图片处理** — 支持图片转文字，可配置范围，结果自动缓存
+- **StepFun 图片工具** — 启用后，群聊正式回复阶段可调用 `step-image-edit-2` 进行文生图或编辑同条消息中的图片，群聊侧只返回生成图片
 - **转发解析** — QQ合并转发消息自动解析为可读文本
 - **关键词系统** — 触发词跳过概率/智能模式，黑名单词直接过滤
 - **戳一戳** — 智能响应QQ戳一戳，支持反戳和回复后戳
@@ -247,6 +248,18 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
   "image_to_text_prompt": "请详细描述这张图片的内容",
   "image_to_text_timeout": 60,
   "max_images_per_message": 10,
+  "enable_step_image_tools": false,
+  "step_image_provider_id": "",
+  "step_image_model": "step-image-edit-2",
+  "step_image_api_base": "",
+  "step_image_default_size": "1024x1024",
+  "step_image_timeout": 60,
+  "step_image_proxy": "",
+  "step_image_cfg_scale": 1.0,
+  "step_image_steps": 8,
+  "step_image_seed": "",
+  "step_image_text_mode": true,
+  "step_image_output_retention_minutes": 60,
   "enable_image_description_cache": true,
   "image_description_cache_max_entries": 500,
   "platform_image_caption_max_wait": 2.0,

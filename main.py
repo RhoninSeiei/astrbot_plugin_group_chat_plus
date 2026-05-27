@@ -94,8 +94,12 @@ from astrbot.api.event import filter
 from astrbot.core.star.star_tools import StarTools
 
 # 导入消息组件类型
-from astrbot.core.message.components import Plain, Poke, At, AtAll, Forward
-from astrbot.core.message.message_event_result import MessageChain, ResultContentType
+from astrbot.core.message.components import Plain, Poke, At, AtAll, Forward, Image
+from astrbot.core.message.message_event_result import (
+    MessageChain,
+    ResultContentType,
+    MessageEventResult,
+)
 
 # 导入 ProviderRequest 类型用于类型判断
 from astrbot.core.provider.entities import ProviderRequest
@@ -145,6 +149,12 @@ from .utils.image_description_cache import (
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
+from .utils.step_image_service import (
+    StepImageConfigError,
+    StepImageProviderError,
+    StepImageService,
+    StepImageUserError,
+)
 from .utils.system_prompt_rewriter import SystemPromptRewriter
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
@@ -632,6 +642,34 @@ class ChatPlus(Star):
         self.max_images_per_message = max(
             1, min(config.get("max_images_per_message", 10), 50)
         )  # 单条消息最大处理图片数（硬限制1-50）
+        self.step_image_config = {
+            "enable_step_image_tools": config.get("enable_step_image_tools", False),
+            "step_image_provider_id": config.get("step_image_provider_id", ""),
+            "step_image_model": config.get("step_image_model", "step-image-edit-2"),
+            "step_image_api_base": config.get("step_image_api_base", ""),
+            "step_image_timeout": config.get("step_image_timeout", 60),
+            "step_image_proxy": config.get("step_image_proxy", ""),
+            "step_image_cfg_scale": config.get("step_image_cfg_scale", 1.0),
+            "step_image_steps": config.get("step_image_steps", 8),
+            "step_image_seed": config.get("step_image_seed", ""),
+            "step_image_text_mode": config.get("step_image_text_mode", True),
+        }
+        self.step_image_default_size = config.get(
+            "step_image_default_size", "1024x1024"
+        )
+        try:
+            step_image_retention_minutes = int(
+                config.get("step_image_output_retention_minutes", 60)
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "⚠️ step_image_output_retention_minutes 配置值无效，使用默认值 60"
+            )
+            step_image_retention_minutes = 60
+        self.step_image_output_retention_minutes = max(
+            1, step_image_retention_minutes
+        )
+        self.step_image_output_dir = self._resolve_step_image_output_dir()
 
         # === 💾 图片描述缓存配置 ===
         self.enable_image_description_cache = config.get(
@@ -8292,6 +8330,139 @@ class ChatPlus(Star):
                 logger.warning(f"[戳一戳] 发送后执行失败: {e}")
 
         logger.info("消息处理完成,已发送回复并保存历史")
+
+    def _resolve_step_image_output_dir(self) -> Path:
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+            return Path(get_astrbot_temp_path()) / "group_chat_plus_step_images"
+        except Exception:
+            return Path(__file__).resolve().parent / "data" / "step_images"
+
+    def _step_image_guard(self, event: AstrMessageEvent) -> Optional[str]:
+        if not StepImageService.is_enabled(self.step_image_config):
+            return "图片生成工具未启用。"
+        if event.is_private_chat():
+            return "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
+        if not self._is_enabled(event):
+            return "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
+        return None
+
+    def _cleanup_step_image_outputs(self) -> None:
+        retention_seconds = self.step_image_output_retention_minutes * 60
+        cutoff = time.time() - retention_seconds
+        try:
+            if not self.step_image_output_dir.exists():
+                return
+            for image_path in self.step_image_output_dir.glob("step_image_*.png"):
+                try:
+                    if image_path.stat().st_mtime < cutoff:
+                        image_path.unlink()
+                except OSError:
+                    continue
+        except Exception as exc:
+            if self.debug_mode:
+                logger.warning(f"[StepImage] 清理临时图片失败: {exc}")
+
+    def _get_step_image_service(self) -> StepImageService:
+        return StepImageService(
+            context=self.context,
+            config=self.step_image_config,
+            output_dir=self.step_image_output_dir,
+        )
+
+    async def _extract_first_current_image_path(
+        self, event: AstrMessageEvent
+    ) -> Optional[str]:
+        if not hasattr(event, "message_obj") or not hasattr(
+            event.message_obj, "message"
+        ):
+            return None
+
+        for component in event.message_obj.message:
+            if isinstance(component, Image):
+                try:
+                    image_path = await component.convert_to_file_path()
+                    if image_path:
+                        return image_path
+                except Exception as exc:
+                    logger.warning(f"[StepImage] 提取待编辑图片失败: {exc}")
+        return None
+
+    @filter.llm_tool(name="gcp_step_image_generate")
+    async def gcp_step_image_generate(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        size: str = "",
+    ):
+        """生成图片。当启用 group_chat_plus 的群聊用户明确要求画图、生图、生成图片时调用。
+
+        Args:
+            prompt(string): 图片内容提示词，不超过 512 个字符。
+            size(string): 图片尺寸，可选值为 1024x1024、768x1360、896x1184、1360x768、1184x896。留空使用默认尺寸。
+        """
+        guard_message = self._step_image_guard(event)
+        if guard_message:
+            return guard_message
+
+        try:
+            self._cleanup_step_image_outputs()
+            image_size = (size or self.step_image_default_size or "1024x1024").strip()
+            result = await self._get_step_image_service().generate(
+                prompt=prompt,
+                size=image_size,
+            )
+            return MessageEventResult().file_image(result.path).stop_event()
+        except StepImageUserError as exc:
+            return str(exc)
+        except StepImageConfigError as exc:
+            logger.warning(f"[StepImage] 配置不可用: {exc}")
+            return "图片生成工具配置未就绪。"
+        except StepImageProviderError as exc:
+            logger.warning(f"[StepImage] Provider 调用失败: {exc}")
+            return "图片生成失败，稍后再试。"
+        except Exception as exc:
+            logger.error(f"[StepImage] 图片生成失败: {exc}", exc_info=True)
+            return "图片生成失败，稍后再试。"
+
+    @filter.llm_tool(name="gcp_step_image_edit")
+    async def gcp_step_image_edit(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+    ):
+        """编辑图片。当启用 group_chat_plus 的群聊用户在同一条消息中发送图片并要求修图、改图时调用。
+
+        Args:
+            prompt(string): 图片编辑要求，不超过 512 个字符。
+        """
+        guard_message = self._step_image_guard(event)
+        if guard_message:
+            return guard_message
+
+        image_path = await self._extract_first_current_image_path(event)
+        if not image_path:
+            return "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+
+        try:
+            self._cleanup_step_image_outputs()
+            result = await self._get_step_image_service().edit(
+                prompt=prompt,
+                image_path=image_path,
+            )
+            return MessageEventResult().file_image(result.path).stop_event()
+        except StepImageUserError as exc:
+            return str(exc)
+        except StepImageConfigError as exc:
+            logger.warning(f"[StepImage] 配置不可用: {exc}")
+            return "图片编辑工具配置未就绪。"
+        except StepImageProviderError as exc:
+            logger.warning(f"[StepImage] Provider 调用失败: {exc}")
+            return "图片编辑失败，稍后再试。"
+        except Exception as exc:
+            logger.error(f"[StepImage] 图片编辑失败: {exc}", exc_info=True)
+            return "图片编辑失败，稍后再试。"
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):

@@ -61,6 +61,7 @@ astrbot_plugin_group_chat_plus/
 │   ├── context_manager.py      # 上下文管理器
 │   ├── image_handler.py        # 图片处理
 │   ├── image_description_cache.py # 图片描述缓存
+│   ├── step_image_service.py   # StepFun 图片生成与编辑
 │   ├── keyword_checker.py      # 关键词检测
 │   ├── message_cleaner.py      # 历史消息清洗
 │   ├── attention_manager.py    # 注意力机制
@@ -221,6 +222,7 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 | `message_cleaner.py` | `MessageCleaner` | 清洗历史消息，过滤系统提示词和标记 |
 | `image_handler.py` | `ImageHandler` | 调用图片转文字 API，提取图片 URL，处理多图 |
 | `image_description_cache.py` | `ImageDescriptionCache` | 本地缓存图片描述结果，避免重复 API 调用 |
+| `step_image_service.py` | `StepImageService` | 封装 StepFun `step-image-edit-2` 文生图与修图调用，并处理错误脱敏 |
 | `forward_message_parser.py` | `ForwardMessageParser` | 解析 QQ 合并转发消息，支持嵌套转发 |
 | `welcome_message_parser.py` | `WelcomeMessageParser` | 检测新成员入群消息 |
 | `keyword_checker.py` | `KeywordChecker` | 匹配触发关键词和黑名单关键词 |

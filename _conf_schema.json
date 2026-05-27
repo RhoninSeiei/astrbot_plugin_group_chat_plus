@@ -442,6 +442,80 @@
         "hint": "单条消息最多处理多少张图片。超出的图片将被忽略（用占位符替代）。防止有人恶意发送大量图片导致AI调用费用暴增。建议5-20张，默认10张",
         "default": 10
     },
+    "enable_step_image_tools": {
+        "description": "🖼️ 启用 StepFun 生图/修图工具",
+        "type": "bool",
+        "hint": "开启后，启用 group_chat_plus 的群聊可以通过正式回复阶段的工具调用生成图片或编辑当前消息中的图片。工具只返回图片，不向群聊暴露 API 地址、Key、原始响应或临时文件路径。判断阶段不会调用该工具。",
+        "default": false
+    },
+    "step_image_provider_id": {
+        "description": "🖼️ StepFun 图片模型 Provider",
+        "type": "string",
+        "hint": "用于读取 StepFun API Key 和 api_base 的 provider。建议选择已配置 step-image-edit-2 的 OpenAI 兼容 provider。留空时会按模型名自动查找 provider。",
+        "default": "",
+        "_special": "select_provider"
+    },
+    "step_image_model": {
+        "description": "🖼️ StepFun 图片模型名",
+        "type": "string",
+        "hint": "默认使用 step-image-edit-2。插件会把该模型用于 /v1/images/generations 和 /v1/images/edits。",
+        "default": "step-image-edit-2"
+    },
+    "step_image_api_base": {
+        "description": "🖼️ StepFun 图片 API Base",
+        "type": "string",
+        "hint": "通常留空，自动复用 provider 的 api_base。为空且 provider 未配置时使用 https://api.stepfun.com/v1。这里不会配置 API Key。",
+        "default": ""
+    },
+    "step_image_default_size": {
+        "description": "🖼️ 文生图默认尺寸",
+        "type": "string",
+        "options": ["1024x1024", "768x1360", "896x1184", "1360x768", "1184x896"],
+        "hint": "用户未指定尺寸时使用的文生图尺寸。格式遵循 StepFun 文档。",
+        "default": "1024x1024"
+    },
+    "step_image_timeout": {
+        "description": "🖼️ StepFun 图片调用超时时间(秒)",
+        "type": "int",
+        "hint": "文生图和修图接口的调用超时时间。默认 60 秒。",
+        "default": 60
+    },
+    "step_image_proxy": {
+        "description": "🖼️ StepFun 图片调用代理",
+        "type": "string",
+        "hint": "通常留空并复用 provider 的 proxy。需要单独指定时填 http://host:port。",
+        "default": ""
+    },
+    "step_image_cfg_scale": {
+        "description": "🖼️ StepFun cfg_scale",
+        "type": "float",
+        "hint": "传给 step-image-edit-2 的 cfg_scale，默认 1.0。",
+        "default": 1.0
+    },
+    "step_image_steps": {
+        "description": "🖼️ StepFun steps",
+        "type": "int",
+        "hint": "传给 step-image-edit-2 的 steps，默认 8。",
+        "default": 8
+    },
+    "step_image_seed": {
+        "description": "🖼️ StepFun seed",
+        "type": "string",
+        "hint": "留空表示不固定 seed；填整数则传给 StepFun 接口。",
+        "default": ""
+    },
+    "step_image_text_mode": {
+        "description": "🖼️ StepFun text_mode",
+        "type": "bool",
+        "hint": "针对文字场景的优化开关，默认开启。",
+        "default": true
+    },
+    "step_image_output_retention_minutes": {
+        "description": "🖼️ StepFun 临时图片保留分钟数",
+        "type": "int",
+        "hint": "每次工具调用前会清理超过该时间的 step_image 临时图片。默认 60 分钟。",
+        "default": 60
+    },
     "enable_image_description_cache": {
         "description": "💾 启用图片描述本地缓存（省钱功能）",
         "type": "bool",
