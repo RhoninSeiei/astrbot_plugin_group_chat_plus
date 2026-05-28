@@ -32,6 +32,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             self.main_source,
         )
         self.assertIn("await event.send(MessageChain(image_result.chain))", self.main_source)
+        self.assertIn("[StepImage] 图片结果已通过工具发送", self.main_source)
         self.assertNotIn("yield self._build_step_image_direct_result", self.main_source)
 
     def test_step_image_guard_uses_group_id_fallbacks(self):

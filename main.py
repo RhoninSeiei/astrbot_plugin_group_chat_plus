@@ -8630,6 +8630,12 @@ class ChatPlus(Star):
         event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, True)
         try:
             await event.send(MessageChain(image_result.chain))
+            logger.info(
+                "[StepImage] 图片结果已通过工具发送: group_id=%s, action=%s, file=%s",
+                self._get_step_image_group_id(event) or "unknown",
+                event.get_extra(PLUGIN_STEP_IMAGE_ACTION, "") or "unknown",
+                Path(str(image_path)).name,
+            )
         except Exception as exc:
             event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, None)
             logger.warning(f"[StepImage] 发送图片结果失败: {exc}", exc_info=True)
