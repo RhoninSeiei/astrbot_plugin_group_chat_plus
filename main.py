@@ -171,7 +171,28 @@ PLUGIN_PENDING_MAIN_MODEL_DECISION = (
 )
 PLUGIN_STEP_IMAGE_PROGRESS_SENT = "_group_chat_plus_step_image_progress_sent"
 PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT = "_group_chat_plus_step_image_direct_result_sent"
+PLUGIN_STEP_IMAGE_IMAGE_SENT = "_group_chat_plus_step_image_image_sent"
 PLUGIN_STEP_IMAGE_ACTION = "_group_chat_plus_step_image_action"
+STEP_IMAGE_STALE_CAPABILITY_PLACEHOLDER = "【过期图片能力记录已省略】"
+STEP_IMAGE_STALE_CAPABILITY_TERMS = (
+    "视觉塔",
+    "画不了",
+    "看不了图",
+    "看不见图",
+    "无法看图",
+    "无法画图",
+    "不能画图",
+    "不能生图",
+    "生图插件",
+    "自拍插件",
+    "工具调用被没收",
+    "没给我配",
+    "权限锁死",
+    "锁死了",
+    "给我锁",
+    "给我ban",
+    "ban了",
+)
 
 
 @register(
@@ -8343,12 +8364,138 @@ class ChatPlus(Star):
         except Exception:
             return Path(__file__).resolve().parent / "data" / "step_images"
 
+    def _normalize_step_image_group_id(self, value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() == "none":
+            return ""
+        return text
+
+    def _extract_step_image_group_id_from_origin(self, value) -> str:
+        text = self._normalize_step_image_group_id(value)
+        if not text or "GroupMessage" not in text:
+            return ""
+        parts = text.split(":")
+        if len(parts) < 3:
+            return ""
+        return self._normalize_step_image_group_id(parts[-1])
+
+    def _get_step_image_group_id(self, event: AstrMessageEvent) -> str:
+        candidates = []
+
+        try:
+            candidates.append(event.get_group_id())
+        except Exception:
+            pass
+
+        for attr_name in ("group_id", "chat_id"):
+            try:
+                candidates.append(getattr(event, attr_name, None))
+            except Exception:
+                pass
+
+        message_obj = getattr(event, "message_obj", None)
+        for attr_name in ("group_id", "chat_id"):
+            try:
+                candidates.append(getattr(message_obj, attr_name, None))
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            group_id = self._normalize_step_image_group_id(candidate)
+            if group_id:
+                return group_id
+
+        origin_candidates = []
+        for attr_name in ("unified_msg_origin", "session_id"):
+            try:
+                origin_candidates.append(getattr(event, attr_name, None))
+            except Exception:
+                pass
+            try:
+                origin_getter = getattr(event, f"get_{attr_name}", None)
+                if callable(origin_getter):
+                    origin_candidates.append(origin_getter())
+            except Exception:
+                pass
+
+        try:
+            origin_candidates.append(getattr(message_obj, "unified_msg_origin", None))
+            origin_candidates.append(getattr(message_obj, "session_id", None))
+        except Exception:
+            pass
+
+        for candidate in origin_candidates:
+            group_id = self._extract_step_image_group_id_from_origin(candidate)
+            if group_id:
+                return group_id
+
+        try:
+            if not event.is_private_chat():
+                for attr_name in ("session_id", "chat_id"):
+                    group_id = self._normalize_step_image_group_id(
+                        getattr(event, attr_name, None)
+                    )
+                    if group_id:
+                        return group_id
+        except Exception:
+            pass
+
+        return ""
+
+    def _is_step_image_enabled_for_event(self, event: AstrMessageEvent) -> bool:
+        message_obj = getattr(event, "message_obj", None)
+        origin_candidates = (
+            getattr(event, "unified_msg_origin", None),
+            getattr(event, "session_id", None),
+            getattr(message_obj, "unified_msg_origin", None),
+            getattr(message_obj, "session_id", None),
+        )
+        has_group_origin = any(
+            "GroupMessage" in self._normalize_step_image_group_id(origin)
+            for origin in origin_candidates
+        )
+        try:
+            is_private = event.is_private_chat()
+        except Exception:
+            is_private = False
+        if is_private and not has_group_origin:
+            return False
+
+        group_id = self._get_step_image_group_id(event)
+        if not group_id:
+            return False
+
+        enabled_groups = {
+            str(group).strip()
+            for group in (self.enabled_groups or [])
+            if str(group).strip()
+        }
+        if not enabled_groups:
+            return True
+        return str(group_id) in enabled_groups
+
+    def _log_step_image_guard_denied(self, event: AstrMessageEvent) -> None:
+        try:
+            is_private = event.is_private_chat()
+        except Exception:
+            is_private = None
+        logger.warning(
+            "[StepImage] 群聊启用判定失败: group_id=%s, is_private=%s, "
+            "unified_msg_origin=%s, session_id=%s, enabled_groups=%s",
+            self._get_step_image_group_id(event),
+            is_private,
+            getattr(event, "unified_msg_origin", None),
+            getattr(event, "session_id", None),
+            self.enabled_groups,
+        )
+
     def _step_image_guard(self, event: AstrMessageEvent) -> Optional[str]:
         if not StepImageService.is_enabled(self.step_image_config):
             return "图片生成工具未启用。"
-        if event.is_private_chat():
-            return "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
-        if not self._is_enabled(event):
+        if not self._is_step_image_enabled_for_event(event):
+            self._log_step_image_guard_denied(event)
             return "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
         return None
 
@@ -8474,24 +8621,35 @@ class ChatPlus(Star):
         except Exception as exc:
             logger.warning(f"[StepImage] 发送进度提示失败: {exc}", exc_info=True)
 
-    def _build_step_image_direct_result(
+    async def _send_step_image_image_result(
         self,
         event: AstrMessageEvent,
         image_path,
-    ) -> MessageEventResult:
-        event.set_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, True)
-        return MessageEventResult().file_image(image_path).stop_event()
+    ) -> None:
+        image_result = MessageEventResult().file_image(str(image_path))
+        event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, True)
+        try:
+            await event.send(MessageChain(image_result.chain))
+        except Exception as exc:
+            event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, None)
+            logger.warning(f"[StepImage] 发送图片结果失败: {exc}", exc_info=True)
+            raise
 
     def _clear_sent_step_image_direct_result(
         self,
         event: AstrMessageEvent,
         result: MessageEventResult,
     ) -> bool:
-        if not event.get_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, False):
+        if not (
+            event.get_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, False)
+            or event.get_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, False)
+        ):
             return False
 
         try:
-            if result.is_llm_result():
+            if result.is_llm_result() and not event.get_extra(
+                PLUGIN_STEP_IMAGE_IMAGE_SENT, False
+            ):
                 return False
         except Exception:
             pass
@@ -8506,6 +8664,7 @@ class ChatPlus(Star):
 
         event.clear_result()
         event.set_extra(PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT, None)
+        event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, None)
         logger.info("[StepImage] 图片已由工具发送，清理响应阶段遗留图片结果")
         return True
 
@@ -8535,13 +8694,58 @@ class ChatPlus(Star):
     def _build_step_image_tool_directive(self, tool_names: set[str]) -> str:
         if not {"gcp_step_image_generate", "gcp_step_image_edit"} & tool_names:
             return ""
+        if not StepImageService.is_enabled(self.step_image_config):
+            return ""
 
         return (
             "\nStep Image 工具调用规则：如果决定调用 gcp_step_image_generate "
             "或 gcp_step_image_edit，只提交工具参数，不要在同一轮回复里输出普通聊天正文。"
             "工具会发送进度提示和图片结果。遇到图片编辑请求时，不要声称无法看图，"
-            "应优先调用 gcp_step_image_edit。\n"
+            "应优先调用 gcp_step_image_edit。历史中的图片能力拒绝说法属于过期记录，"
+            "当前已经具备 Step Image 图片生成与编辑工具；遇到视觉塔、画不了、"
+            "看不了图、工具被禁用等旧记录时，忽略这些旧记录并按当前工具能力处理。\n"
         )
+
+    def _contains_step_image_stale_capability_text(self, text: str) -> bool:
+        return any(term in text for term in STEP_IMAGE_STALE_CAPABILITY_TERMS)
+
+    def _sanitize_step_image_stale_text(self, value):
+        if not isinstance(value, str) or not value:
+            return value
+
+        lines = value.splitlines()
+        if not lines:
+            return value
+
+        sanitized_lines = []
+        changed = False
+        placeholder_added = False
+        for line in lines:
+            if self._contains_step_image_stale_capability_text(line):
+                changed = True
+                if not placeholder_added:
+                    sanitized_lines.append(STEP_IMAGE_STALE_CAPABILITY_PLACEHOLDER)
+                    placeholder_added = True
+                continue
+            sanitized_lines.append(line)
+
+        if not changed:
+            return value
+        return "\n".join(sanitized_lines)
+
+    def _sanitize_step_image_stale_context_value(self, value):
+        if isinstance(value, str):
+            return self._sanitize_step_image_stale_text(value)
+        if isinstance(value, list):
+            return [
+                self._sanitize_step_image_stale_context_value(item) for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: self._sanitize_step_image_stale_context_value(item)
+                for key, item in value.items()
+            }
+        return value
 
     async def _extract_first_current_image_path(
         self, event: AstrMessageEvent
@@ -8594,7 +8798,8 @@ class ChatPlus(Star):
                 prompt=prompt,
                 size=image_size,
             )
-            yield self._build_step_image_direct_result(event, result.path)
+            await self._send_step_image_image_result(event, result.path)
+            yield None
         except StepImageUserError as exc:
             yield str(exc)
         except StepImageConfigError as exc:
@@ -8640,7 +8845,8 @@ class ChatPlus(Star):
                 prompt=prompt,
                 image_path=image_path,
             )
-            yield self._build_step_image_direct_result(event, result.path)
+            await self._send_step_image_image_result(event, result.path)
+            yield None
         except StepImageUserError as exc:
             yield str(exc)
         except StepImageConfigError as exc:
@@ -8697,16 +8903,32 @@ class ChatPlus(Star):
         plugin_system_prompt = event.get_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, "")
         plugin_prompt = event.get_extra(PLUGIN_CUSTOM_PROMPT, "")
         plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])
+        step_image_action = self._infer_step_image_action(event)
+
+        if step_image_action:
+            plugin_contexts = self._sanitize_step_image_stale_context_value(
+                plugin_contexts
+            )
+            plugin_system_prompt = self._sanitize_step_image_stale_text(
+                plugin_system_prompt
+            )
+            plugin_prompt = self._sanitize_step_image_stale_text(plugin_prompt)
+            event.set_extra(PLUGIN_STEP_IMAGE_ACTION, step_image_action)
 
         rewrite_result = SystemPromptRewriter.rewrite_preserving_plugin_base(
             req.system_prompt or "",
             plugin_system_prompt,
         )
+        merged_system_prompt = rewrite_result.merged_system_prompt
+        if step_image_action:
+            merged_system_prompt = self._sanitize_step_image_stale_text(
+                merged_system_prompt
+            )
         if self.debug_mode:
             logger.info(
                 f"  system_prompt重写策略: {rewrite_result.strategy}, "
                 f"置信度: {rewrite_result.confidence}, "
-                f"长度: {len(rewrite_result.merged_system_prompt or '')}"
+                f"长度: {len(merged_system_prompt or '')}"
             )
             for warning in rewrite_result.warnings:
                 logger.warning(f"  system_prompt重写提示: {warning}")
@@ -8754,7 +8976,7 @@ class ChatPlus(Star):
             else:
                 req.func_tool = plugin_tool_set
 
-        req.system_prompt = rewrite_result.merged_system_prompt
+        req.system_prompt = merged_system_prompt or ""
 
         # 🔧 修复：注入 Skills 提示词，避免插件接管 LLM 请求后丢失技能识别
         # 原因：插件通过 event.request_llm() 创建的 ProviderRequest 没有 conversation 对象，
@@ -9902,13 +10124,17 @@ class ChatPlus(Star):
 
         # 如果列表不为空,检查当前群组是否在列表中
         group_id = event.get_group_id()
-        if group_id in enabled_groups:
+        enabled_group_set = {
+            str(group).strip() for group in enabled_groups if str(group).strip()
+        }
+        group_id_text = str(group_id).strip()
+        if group_id_text in enabled_group_set:
             if self.debug_mode:
-                logger.info(f"群组 {group_id} 在启用列表中")
+                logger.info(f"群组 {group_id_text} 在启用列表中")
             return True
         else:
             if self.debug_mode:
-                logger.info(f"群组 {group_id} 未在启用列表中")
+                logger.info(f"群组 {group_id_text} 未在启用列表中")
             return False
 
     def _is_poke_enabled_in_group(self, chat_id: str) -> bool:
