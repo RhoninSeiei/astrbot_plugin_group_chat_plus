@@ -40,6 +40,8 @@ PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 # event.request_llm() 的 prompt 参数传此短字符串，其他插件做向量检索时用的是短消息而不是完整历史
 # group_chat_plus 自身的 on_llm_request 钩子（priority=-1，最后执行）再把 req.prompt 换回完整 full_prompt
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
+# 🔧 存储已注入提示词的工具名，用于与执行器工具表做一致性检查
+PLUGIN_VISIBLE_TOOL_NAMES = "_group_chat_plus_visible_tool_names"
 # 🔧 存储空回复兜底所需的最终提示词信息
 PLUGIN_FALLBACK_PAYLOAD = "_group_chat_plus_fallback_payload"
 # 🔧 存储回复成功后再记账所需的上下文

@@ -157,12 +157,14 @@ from .utils.step_image_service import (
     StepImageUserError,
 )
 from .utils.system_prompt_rewriter import SystemPromptRewriter
+from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
     PLUGIN_FALLBACK_PAYLOAD,
     PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED,
     PLUGIN_REPLY_EFFECT_CONTEXT,
+    PLUGIN_VISIBLE_TOOL_NAMES,
 )
 
 
@@ -6028,6 +6030,26 @@ class ChatPlus(Star):
                     logger.warning(f"人格工具过滤失败,使用全部工具: {e}")
 
             old_len = len(final_message)
+            try:
+                visible_tools = ToolsReminder.get_available_tools(self.context)
+                if allowed_tool_names is not None:
+                    visible_tools = [
+                        tool
+                        for tool in visible_tools
+                        if tool.get("name") in allowed_tool_names
+                    ]
+                visible_tool_names = sorted(
+                    {
+                        str(tool.get("name", "")).strip()
+                        for tool in visible_tools
+                        if str(tool.get("name", "")).strip()
+                    }
+                )
+                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)
+            except Exception as e:
+                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, [])
+                logger.warning(f"记录提示工具列表失败: {e}")
+
             final_message = ToolsReminder.inject_tools_to_message(
                 final_message, self.context, allowed_tool_names
             )
@@ -8889,6 +8911,7 @@ class ChatPlus(Star):
             PLUGIN_IMAGE_URLS,
             PLUGIN_FUNC_TOOL,
             PLUGIN_CURRENT_MESSAGE,
+            PLUGIN_VISIBLE_TOOL_NAMES,
         )
 
         # 检查是否是来自本插件的请求
@@ -8961,6 +8984,32 @@ class ChatPlus(Star):
                 return list(func_list)
             return []
 
+        def _get_tool_name_set(tool_container):
+            return {
+                str(getattr(tool, "name", "")).strip()
+                for tool in _get_compatible_tools(tool_container)
+                if str(getattr(tool, "name", "")).strip()
+            }
+
+        def _log_tool_visibility_delta(visible_tool_names, executable_tool_names):
+            if not visible_tool_names and not executable_tool_names:
+                return
+            missing_executable = sorted(visible_tool_names - executable_tool_names)
+            hidden_from_prompt = sorted(executable_tool_names - visible_tool_names)
+            if missing_executable or hidden_from_prompt:
+                logger.warning(
+                    "[工具一致性] 提示工具与执行工具不一致: "
+                    "提示可见但不可执行=%s; 可执行但未提示=%s",
+                    missing_executable[:20],
+                    hidden_from_prompt[:20],
+                )
+                return
+            if self.debug_mode:
+                logger.info(
+                    "[工具一致性] 提示工具与执行工具一致: %s 个",
+                    len(executable_tool_names),
+                )
+
         # 正式回复阶段保留平台 build_main_agent 注入的工具，并合并插件注册工具。
         # 读空气判断与最终判断仍走无工具的 Provider 直连，避免判断阶段产生外部副作用。
         plugin_tool_set = event.get_extra(PLUGIN_FUNC_TOOL)
@@ -9005,6 +9054,11 @@ class ChatPlus(Star):
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
 
         current_tools = _get_compatible_tools(req.func_tool)
+        visible_tool_names = set(event.get_extra(PLUGIN_VISIBLE_TOOL_NAMES, []) or [])
+        _log_tool_visibility_delta(
+            visible_tool_names,
+            _get_tool_name_set(req.func_tool),
+        )
         if current_tools:
             try:
                 from astrbot.core.astr_main_agent_resources import TOOL_CALL_PROMPT
@@ -9039,6 +9093,7 @@ class ChatPlus(Star):
             event.set_extra(PLUGIN_IMAGE_URLS, None)
             event.set_extra(PLUGIN_FUNC_TOOL, None)
             event.set_extra(PLUGIN_CURRENT_MESSAGE, None)
+            event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
             # 简化日志：非debug模式下也显示，方便监控安全机制
             logger.info("[安全] 已清理LLM请求上下文缓存")
         except Exception as e:
@@ -9192,6 +9247,23 @@ class ChatPlus(Star):
             if step_image_progress_text:
                 _replace_result_text(step_image_progress_text)
                 reply_text = step_image_progress_text
+
+            tool_call_guard = sanitize_tool_call_markup(reply_text)
+            if tool_call_guard.had_markup:
+                if tool_call_guard.should_block:
+                    logger.warning(
+                        "[工具调用外显防护] 检测到工具调用控制文本，已跳过发送: %s",
+                        reply_text[:120],
+                    )
+                    event.clear_result()
+                    return
+                logger.warning(
+                    "[工具调用外显防护] 检测到工具调用控制文本，发送前已清理: %s -> %s",
+                    reply_text[:120],
+                    tool_call_guard.sanitized_text[:120],
+                )
+                _replace_result_text(tool_call_guard.sanitized_text)
+                reply_text = tool_call_guard.sanitized_text
 
             brief_text = ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
             if brief_text != reply_text:
