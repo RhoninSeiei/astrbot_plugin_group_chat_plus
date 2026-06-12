@@ -59,6 +59,170 @@ class MemoryInjector:
     """
 
     @staticmethod
+    def _clean_identity_value(value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if text.lower() in {"", "none", "null", "unknown", "未知", "未知用户"}:
+            return ""
+        return text
+
+    @staticmethod
+    def _first_metadata_value(metadata: dict, *keys: str) -> str:
+        if not isinstance(metadata, dict):
+            return ""
+        for key in keys:
+            value = metadata.get(key)
+            cleaned = MemoryInjector._clean_identity_value(value)
+            if cleaned:
+                return cleaned
+        return ""
+
+    @staticmethod
+    def _format_member_identity(name: str = "", user_id: str = "") -> tuple[str, bool]:
+        clean_name = MemoryInjector._clean_identity_value(name)
+        clean_user_id = MemoryInjector._clean_identity_value(user_id)
+
+        if clean_user_id:
+            display_name = clean_name or "用户"
+            return f"{display_name}(ID:{clean_user_id})", True
+
+        display_name = clean_name or "未知成员"
+        return f"{display_name}(仅昵称来源，身份未确认)", False
+
+    @staticmethod
+    def _iter_participant_candidates(metadata: dict):
+        if not isinstance(metadata, dict):
+            return
+
+        sender_id = MemoryInjector._first_metadata_value(
+            metadata, "sender_id", "user_id", "platform_user_id", "qq"
+        )
+        sender_name = MemoryInjector._first_metadata_value(
+            metadata, "sender_name", "nickname", "user_name", "name"
+        )
+        if sender_id or sender_name:
+            yield {"user_id": sender_id, "nickname": sender_name}
+
+        for key in ("sender", "user", "author"):
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                yield value
+
+        for key in ("participants", "participant", "members", "users"):
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                value = list(value.values())
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    if isinstance(item, dict):
+                        yield item
+                    else:
+                        yield {"nickname": item}
+
+    @staticmethod
+    def _format_memory_identity_lines(metadata: dict) -> list[str]:
+        if not isinstance(metadata, dict):
+            return ["   身份可信度: 该记忆未提供结构化身份字段，仅能按正文弱参考"]
+
+        lines = []
+        session_id = MemoryInjector._first_metadata_value(
+            metadata, "session_id", "unified_msg_origin", "umo"
+        )
+        platform_id = MemoryInjector._first_metadata_value(
+            metadata, "platform_id", "platform", "platform_name"
+        )
+        group_id = MemoryInjector._first_metadata_value(
+            metadata, "group_id", "chat_id", "room_id"
+        )
+
+        if session_id:
+            lines.append(f"   来源会话: {session_id}")
+        if platform_id:
+            lines.append(f"   平台ID: {platform_id}")
+        if group_id:
+            lines.append(f"   群组ID: {group_id}")
+
+        participant_texts = []
+        has_confirmed_id = False
+        has_nickname_only = False
+        seen = set()
+        for candidate in MemoryInjector._iter_participant_candidates(metadata):
+            user_id = MemoryInjector._first_metadata_value(
+                candidate, "user_id", "sender_id", "platform_user_id", "qq"
+            )
+            nickname = MemoryInjector._first_metadata_value(
+                candidate, "nickname", "sender_name", "user_name", "name", "display_name"
+            )
+            display, has_id = MemoryInjector._format_member_identity(nickname, user_id)
+            dedupe_key = (user_id or "", nickname or display)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            participant_texts.append(display)
+            has_confirmed_id = has_confirmed_id or has_id
+            has_nickname_only = has_nickname_only or not has_id
+
+        if participant_texts:
+            lines.append(f"   相关成员: {', '.join(participant_texts)}")
+
+        if has_confirmed_id and has_nickname_only:
+            lines.append(
+                "   身份可信度: 含用户ID的成员引用可用于区分同名成员；仅昵称来源的成员引用只作弱参考"
+            )
+        elif has_confirmed_id:
+            lines.append("   身份可信度: 含用户ID的成员引用可用于区分同名成员")
+        elif has_nickname_only:
+            lines.append("   身份可信度: 仅昵称来源，身份未确认，只作弱参考")
+        elif not lines:
+            lines.append("   身份可信度: 该记忆未提供结构化身份字段，仅能按正文弱参考")
+
+        return lines
+
+    @staticmethod
+    def _format_livingmemory_memory(mem, index: int) -> str:
+        content = getattr(mem, "content", "")
+        metadata = getattr(mem, "metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        importance = metadata.get("importance", 0.5)
+        try:
+            importance_value = float(importance)
+        except (TypeError, ValueError):
+            importance_value = 0.5
+
+        star_count = max(1, min(5, int(importance_value * 5)))
+        importance_stars = "⭐" * star_count
+
+        create_time = metadata.get("create_time")
+        time_str = "未知时间"
+        if create_time is not None:
+            try:
+                dt = datetime.fromtimestamp(float(create_time))
+                weekday_names = [
+                    "周一",
+                    "周二",
+                    "周三",
+                    "周四",
+                    "周五",
+                    "周六",
+                    "周日",
+                ]
+                weekday = weekday_names[dt.weekday()]
+                time_str = dt.strftime(f"%Y-%m-%d {weekday} %H:%M:%S")
+            except (ValueError, TypeError, OSError):
+                time_str = "未知时间"
+
+        parts = [
+            f"{index}. {content}",
+            *MemoryInjector._format_memory_identity_lines(metadata),
+            f"   重要程度: {importance_stars} ({star_count}/5)",
+            f"   时间: {time_str}",
+        ]
+        return "\n".join(parts)
+
+    @staticmethod
     def _get_livingmemory_plugin_state(context: Context, version: str = "v1"):
         """
         获取 LivingMemory 插件的初始化状态和 memory_engine
@@ -544,51 +708,9 @@ class MemoryInjector:
                 # 注意：memories已经按综合得分排序，索引号越小越重要
                 memory_texts = []
                 for i, mem in enumerate(memories, 1):
-                    content = getattr(mem, "content", "")
-                    metadata = getattr(mem, "metadata", {})
-
-                    # 提取重要性信息
-                    importance = (
-                        metadata.get("importance", 0.5)
-                        if isinstance(metadata, dict)
-                        else 0.5
+                    memory_texts.append(
+                        MemoryInjector._format_livingmemory_memory(mem, i)
                     )
-
-                    # 转换为星级显示（1-5颗星）
-                    star_count = max(1, min(5, int(importance * 5)))
-                    importance_stars = "⭐" * star_count
-
-                    # 提取时间戳并格式化
-                    create_time = (
-                        metadata.get("create_time")
-                        if isinstance(metadata, dict)
-                        else None
-                    )
-                    time_str = "未知时间"
-                    if create_time:
-                        try:
-                            dt = datetime.fromtimestamp(float(create_time))
-                            weekday_names = [
-                                "周一",
-                                "周二",
-                                "周三",
-                                "周四",
-                                "周五",
-                                "周六",
-                                "周日",
-                            ]
-                            weekday = weekday_names[dt.weekday()]
-                            time_str = dt.strftime(f"%Y-%m-%d {weekday} %H:%M:%S")
-                        except (ValueError, TypeError, OSError):
-                            time_str = "未知时间"
-
-                    # 详细格式：序号 + 内容 + 重要程度 + 时间
-                    memory_text = (
-                        f"{i}. {content}\n"
-                        f"   重要程度: {importance_stars} ({star_count}/5)\n"
-                        f"   时间: {time_str}"
-                    )
-                    memory_texts.append(memory_text)
 
                 result = "\n\n".join(memory_texts)
                 logger.info(
@@ -740,8 +862,17 @@ class MemoryInjector:
                 )
             return original_message
 
+        identity_rule = (
+            "[成员身份识别规则]\n"
+            "涉及具体成员时以用户ID为准，昵称只作展示。\n"
+            "记忆中标注为“仅昵称来源，身份未确认”的成员引用只作弱参考；"
+            "遇到同名、改名或昵称相似时，优先采用当前消息与历史消息中带 ID 的身份标注。\n"
+        )
+
         # 在消息末尾添加记忆部分
-        injected_message = original_message + "\n\n=== 背景信息 ===\n" + memories
+        injected_message = (
+            original_message + "\n\n=== 背景信息 ===\n" + identity_rule + memories
+        )
         injected_message += "\n\n(这些信息可能对理解当前对话有帮助，请自然地融入到你的回答中，而不要明确提及)"
 
         logger.info(f"成功注入记忆: {len(memories)} 字符")

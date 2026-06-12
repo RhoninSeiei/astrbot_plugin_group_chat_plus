@@ -102,13 +102,14 @@ class PlatformLTMHelper:
 
             umo = event.unified_msg_origin
             sender_name = event.get_sender_name() or ""
+            sender_id = str(event.get_sender_id() or "")
 
             # 🔧 获取当前消息的时间戳，用于精确匹配
             msg_timestamp = PlatformLTMHelper._get_message_timestamp(event)
 
             # 首次尝试（可能平台已经处理完成）
             result = PlatformLTMHelper._try_extract_caption(
-                ltm, umo, sender_name, original_text, msg_timestamp
+                ltm, umo, sender_name, original_text, msg_timestamp, sender_id=sender_id
             )
             if result[0]:
                 # 平台已处理完成，直接返回
@@ -123,7 +124,7 @@ class PlatformLTMHelper:
             # 检查是否需要等待（平台可能正在处理中）
             # 条件：会话存在 且 最后一条消息匹配当前发送者 但 还没有图片描述
             should_wait = PlatformLTMHelper._should_wait_for_platform(
-                ltm, umo, sender_name, original_text, msg_timestamp
+                ltm, umo, sender_name, original_text, msg_timestamp, sender_id=sender_id
             )
 
             if not should_wait:
@@ -152,7 +153,12 @@ class PlatformLTMHelper:
 
                 # 重新尝试提取
                 result = PlatformLTMHelper._try_extract_caption(
-                    ltm, umo, sender_name, original_text, msg_timestamp
+                    ltm,
+                    umo,
+                    sender_name,
+                    original_text,
+                    msg_timestamp,
+                    sender_id=sender_id,
                 )
 
                 if result[0]:
@@ -163,7 +169,7 @@ class PlatformLTMHelper:
 
                 # 检查是否平台处理失败（出现 [Image] 而非 [Image: xxx]）
                 if PlatformLTMHelper._check_platform_failed(
-                    ltm, umo, sender_name, msg_timestamp
+                    ltm, umo, sender_name, msg_timestamp, sender_id=sender_id
                 ):
                     if DEBUG_MODE:
                         logger.info("[PlatformLTM] 检测到平台图片处理失败，停止等待")
@@ -224,10 +230,11 @@ class PlatformLTMHelper:
 
             umo = event.unified_msg_origin
             sender_name = event.get_sender_name() or ""
+            sender_id = str(event.get_sender_id() or "")
             msg_timestamp = PlatformLTMHelper._get_message_timestamp(event)
 
             return PlatformLTMHelper._try_extract_caption(
-                ltm, umo, sender_name, original_text, msg_timestamp
+                ltm, umo, sender_name, original_text, msg_timestamp, sender_id=sender_id
             )
 
         except Exception as e:
@@ -283,12 +290,78 @@ class PlatformLTMHelper:
             return None
 
     @staticmethod
+    def _clean_identity_value(value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if text.lower() in {"", "none", "null", "unknown", "未知", "未知用户"}:
+            return ""
+        return text
+
+    @staticmethod
+    def _parse_chat_record_identity(chat_record: str) -> tuple[str, str, str]:
+        """
+        解析平台 LTM 前缀中的昵称、用户ID和时间。
+
+        支持旧格式 [昵称/HH:MM:SS]，也支持增强格式
+        [昵称(ID:QQ)/HH:MM:SS]。
+        """
+        try:
+            match = re.match(
+                r"^\[(?P<label>.+?)/(?P<time>\d{2}:\d{2}:\d{2})\]",
+                chat_record or "",
+            )
+            if not match:
+                return "", "", ""
+
+            label = match.group("label").strip()
+            record_time = match.group("time")
+            sender_id = ""
+            id_match = re.search(r"\((?:ID|id|QQ|qq)[:： ]*([^)]+)\)", label)
+            if id_match:
+                sender_id = PlatformLTMHelper._clean_identity_value(id_match.group(1))
+                label = re.sub(
+                    r"\s*\((?:ID|id|QQ|qq)[:： ]*[^)]*\)",
+                    "",
+                    label,
+                ).strip()
+
+            return label, sender_id, record_time
+        except Exception:
+            return "", "", ""
+
+    @staticmethod
+    def _sender_match_kind(
+        chat_record: str, sender_name: str, sender_id: str = ""
+    ) -> Optional[str]:
+        record_name, record_sender_id, _ = PlatformLTMHelper._parse_chat_record_identity(
+            chat_record
+        )
+        expected_name = PlatformLTMHelper._clean_identity_value(sender_name)
+        expected_id = PlatformLTMHelper._clean_identity_value(sender_id)
+
+        if expected_id and record_sender_id:
+            if record_sender_id == expected_id:
+                return "id"
+            return None
+
+        if expected_name and record_name == expected_name:
+            return "nickname_only"
+
+        # 兼容旧实现的宽松匹配，避免特殊字符昵称造成图片描述完全不可用。
+        if expected_name and f"[{expected_name}" in (chat_record or "")[:80]:
+            return "nickname_only"
+
+        return None
+
+    @staticmethod
     def _try_extract_caption(
         ltm,
         umo: str,
         sender_name: str,
         original_text: str,
         msg_timestamp: Optional[str] = None,
+        sender_id: str = "",
     ) -> Tuple[bool, Optional[str]]:
         """
         尝试从 LTM 提取图片描述（内部方法）
@@ -315,7 +388,11 @@ class PlatformLTMHelper:
             # 确保即使同一秒内多条消息也能正确匹配
             if msg_timestamp:
                 matched_chat = PlatformLTMHelper._find_message_by_timestamp(
-                    session_chats, sender_name, msg_timestamp, original_text
+                    session_chats,
+                    sender_name,
+                    msg_timestamp,
+                    original_text,
+                    sender_id=sender_id,
                 )
                 if not matched_chat:
                     return False, None
@@ -323,7 +400,7 @@ class PlatformLTMHelper:
                 # 没有时间戳，回退到只检查最后一条
                 matched_chat = session_chats[-1]
                 if not PlatformLTMHelper._verify_message_match(
-                    matched_chat, sender_name, original_text, None
+                    matched_chat, sender_name, original_text, None, sender_id=sender_id
                 ):
                     return False, None
 
@@ -364,6 +441,7 @@ class PlatformLTMHelper:
         sender_name: str,
         msg_timestamp: str,
         original_text: str = "",
+        sender_id: str = "",
     ) -> Optional[str]:
         """
         根据时间戳从聊天记录中查找匹配的消息
@@ -389,48 +467,99 @@ class PlatformLTMHelper:
             check_count = min(15, len(session_chats))
 
             # 第一轮：精确匹配 sender_name + timestamp
+            nickname_only_candidate = None
             for i in range(1, check_count + 1):
                 chat = session_chats[-i]
 
-                # 精确匹配格式: [昵称/HH:MM:SS]: 内容
-                expected_prefix = f"[{sender_name}/{msg_timestamp}]"
-                if chat.startswith(expected_prefix):
+                record_name, _, record_time = (
+                    PlatformLTMHelper._parse_chat_record_identity(chat)
+                )
+                match_kind = PlatformLTMHelper._sender_match_kind(
+                    chat, sender_name, sender_id
+                )
+                if match_kind and record_time == msg_timestamp:
                     # 如果有原始文本，进一步验证内容
                     if original_text:
-                        if PlatformLTMHelper._content_matches(chat, original_text):
-                            return chat
-                        # 内容不匹配，可能是同一秒的另一条消息，继续查找
-                        continue
-                    return chat
+                        if not PlatformLTMHelper._content_matches(
+                            chat, original_text
+                        ):
+                            # 内容不匹配，可能是同一秒的另一条消息，继续查找
+                            continue
+                    if match_kind == "id":
+                        return chat
+                    if nickname_only_candidate is None:
+                        nickname_only_candidate = chat
+
+                # 兼容旧代码对原始前缀的判断。
+                expected_prefix = f"[{sender_name}/{msg_timestamp}]"
+                if (
+                    not record_name
+                    and chat.startswith(expected_prefix)
+                    and PlatformLTMHelper._content_matches(chat, original_text)
+                ):
+                    if nickname_only_candidate is None:
+                        nickname_only_candidate = chat
+
+            if nickname_only_candidate is not None:
+                if DEBUG_MODE and sender_id:
+                    logger.info(
+                        "[PlatformLTM] 使用仅昵称 LTM 记录补充当前图片内容，身份仍以当前事件 sender_id 为准"
+                    )
+                return nickname_only_candidate
 
             # 第二轮：宽松匹配（3秒容差，因为平台使用处理时的时间，可能有延迟）
+            nickname_only_candidate = None
             for i in range(1, check_count + 1):
                 chat = session_chats[-i]
 
-                # 提取聊天记录中的时间戳
-                match = re.match(
-                    rf"^\[{re.escape(sender_name)}/(\d{{2}}:\d{{2}}:\d{{2}})\]", chat
+                _, _, record_time = PlatformLTMHelper._parse_chat_record_identity(chat)
+                match_kind = PlatformLTMHelper._sender_match_kind(
+                    chat, sender_name, sender_id
                 )
-                if match:
-                    record_time = match.group(1)
+                if match_kind and record_time:
                     if PlatformLTMHelper._timestamps_close(
                         msg_timestamp, record_time, tolerance=3
                     ):
                         # 如果有原始文本，验证内容
                         if original_text:
-                            if PlatformLTMHelper._content_matches(chat, original_text):
-                                return chat
-                            continue
-                        return chat
+                            if not PlatformLTMHelper._content_matches(
+                                chat, original_text
+                            ):
+                                continue
+                        if match_kind == "id":
+                            return chat
+                        if nickname_only_candidate is None:
+                            nickname_only_candidate = chat
+
+            if nickname_only_candidate is not None:
+                if DEBUG_MODE and sender_id:
+                    logger.info(
+                        "[PlatformLTM] 使用仅昵称 LTM 记录补充当前图片内容，身份仍以当前事件 sender_id 为准"
+                    )
+                return nickname_only_candidate
 
             # 第三轮：仅通过发送者和内容匹配（时间戳可能完全不同）
             if original_text:
+                nickname_only_candidate = None
                 for i in range(1, check_count + 1):
                     chat = session_chats[-i]
                     # 检查是否是同一发送者
-                    if f"[{sender_name}/" in chat[:50]:
-                        if PlatformLTMHelper._content_matches(chat, original_text):
+                    match_kind = PlatformLTMHelper._sender_match_kind(
+                        chat, sender_name, sender_id
+                    )
+                    if match_kind and PlatformLTMHelper._content_matches(
+                        chat, original_text
+                    ):
+                        if match_kind == "id":
                             return chat
+                        if nickname_only_candidate is None:
+                            nickname_only_candidate = chat
+                if nickname_only_candidate is not None:
+                    if DEBUG_MODE and sender_id:
+                        logger.info(
+                            "[PlatformLTM] 使用仅昵称 LTM 记录补充当前图片内容，身份仍以当前事件 sender_id 为准"
+                        )
+                    return nickname_only_candidate
 
             return None
 
@@ -537,6 +666,7 @@ class PlatformLTMHelper:
         sender_name: str,
         original_text: str,
         msg_timestamp: Optional[str] = None,
+        sender_id: str = "",
     ) -> bool:
         """
         判断是否应该等待平台处理
@@ -577,20 +707,21 @@ class PlatformLTMHelper:
                 check_count = min(5, len(session_chats))
                 for i in range(1, check_count + 1):
                     chat = session_chats[-i]
+                    match_kind = PlatformLTMHelper._sender_match_kind(
+                        chat, sender_name, sender_id
+                    )
+                    _, _, record_time = PlatformLTMHelper._parse_chat_record_identity(
+                        chat
+                    )
                     # 检查是否是当前消息（通过时间戳匹配）
-                    if f"[{sender_name}/{msg_timestamp}]" in chat[:50]:
+                    if match_kind and record_time == msg_timestamp:
                         # 找到了，检查是否有 [Image] 标记
                         if "[Image]" in chat and "[Image:" not in chat:
                             return True
                         # 已经有描述或没有图片，不需要等待
                         return False
                     # 宽松匹配时间戳
-                    match = re.match(
-                        rf"^\[{re.escape(sender_name)}/(\d{{2}}:\d{{2}}:\d{{2}})\]",
-                        chat,
-                    )
-                    if match:
-                        record_time = match.group(1)
+                    if match_kind and record_time:
                         if PlatformLTMHelper._timestamps_close(
                             msg_timestamp, record_time, tolerance=1
                         ):
@@ -604,7 +735,9 @@ class PlatformLTMHelper:
             last_chat = session_chats[-1]
 
             # 宽松匹配发送者
-            if f"[{sender_name}" not in last_chat[:50]:
+            if not PlatformLTMHelper._sender_match_kind(
+                last_chat, sender_name, sender_id
+            ):
                 return False
 
             # 如果已经有图片描述，不需要等待
@@ -622,7 +755,11 @@ class PlatformLTMHelper:
 
     @staticmethod
     def _check_platform_failed(
-        ltm, umo: str, sender_name: str, msg_timestamp: Optional[str] = None
+        ltm,
+        umo: str,
+        sender_name: str,
+        msg_timestamp: Optional[str] = None,
+        sender_id: str = "",
     ) -> bool:
         """
         检查平台是否处理失败
@@ -646,18 +783,23 @@ class PlatformLTMHelper:
                 check_count = min(5, len(session_chats))
                 for i in range(1, check_count + 1):
                     chat = session_chats[-i]
+                    match_kind = PlatformLTMHelper._sender_match_kind(
+                        chat, sender_name, sender_id
+                    )
+                    _, _, record_time = PlatformLTMHelper._parse_chat_record_identity(
+                        chat
+                    )
                     # 检查是否是当前消息
-                    is_match = f"[{sender_name}/{msg_timestamp}]" in chat[:50]
-                    if not is_match:
-                        match = re.match(
-                            rf"^\[{re.escape(sender_name)}/(\d{{2}}:\d{{2}}:\d{{2}})\]",
-                            chat,
-                        )
-                        if match:
-                            record_time = match.group(1)
-                            is_match = PlatformLTMHelper._timestamps_close(
+                    is_match = bool(
+                        match_kind
+                        and record_time
+                        and (
+                            record_time == msg_timestamp
+                            or PlatformLTMHelper._timestamps_close(
                                 msg_timestamp, record_time, tolerance=1
                             )
+                        )
+                    )
 
                     if is_match:
                         # 🔧 修复多图片场景：检查是否有未处理的图片
@@ -677,7 +819,9 @@ class PlatformLTMHelper:
             last_chat = session_chats[-1]
 
             # 检查是否是当前发送者
-            if f"[{sender_name}" not in last_chat[:50]:
+            if not PlatformLTMHelper._sender_match_kind(
+                last_chat, sender_name, sender_id
+            ):
                 return False
 
             # 🔧 修复多图片场景：检查是否有未处理的图片
@@ -773,6 +917,7 @@ class PlatformLTMHelper:
         sender_name: str,
         original_text: str,
         msg_timestamp: Optional[str] = None,
+        sender_id: str = "",
     ) -> bool:
         """
         验证聊天记录是否匹配当前消息
@@ -794,18 +939,20 @@ class PlatformLTMHelper:
             if not sender_name:
                 return False
 
+            if not PlatformLTMHelper._sender_match_kind(
+                chat_record, sender_name, sender_id
+            ):
+                return False
+
             # 🔧 如果有时间戳，优先使用精确匹配
             if msg_timestamp:
-                expected_prefix = f"[{sender_name}/{msg_timestamp}]"
-                if chat_record.startswith(expected_prefix):
+                _, _, record_time = PlatformLTMHelper._parse_chat_record_identity(
+                    chat_record
+                )
+                if record_time == msg_timestamp:
                     return True
                 # 宽松匹配：允许1秒误差
-                match = re.match(
-                    rf"^\[{re.escape(sender_name)}/(\d{{2}}:\d{{2}}:\d{{2}})\]",
-                    chat_record,
-                )
-                if match:
-                    record_time = match.group(1)
+                if record_time:
                     if PlatformLTMHelper._timestamps_close(
                         msg_timestamp, record_time, tolerance=1
                     ):
@@ -814,11 +961,11 @@ class PlatformLTMHelper:
 
             # 没有时间戳，使用原有的宽松匹配逻辑
             # 使用正则匹配格式 [昵称/时间]:
-            pattern = rf"^\[{re.escape(sender_name)}/\d{{2}}:\d{{2}}:\d{{2}}\]:\s*"
-            if not re.match(pattern, chat_record):
-                # 尝试更宽松的匹配（昵称可能被截断或有特殊字符）
-                if f"[{sender_name}" not in chat_record[:50]:
-                    return False
+            _, _, record_time = PlatformLTMHelper._parse_chat_record_identity(
+                chat_record
+            )
+            if not record_time:
+                return False
 
             # 如果原始文本不为空，进一步验证内容
             if original_text and len(original_text) > 3:
