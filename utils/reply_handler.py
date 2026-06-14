@@ -42,6 +42,8 @@ PLUGIN_FUNC_TOOL = "_group_chat_plus_func_tool"
 PLUGIN_CURRENT_MESSAGE = "_group_chat_plus_current_message"
 # 🔧 存储已注入提示词的工具名，用于与执行器工具表做一致性检查
 PLUGIN_VISIBLE_TOOL_NAMES = "_group_chat_plus_visible_tool_names"
+# 🔧 存储本次工具放行前的原始插件范围，用于 LLM 请求钩子结束后还原
+PLUGIN_ORIGINAL_PLUGINS_NAME = "_group_chat_plus_original_plugins_name"
 # 🔧 存储空回复兜底所需的最终提示词信息
 PLUGIN_FALLBACK_PAYLOAD = "_group_chat_plus_fallback_payload"
 # 🔧 存储回复成功后再记账所需的上下文
@@ -50,6 +52,68 @@ PLUGIN_DIRECT_REPLY_MODE = "_group_chat_plus_direct_reply_mode"
 PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED = (
     "_group_chat_plus_main_model_final_gate_declined"
 )
+
+
+def _get_compatible_tools(tool_container):
+    if not tool_container:
+        return []
+    tools = getattr(tool_container, "tools", None)
+    if tools is not None:
+        return list(tools)
+    func_list = getattr(tool_container, "func_list", None)
+    if func_list is not None:
+        return list(func_list)
+    return []
+
+
+def _resolve_tool_owner_plugin_names(tool_container) -> list[str]:
+    try:
+        from astrbot.core.star.star_manager import star_map
+    except Exception:
+        return []
+
+    plugin_names = []
+    for tool in _get_compatible_tools(tool_container):
+        if getattr(tool, "active", True) is False:
+            continue
+        handler_module_path = str(
+            getattr(tool, "handler_module_path", "") or ""
+        ).strip()
+        if not handler_module_path:
+            continue
+        plugin = star_map.get(handler_module_path)
+        if not plugin or getattr(plugin, "reserved", False):
+            continue
+        plugin_name = str(getattr(plugin, "name", "") or "").strip()
+        if plugin_name:
+            plugin_names.append(plugin_name)
+
+    return sorted(set(plugin_names))
+
+
+def _expand_event_plugins_name_for_tool_access(event, plugin_tool_set) -> None:
+    owner_plugin_names = _resolve_tool_owner_plugin_names(plugin_tool_set)
+    if not owner_plugin_names:
+        return
+
+    original_plugins_name = getattr(event, "plugins_name", None)
+    if original_plugins_name is None or original_plugins_name == ["*"]:
+        return
+
+    original_list = list(original_plugins_name)
+    merged_plugins_name = list(dict.fromkeys(original_list + owner_plugin_names))
+    if merged_plugins_name == original_list:
+        return
+
+    event.set_extra(PLUGIN_ORIGINAL_PLUGINS_NAME, original_list)
+    event.plugins_name = merged_plugins_name
+    added_plugins = [
+        name for name in owner_plugin_names if name not in set(original_list)
+    ]
+    logger.info(
+        "[平台工具模式] 已扩展本次工具调用插件范围: +%s",
+        added_plugins[:20],
+    )
 
 
 class ReplyHandler:
@@ -485,6 +549,7 @@ class ReplyHandler:
             event.set_extra(PLUGIN_CUSTOM_PROMPT, full_prompt)
             event.set_extra(PLUGIN_IMAGE_URLS, image_urls)
             event.set_extra(PLUGIN_FUNC_TOOL, plugin_tool_set)
+            _expand_event_plugins_name_for_tool_access(event, plugin_tool_set)
             event.set_extra(
                 PLUGIN_FALLBACK_PAYLOAD,
                 {

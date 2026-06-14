@@ -39,6 +39,19 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         )
         self.assertIn("TOOL_CALL_PROMPT", self.main_source)
 
+    def test_formal_reply_expands_plugin_scope_for_tool_owner_filter(self):
+        self.assertIn("PLUGIN_ORIGINAL_PLUGINS_NAME", self.reply_source)
+        self.assertIn(
+            "_expand_event_plugins_name_for_tool_access(event, plugin_tool_set)",
+            self.reply_source,
+        )
+        self.assertIn("handler_module_path", self.reply_source)
+        self.assertIn("star_map", self.reply_source)
+
+    def test_on_llm_request_restores_original_plugin_scope(self):
+        self.assertIn("PLUGIN_ORIGINAL_PLUGINS_NAME", self.main_source)
+        self.assertIn("event.plugins_name = original_plugins_name", self.main_source)
+
     def test_judgment_ai_keeps_tools_disabled(self):
         self.assertIn("func_tool=None", self.decision_source)
         self.assertIn("gate_req = ProviderRequest(", self.reply_source)

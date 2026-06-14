@@ -8912,6 +8912,7 @@ class ChatPlus(Star):
             PLUGIN_FUNC_TOOL,
             PLUGIN_CURRENT_MESSAGE,
             PLUGIN_VISIBLE_TOOL_NAMES,
+            PLUGIN_ORIGINAL_PLUGINS_NAME,
         )
 
         # 检查是否是来自本插件的请求
@@ -9086,6 +9087,14 @@ class ChatPlus(Star):
         # 背景：平台在网络异常等特殊情况下可能复用event对象，如果不清理extra字段，
         # 可能导致后续请求读取到错误的上下文数据，从而出现AI答非所问的问题
         try:
+            original_plugins_name = event.get_extra(PLUGIN_ORIGINAL_PLUGINS_NAME, None)
+            if original_plugins_name is not None:
+                event.plugins_name = original_plugins_name
+                if self.debug_mode:
+                    logger.info(
+                        "[平台工具模式] 已还原本次请求前的插件范围: %s",
+                        original_plugins_name,
+                    )
             event.set_extra(PLUGIN_REQUEST_MARKER, None)
             event.set_extra(PLUGIN_CUSTOM_CONTEXTS, None)
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, None)
@@ -9094,6 +9103,7 @@ class ChatPlus(Star):
             event.set_extra(PLUGIN_FUNC_TOOL, None)
             event.set_extra(PLUGIN_CURRENT_MESSAGE, None)
             event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
+            event.set_extra(PLUGIN_ORIGINAL_PLUGINS_NAME, None)
             # 简化日志：非debug模式下也显示，方便监控安全机制
             logger.info("[安全] 已清理LLM请求上下文缓存")
         except Exception as e:
