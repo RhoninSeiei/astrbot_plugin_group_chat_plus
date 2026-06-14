@@ -85,6 +85,40 @@ class MemoryIdentityHardeningTest(unittest.TestCase):
         self.assertIn("仅昵称来源", injected)
 
 
+    def test_livingmemory_metadata_supports_compat_shapes(self):
+        module = _load_module("memory_injector_identity_compat_test", "utils/memory_injector.py")
+        mem = types.SimpleNamespace(
+            content="\u517c\u5bb9\u7ed3\u6784\u8bb0\u5fc6",
+            metadata={
+                "sender": {"sender_id": "2002", "sender_name": "Eve"},
+                "participants": {
+                    "lead": {"user_id": "3003", "display_name": "Mallory"},
+                    "guest": "Oscar",
+                },
+                "members": [{"qq": "4004", "name": "Trudy"}],
+            },
+        )
+
+        text = module.MemoryInjector._format_livingmemory_memory(mem, 1)
+
+        self.assertIn("Eve(ID:2002)", text)
+        self.assertIn("Mallory(ID:3003)", text)
+        self.assertIn("Oscar(\u4ec5\u6635\u79f0\u6765\u6e90\uff0c\u8eab\u4efd\u672a\u786e\u8ba4)", text)
+        self.assertIn("Trudy(ID:4004)", text)
+
+    def test_livingmemory_metadata_missing_structure_marks_weak_reference(self):
+        module = _load_module("memory_injector_identity_empty_meta_test", "utils/memory_injector.py")
+        mem = types.SimpleNamespace(content="\u65e7\u8bb0\u5fc6", metadata=None)
+
+        text = module.MemoryInjector._format_livingmemory_memory(mem, 1)
+
+        self.assertIn(
+            "\u8be5\u8bb0\u5fc6\u672a\u63d0\u4f9b\u7ed3\u6784\u5316\u8eab\u4efd\u5b57\u6bb5",
+            text,
+        )
+        self.assertIn("\u4ec5\u80fd\u6309\u6b63\u6587\u5f31\u53c2\u8003", text)
+
+
 class PlatformLTMIdentityHardeningTest(unittest.TestCase):
     def test_sender_id_disambiguates_same_nickname_records(self):
         module = _load_module("platform_ltm_identity_test", "utils/platform_ltm_helper.py")
@@ -132,6 +166,48 @@ class PlatformLTMIdentityHardeningTest(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual("这张图 [图片内容: 当前图片描述]", text)
+
+
+    def test_should_wait_for_platform_ignores_same_nickname_other_sender_id(self):
+        module = _load_module("platform_ltm_wait_identity_test", "utils/platform_ltm_helper.py")
+        ltm = types.SimpleNamespace(
+            session_chats={
+                "aiocqhttp:GroupMessage:851926461": [
+                    "[Alice(ID:2002)/12:00:00]: [Image]",
+                ]
+            }
+        )
+
+        should_wait = module.PlatformLTMHelper._should_wait_for_platform(
+            ltm,
+            "aiocqhttp:GroupMessage:851926461",
+            "Alice",
+            "[\u56fe\u7247]",
+            "12:00:00",
+            sender_id="1001",
+        )
+
+        self.assertTrue(should_wait)
+
+    def test_check_platform_failed_ignores_same_nickname_other_sender_id(self):
+        module = _load_module("platform_ltm_failed_identity_test", "utils/platform_ltm_helper.py")
+        ltm = types.SimpleNamespace(
+            session_chats={
+                "aiocqhttp:GroupMessage:851926461": [
+                    "[Alice(ID:2002)/12:00:00]: [Image]",
+                ]
+            }
+        )
+
+        failed = module.PlatformLTMHelper._check_platform_failed(
+            ltm,
+            "aiocqhttp:GroupMessage:851926461",
+            "Alice",
+            "12:00:00",
+            sender_id="1001",
+        )
+
+        self.assertFalse(failed)
 
 
 if __name__ == "__main__":

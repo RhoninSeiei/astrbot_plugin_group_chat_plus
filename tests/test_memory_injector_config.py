@@ -123,5 +123,49 @@ class MemoryInjectorConfigTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_livingmemory_search_uses_session_and_persona_only_in_query_params(self):
+        module = _load_memory_injector()
+
+        class MemoryEngine:
+            def __init__(self):
+                self.kwargs = None
+
+            async def search_memories(self, **kwargs):
+                self.kwargs = kwargs
+                return [types.SimpleNamespace(content="\u547d\u4e2d\u8bb0\u5fc6", metadata={})]
+
+        memory_engine = MemoryEngine()
+        plugin = types.SimpleNamespace(
+            _initialization_complete=True,
+            memory_engine=memory_engine,
+        )
+        star = types.SimpleNamespace(activated=True, star_cls=plugin)
+        context = _Context(star=star)
+        event = types.SimpleNamespace(
+            unified_msg_origin="aiocqhttp:GroupMessage:851926461",
+            message_str="\u73b0\u5728\u5728\u8bf4\u8c01\uff1f",
+            get_platform_name=lambda: "aiocqhttp",
+        )
+
+        result = await module.MemoryInjector.get_memories(
+            context,
+            event,
+            mode="livingmemory",
+            top_k=3,
+            version="v1",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            memory_engine.kwargs,
+            {
+                "query": "\u73b0\u5728\u5728\u8bf4\u8c01\uff1f",
+                "k": 3,
+                "session_id": "aiocqhttp:GroupMessage:851926461",
+                "persona_id": None,
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

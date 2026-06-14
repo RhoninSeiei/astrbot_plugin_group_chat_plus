@@ -134,6 +134,61 @@ class MultimodalHistoryContentTest(unittest.TestCase):
         self.assertIn("群友A(ID:10001):", formatted)
         self.assertIn("当前消息", formatted)
 
+    def test_format_context_for_ai_marks_bot_history_reply_with_id(self):
+        msg = self.AstrBotMessage()
+        msg.message_str = "\u4e4b\u524d\u7684\u56de\u590d"
+        msg.sender = self.MessageMember(
+            user_id="bot-001",
+            nickname="\u963f\u7eb3\u6d77\u59c6",
+        )
+        msg.timestamp = 1713418380
+
+        formatted = asyncio.run(
+            self.ContextManager.format_context_for_ai(
+                [msg],
+                "\u5f53\u524d\u6d88\u606f",
+                "bot-001",
+                include_timestamp=False,
+                include_sender_info=True,
+            )
+        )
+
+        self.assertIn(
+            "\u3010\u7981\u6b62\u91cd\u590d-\u4f60\u7684\u5386\u53f2\u56de\u590d\u3011\u963f\u7eb3\u6d77\u59c6(ID:bot-001):",
+            formatted,
+        )
+        self.assertIn("\u4e4b\u524d\u7684\u56de\u590d", formatted)
+
+    def test_format_context_for_ai_falls_back_to_unknown_sender_and_formats_window_buffer(self):
+        msg = self.AstrBotMessage()
+        msg.message_str = "\u672a\u643a\u5e26id\u7684\u5386\u53f2\u6d88\u606f"
+        msg.sender = self.MessageMember(user_id="", nickname="")
+        msg.timestamp = 1713418380
+
+        formatted = asyncio.run(
+            self.ContextManager.format_context_for_ai(
+                [msg],
+                "\u5f53\u524d\u6d88\u606f",
+                "bot-001",
+                include_timestamp=False,
+                include_sender_info=True,
+                window_buffered_messages=[
+                    {
+                        "sender_name": "\u7fa4\u53cbB",
+                        "sender_id": "20002",
+                        "content": "\u7a97\u53e3\u671f\u8ffd\u52a0\u6d88\u606f",
+                        "timestamp": 1713418390,
+                    }
+                ],
+            )
+        )
+
+        self.assertIn("\u672a\u77e5\u7528\u6237(ID:unknown):", formatted)
+        self.assertIn(
+            "\u7fa4\u53cbB(ID:20002): \u7a97\u53e3\u671f\u8ffd\u52a0\u6d88\u606f",
+            formatted,
+        )
+
     def test_dict_to_message_coerces_list_message_str_to_text(self):
         msg = self.ContextManager._dict_to_message(
             {
