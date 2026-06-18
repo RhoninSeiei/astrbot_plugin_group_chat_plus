@@ -200,6 +200,33 @@ class MultimodalHistoryContentTest(unittest.TestCase):
         self.assertNotIn("The tool has no return value", formatted)
         self.assertNotIn("[SYSTEM NOTICE]", formatted)
 
+    def test_format_context_for_ai_omits_tool_call_protocol_markup(self):
+        bot_msg = self.AstrBotMessage()
+        bot_msg.message_str = (
+            "收到，开始搜索。\n"
+            "<tool_call>\n"
+            "<function=pixiv_search_illust>\n"
+            '{"query":"vtuber"}\n'
+            "</tool_call>"
+        )
+        bot_msg.sender = self.MessageMember(user_id="bot-001", nickname="AstrBot")
+        bot_msg.timestamp = 1713418380
+
+        formatted = asyncio.run(
+            self.ContextManager.format_context_for_ai(
+                [bot_msg],
+                "当前消息",
+                "bot-001",
+                include_timestamp=False,
+                include_sender_info=True,
+            )
+        )
+
+        self.assertIn("收到，开始搜索。", formatted)
+        self.assertNotIn("<tool_call>", formatted)
+        self.assertNotIn("pixiv_search_illust", formatted)
+        self.assertNotIn('"query"', formatted)
+
     def test_format_context_for_ai_falls_back_to_unknown_sender_and_formats_window_buffer(self):
         msg = self.AstrBotMessage()
         msg.message_str = "\u672a\u643a\u5e26id\u7684\u5386\u53f2\u6d88\u606f"

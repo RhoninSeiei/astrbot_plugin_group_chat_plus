@@ -25,10 +25,30 @@ _TOOL_CODE_FENCE_RE = re.compile(
     r"```(?:\s*(?:tool_call|json|function))?", re.IGNORECASE
 )
 _FUNCTION_NAME_ONLY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+_TOOL_STATUS_TAG_ONLY_RE = re.compile(r"</?\s*tool_calls?\s*/?>", re.IGNORECASE)
 
 
 def contains_tool_call_markup(text: str) -> bool:
     return bool(_TOOL_CALL_TAG_RE.search(text or ""))
+
+
+def is_tool_status_payload(message_type: str | None, text: str) -> bool:
+    if message_type in {"tool_call", "tool_call_result"}:
+        return True
+
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+
+    lower_text = normalized.lower()
+    if _TOOL_STATUS_TAG_ONLY_RE.fullmatch(lower_text):
+        return True
+
+    tool_prefixes = (
+        "\U0001f528 \u8c03\u7528\u5de5\u5177",
+        "\U0001f527 \u8c03\u7528\u5de5\u5177",
+    )
+    return normalized.startswith(tool_prefixes)
 
 
 def strip_tool_call_markup(text: str) -> str:

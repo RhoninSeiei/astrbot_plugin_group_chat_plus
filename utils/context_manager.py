@@ -74,6 +74,9 @@ class ContextManager:
                 "[SYSTEM NOTICE]",
                 "The tool has no return value",
                 "Tool `",
+                "<tool_call",
+                "<tool_calls",
+                "<function",
             )
         ):
             return text
@@ -88,6 +91,21 @@ class ContextManager:
         cleaned = re.sub(r"(?m)^\s*Tool `[^`]+` Result:.*(?:\n|$)", "", cleaned)
         cleaned = re.sub(
             r"(?m)^\s*The tool has no return value, or has sent the result directly to the user\.\s*(?:\n|$)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?is)(?:^|\n)\s*<\s*tool_calls?\b[^>]*>.*?(?:<\s*/\s*tool_calls?\s*>|$)",
+            "\n",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?im)^\s*.*<\s*/?\s*(?:tool_call|tool_calls|function|parameters?|arguments?|argument|tool)\b.*(?:\n|$)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?m)^\s*[\[{].*[\"']?(?:query|prompt|name|arguments?|parameters?|function)[\"']?\s*:.*[\]}]\s*(?:\n|$)",
             "",
             cleaned,
         )
@@ -2995,8 +3013,24 @@ class ContextManager:
                             role = cached_msg.get("role", "user") or "user"
                             if role not in ("user", "assistant", "system"):
                                 role = "user"
+                            cached_content = cached_msg["content"]
+                            if isinstance(cached_content, str):
+                                cached_content = (
+                                    ContextManager.strip_tool_call_record_blocks(
+                                        cached_content
+                                    )
+                                )
+                                if (
+                                    not cached_content
+                                    and not cached_msg.get("image_urls", [])
+                                ):
+                                    skipped_count += 1
+                                    logger.info(
+                                        "[工具调用记录清理] 缓存消息仅包含工具审计文本，跳过转正"
+                                    )
+                                    continue
                             hashable_content = make_content_hashable(
-                                cached_msg["content"]
+                                cached_content
                             )
                             if hashable_content not in existing_contents:
                                 # 🔧 修复：支持多模态消息格式（包含图片URL）
@@ -3009,11 +3043,11 @@ class ContextManager:
                                     multimodal_content = []
 
                                     # 添加文本部分
-                                    if cached_msg["content"]:
+                                    if cached_content:
                                         multimodal_content.append(
                                             {
                                                 "type": "text",
-                                                "text": cached_msg["content"],
+                                                "text": cached_content,
                                             }
                                         )
 
@@ -3044,7 +3078,7 @@ class ContextManager:
                                     history_list.append(
                                         {
                                             "role": role,
-                                            "content": cached_msg["content"],
+                                            "content": cached_content,
                                         }
                                     )
 
@@ -3063,7 +3097,11 @@ class ContextManager:
                             history_list.append(
                                 {
                                     "role": cached_msg.get("role", "user") or "user",
-                                    "content": cached_msg["content"],
+                                    "content": ContextManager.strip_tool_call_record_blocks(
+                                        cached_msg["content"]
+                                    )
+                                    if isinstance(cached_msg["content"], str)
+                                    else cached_msg["content"],
                                 }
                             )
                             added_count += 1
@@ -3134,13 +3172,7 @@ class ContextManager:
 
             if success:
                 # 计算实际转正的缓存数量
-                cache_converted = len(
-                    [
-                        m
-                        for m in cached_messages
-                        if isinstance(m, dict) and "content" in m
-                    ]
-                )
+                cache_converted = added_count
 
                 logger.info(f"=" * 60)
                 logger.info(f"✅✅✅ [官方保存+缓存转正] 保存成功！")

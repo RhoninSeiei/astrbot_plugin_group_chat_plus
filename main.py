@@ -157,7 +157,10 @@ from .utils.step_image_service import (
     StepImageUserError,
 )
 from .utils.system_prompt_rewriter import SystemPromptRewriter
-from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
+from .utils.tool_call_leakage_guard import (
+    is_tool_status_payload,
+    sanitize_tool_call_markup,
+)
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
@@ -236,6 +239,51 @@ class ChatPlus(Star):
                 key,
                 exc,
             )
+
+    @staticmethod
+    def _message_chain_text(message) -> str:
+        try:
+            if hasattr(message, "get_plain_text"):
+                return message.get_plain_text(with_other_comps_mark=True).strip()
+        except Exception:
+            return ""
+        try:
+            chain = getattr(message, "chain", None) or []
+            return "".join(
+                str(getattr(comp, "text", "")) for comp in chain if hasattr(comp, "text")
+            ).strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _is_tool_status_message_chain(cls, message) -> bool:
+        return is_tool_status_payload(
+            getattr(message, "type", None),
+            cls._message_chain_text(message),
+        )
+
+    def _install_tool_status_send_filter(self, event: AstrMessageEvent):
+        original_send = getattr(event, "send", None)
+        if not original_send:
+            return None
+
+        async def filtered_send(message, *args, **kwargs):
+            if self._is_tool_status_message_chain(message):
+                logger.info(
+                    "[工具状态消息] 已拦截平台工具状态发送 type=%s text=%s",
+                    getattr(message, "type", None) or "",
+                    self._message_chain_text(message)[:120],
+                )
+                return None
+            return await original_send(message, *args, **kwargs)
+
+        setattr(event, "send", filtered_send)
+
+        def restore_tool_status_send_filter():
+            if getattr(event, "send", None) is filtered_send:
+                setattr(event, "send", original_send)
+
+        return restore_tool_status_send_filter
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """
@@ -2918,6 +2966,7 @@ class ChatPlus(Star):
         """
         # 🔧 用于 finally 安全清理，防止 processing_sessions 泄漏导致后续消息卡住
         _cleanup_message_id = None
+        _restore_tool_status_send_filter = None
         try:
             # 🔘 检查群聊功能总开关
             if not self.enable_group_chat or event.is_private_chat():
@@ -2928,6 +2977,10 @@ class ChatPlus(Star):
                     logger.info("[真空消息过滤] 群聊消息没有可处理内容，跳过处理")
                 event.call_llm = True
                 return
+
+            _restore_tool_status_send_filter = self._install_tool_status_send_filter(
+                event
+            )
 
             self._check_compliance_status()
 
@@ -3072,6 +3125,12 @@ class ChatPlus(Star):
         except Exception as e:
             logger.error(f"处理群消息时发生错误: {e}", exc_info=True)
         finally:
+            if _restore_tool_status_send_filter:
+                try:
+                    _restore_tool_status_send_filter()
+                except Exception:
+                    pass
+
             # 🔧 安全网：确保 processing_sessions 条目不会泄漏
             # 当 after_message_sent 未被框架调用时（如 on_decorating_result 清空了 result，
             # 或 _generate_and_send_reply 未 yield 就提前返回，或管线中途异常），

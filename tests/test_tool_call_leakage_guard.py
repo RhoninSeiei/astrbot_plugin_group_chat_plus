@@ -11,6 +11,7 @@ _spec = importlib.util.spec_from_file_location(
 )
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
+is_tool_status_payload = _module.is_tool_status_payload
 sanitize_tool_call_markup = _module.sanitize_tool_call_markup
 
 
@@ -49,6 +50,13 @@ class ToolCallLeakageGuardTest(unittest.TestCase):
         self.assertFalse(result.should_block)
         self.assertEqual("搜不了，自个翻Pixiv去。", result.sanitized_text)
 
+    def test_detects_platform_tool_status_payloads(self):
+        self.assertTrue(is_tool_status_payload("tool_call", ""))
+        self.assertTrue(is_tool_status_payload("tool_call_result", ""))
+        self.assertTrue(is_tool_status_payload(None, "<tool_calls>"))
+        self.assertTrue(is_tool_status_payload(None, "\U0001f528 \u8c03\u7528\u5de5\u5177 pixiv_search"))
+        self.assertFalse(is_tool_status_payload(None, "正在搜索 pixiv 图片"))
+
 
 class ToolCallLeakageIntegrationSourceTest(unittest.TestCase):
     def setUp(self):
@@ -82,6 +90,19 @@ class ToolCallLeakageIntegrationSourceTest(unittest.TestCase):
         self.assertIn(
             "bot_message = ContextManager.strip_tool_call_record_blocks(",
             self.context_source,
+        )
+        self.assertIn(
+            "cached_content = cached_msg[\"content\"]",
+            self.context_source,
+        )
+        self.assertIn("strip_tool_call_record_blocks", self.context_source)
+
+    def test_platform_tool_status_send_filter_is_installed_for_group_flow(self):
+        self.assertIn("def _install_tool_status_send_filter", self.main_source)
+        self.assertIn("is_tool_status_payload(", self.main_source)
+        self.assertIn(
+            "_restore_tool_status_send_filter = self._install_tool_status_send_filter(",
+            self.main_source,
         )
 
 
