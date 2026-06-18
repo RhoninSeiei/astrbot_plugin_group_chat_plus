@@ -62,6 +62,39 @@ class ContextManager:
     _cutoff_file_path: Optional[Path] = None
 
     @staticmethod
+    def strip_tool_call_record_blocks(text: str) -> str:
+        """移除内部工具调用审计文本，避免作为自然回复暴露给模型。"""
+        if not isinstance(text, str):
+            return text
+        if not any(
+            marker in text
+            for marker in (
+                "[工具调用记录]",
+                "[工具调用]",
+                "[SYSTEM NOTICE]",
+                "The tool has no return value",
+                "Tool `",
+            )
+        ):
+            return text
+
+        cleaned = re.sub(
+            r"(?s)(?:^|\n)\s*\[工具调用记录\].*?(?:\[工具调用结束\](?:\n|$)|$)",
+            "\n",
+            text,
+        )
+        cleaned = re.sub(r"(?m)^\s*\[SYSTEM NOTICE\].*(?:\n|$)", "", cleaned)
+        cleaned = re.sub(r"(?m)^\s*\[工具调用\][^\n]*(?:\n|$)", "", cleaned)
+        cleaned = re.sub(r"(?m)^\s*Tool `[^`]+` Result:.*(?:\n|$)", "", cleaned)
+        cleaned = re.sub(
+            r"(?m)^\s*The tool has no return value, or has sent the result directly to the user\.\s*(?:\n|$)",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
     def init(data_dir: Optional[str] = None, custom_storage_max_messages: int = 500):
         """
         初始化上下文管理器，创建存储目录
@@ -1436,6 +1469,12 @@ class ContextManager:
                             if isinstance(comp, Plain):
                                 message_content += comp.text
 
+                    message_content = ContextManager.strip_tool_call_record_blocks(
+                        message_content
+                    )
+                    if not message_content.strip():
+                        continue
+
                     # 格式化消息（根据配置决定格式）
                     # 构建消息前缀部分
                     prefix_parts = []
@@ -1520,6 +1559,11 @@ class ContextManager:
                         wb_content = ContextManager.normalize_message_content(
                             wb_msg.get("content", "")
                         )
+                        wb_content = ContextManager.strip_tool_call_record_blocks(
+                            wb_content
+                        )
+                        if not wb_content.strip():
+                            continue
 
                         # 时间格式化（与历史消息保持一致）
                         wb_time_str = ""
@@ -1950,6 +1994,13 @@ class ContextManager:
                 if DEBUG_MODE:
                     logger.info("⚠️ [AI回复保存] 检测到系统提示残留，已二次清理")
 
+            cleaned_message = ContextManager.strip_tool_call_record_blocks(
+                cleaned_message
+            )
+            if not cleaned_message:
+                logger.info("[工具调用记录清理] AI回复仅包含工具审计文本，跳过AI消息保存")
+                return True
+
             # 获取平台和聊天信息
             platform_name = event.get_platform_name()
             is_private = event.is_private_chat()
@@ -2080,7 +2131,7 @@ class ContextManager:
                     if not message_chain_dict:
                         # 如果没有消息链，创建纯文本消息
                         message_chain_dict = [
-                            {"type": "text", "data": {"text": bot_message_text}}
+                            {"type": "text", "data": {"text": cleaned_message}}
                         ]
 
                     # 调用官方历史管理器保存
@@ -2166,6 +2217,13 @@ class ContextManager:
                 )
                 cleaned_message = cleaned_message.strip()
 
+            cleaned_message = ContextManager.strip_tool_call_record_blocks(
+                cleaned_message
+            )
+            if not cleaned_message:
+                logger.info("[工具调用记录清理] 主动AI回复仅包含工具审计文本，跳过AI消息保存")
+                return True
+
             if not chat_id:
                 logger.warning("无法获取聊天ID,跳过消息保存")
                 return False
@@ -2231,7 +2289,7 @@ class ContextManager:
                 try:
                     # 构造消息链字典（与 save_bot_message 保持一致）
                     message_chain_dict = [
-                        {"type": "text", "data": {"text": bot_message_text}}
+                        {"type": "text", "data": {"text": cleaned_message}}
                     ]
 
                     # 调用官方历史管理器保存
@@ -2764,6 +2822,14 @@ class ContextManager:
             if bot_message is not None:
                 cleaned_bot = MessageCleaner.clean_message(bot_message)
                 bot_message = cleaned_bot or bot_message
+                bot_message = ContextManager.strip_tool_call_record_blocks(
+                    bot_message
+                )
+                if not bot_message:
+                    logger.info(
+                        "[工具调用记录清理] AI回复仅包含工具审计文本，本次不写入官方会话"
+                    )
+                    bot_message = None
 
             # 清理缓存消息
             if cached_messages:

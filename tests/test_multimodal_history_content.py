@@ -159,6 +159,47 @@ class MultimodalHistoryContentTest(unittest.TestCase):
         )
         self.assertIn("\u4e4b\u524d\u7684\u56de\u590d", formatted)
 
+    def test_format_context_for_ai_omits_tool_call_record_blocks(self):
+        bot_msg = self.AstrBotMessage()
+        bot_msg.message_str = (
+            "正在用阶跃星辰 Step Image Edit 2 生成图片，稍等一下。\n"
+            "[工具调用记录]\n"
+            '- gcp_step_image_generate({"prompt": "水彩少女"}) '
+            "→ The tool has no return value, or has sent the result directly to the user.\n"
+            "[SYSTEM NOTICE] User sent follow-up messages while tool execution was in progress.\n"
+            "[工具调用结束]\n"
+            "收到，把细节加进提示词重新生成。"
+        )
+        bot_msg.sender = self.MessageMember(user_id="bot-001", nickname="AstrBot")
+        bot_msg.timestamp = 1713418380
+
+        tool_only_msg = self.AstrBotMessage()
+        tool_only_msg.message_str = (
+            "[工具调用记录]\n"
+            '- gcp_step_image_edit({"prompt": "线稿"}) → (无返回)\n'
+            "[工具调用结束]"
+        )
+        tool_only_msg.sender = self.MessageMember(user_id="bot-001", nickname="AstrBot")
+        tool_only_msg.timestamp = 1713418390
+
+        formatted = asyncio.run(
+            self.ContextManager.format_context_for_ai(
+                [bot_msg, tool_only_msg],
+                "当前消息",
+                "bot-001",
+                include_timestamp=False,
+                include_sender_info=True,
+            )
+        )
+
+        self.assertIn("正在用阶跃星辰 Step Image Edit 2 生成图片", formatted)
+        self.assertIn("收到，把细节加进提示词重新生成。", formatted)
+        self.assertNotIn("[工具调用记录]", formatted)
+        self.assertNotIn("gcp_step_image_generate", formatted)
+        self.assertNotIn("gcp_step_image_edit", formatted)
+        self.assertNotIn("The tool has no return value", formatted)
+        self.assertNotIn("[SYSTEM NOTICE]", formatted)
+
     def test_format_context_for_ai_falls_back_to_unknown_sender_and_formats_window_buffer(self):
         msg = self.AstrBotMessage()
         msg.message_str = "\u672a\u643a\u5e26id\u7684\u5386\u53f2\u6d88\u606f"

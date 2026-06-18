@@ -53,6 +53,9 @@ class ToolCallLeakageGuardTest(unittest.TestCase):
 class ToolCallLeakageIntegrationSourceTest(unittest.TestCase):
     def setUp(self):
         self.main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        self.context_source = (REPO_ROOT / "utils" / "context_manager.py").read_text(
+            encoding="utf-8"
+        )
 
     def test_decorating_stage_filters_tool_markup_before_saving(self):
         guard_pos = self.main_source.index("sanitize_tool_call_markup(reply_text)")
@@ -69,6 +72,17 @@ class ToolCallLeakageIntegrationSourceTest(unittest.TestCase):
         self.assertIn("_get_tool_name_set", self.main_source)
         self.assertIn("_log_tool_visibility_delta", self.main_source)
         self.assertIn("提示工具与执行工具不一致", self.main_source)
+
+    def test_tool_call_records_are_sanitized_before_history_exposure(self):
+        self.assertIn("def strip_tool_call_record_blocks", self.context_source)
+        self.assertIn(
+            "message_content = ContextManager.strip_tool_call_record_blocks(",
+            self.context_source,
+        )
+        self.assertIn(
+            "bot_message = ContextManager.strip_tool_call_record_blocks(",
+            self.context_source,
+        )
 
 
 if __name__ == "__main__":
