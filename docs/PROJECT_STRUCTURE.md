@@ -24,7 +24,7 @@ astrbot_plugin_group_chat_plus/
 │   ├── CONFIG_REFERENCE.md     # 配置项完整参考
 │   └── PROJECT_STRUCTURE.md    # 本文件
 │
-├── web/                        # 🖥️ Web 管理面板
+├── web/                        # 遗留管理面板代码（当前运行入口不加载）
 │   ├── __init__.py
 │   ├── server.py               # HTTP 服务器（路由/中间件/API）
 │   ├── auth.py                 # 认证模块（密码/JWT）
@@ -86,7 +86,7 @@ astrbot_plugin_group_chat_plus/
 │   ├── reply_density_manager.py# 回复密度限制
 │   └── _session_guard.py       # 会话安全守卫
 │
-└── private_chat/               # ⚠️ 私聊模块（开发测试中，非正式版本）
+└── private_chat/               # 遗留私聊模块（当前运行入口不加载）
     ├── __init__.py
     ├── private_chat_main.py    # 私聊主处理器
     └── private_chat_utils/     # 私聊工具模块
@@ -111,15 +111,14 @@ astrbot_plugin_group_chat_plus/
   - `on_llm_request()` — LLM 请求钩子（优先级 -1），负责上下文注入和历史处理
   - `after_message_sent()` — 消息发送后的统计和状态更新
 - **主动对话** — 定时任务，独立于消息流程运行
-- **Web 面板启动** — 初始化 Web 服务器
 
 ### metadata.yaml — 插件元数据
 
-定义插件名称、版本号（v1.2.1）、作者、描述、AstrBot 最低版本要求等。AstrBot 平台通过此文件识别和管理插件。
+定义插件名称、版本号（v1.2.1-rhonin.1）、作者、描述、AstrBot 版本要求与支持平台等。AstrBot 平台通过此文件识别和管理插件。
 
 ### _conf_schema.json — 配置定义
 
-约 94KB 的 JSON Schema 文件，定义了 100+ 个配置项的：
+JSON Schema 文件定义了群聊运行相关配置项的：
 - 字段名与数据类型
 - 默认值
 - 描述文本（显示在 AstrBot 配置面板中）
@@ -131,13 +130,11 @@ astrbot_plugin_group_chat_plus/
 pypinyin    # 拼音处理，用于打字错误生成器
 ```
 
-> `aiohttp` 为 AstrBot 平台自带依赖，通常无需手动安装。
-
 ---
 
-## web/ — Web 管理面板
+## web/ — 遗留管理面板代码
 
-> v1.2.1 新增的完整 Web 管理界面。
+> 当前自用版已从 `main.py` 移除管理面板启动与停止逻辑，该目录仅作为历史实现参考保留。
 
 ### server.py — HTTP 服务器
 
@@ -258,13 +255,13 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 
 ---
 
-## private_chat/ — 私聊模块
+## private_chat/ — 遗留私聊模块
 
-> **⚠️ 开发测试阶段，非正式版本。私聊部分的文件目前处于开发中，代码结构可能不稳定，内容可能混乱，请勿参考其实现细节。**
+> 当前自用版已从 `main.py` 移除私聊事件入口、私聊指令过滤与私聊处理器初始化，该目录仅作为历史实现参考保留。
 
 ### 概述
 
-私聊模块是群聊功能的简化版本，主要区别：
+历史私聊模块是群聊功能的简化版本，主要区别：
 - **无概率筛选** — 私聊总是回复（不做"读空气"判断）
 - **消息聚合** — 支持等待并批量合并多条消息
 - **简化架构** — 较少的功能模块和配置项
@@ -308,8 +305,6 @@ private_chat/
 | 文件 | 说明 |
 |------|------|
 | `history_cutoff.json` | 历史截止时间戳，记录 `gcp_reset` 执行时间 |
-| `bans.json` | IP 封禁记录持久化（Web 面板） |
-| `web_panel_password.json` | Web 面板密码哈希存储 |
 
 ---
 
@@ -320,16 +315,8 @@ private_chat/
                      (插件主入口)
                     ┌──────┼──────┐
                     ↓      ↓      ↓
-               web/    utils/   private_chat/
-            (管理面板) (群聊工具)  (私聊模块 ⚠️)
-                    ↓
-        ┌───────────┼───────────┐
-        ↓           ↓           ↓
-    server.py    auth.py    security.py
-    (路由/API)   (认证)     (安全防护)
-        ↓
-    templates/ + static/
-    (前端页面 + 资源)
+               main.py  utils/   legacy dirs
+            (群聊入口) (群聊工具) (web 与 private_chat 仅保留历史代码)
 ```
 
 ```

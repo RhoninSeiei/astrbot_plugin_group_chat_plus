@@ -9,7 +9,6 @@
 ## 目录
 
 - [基础设置](#基础设置)
-- [Web 管理面板](#web-管理面板)
 - [概率与决策系统](#概率与决策系统)
 - [消息格式与上下文](#消息格式与上下文)
 - [消息缓存](#消息缓存)
@@ -43,7 +42,6 @@
 - [内容过滤](#内容过滤)
 - [回复生成](#回复生成)
 - [历史管理指令](#历史管理指令)
-- [私聊功能（开发中）](#私聊功能开发中)
 
 ---
 
@@ -54,54 +52,6 @@
 | `enable_group_chat` | bool | `true` | **总开关**，关闭后插件完全不处理群聊消息 |
 | `enabled_groups` | list | `[]` | 启用的群组ID列表。留空 = 所有群聊都启用；填写群号 = 仅指定群组启用 |
 | `enable_debug_log` | bool | `false` | 开启后输出详细调试日志，用于排查问题 |
-
----
-
-## Web 管理面板
-
-> v1.2.1 新增，提供可视化管理界面。
-
-### 基础配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enable_web_panel` | bool | `false` | 启用 Web 管理面板 HTTP 服务 |
-| `web_panel_port` | int | `1451` | Web 面板端口号 |
-| `web_panel_host` | string | `"0.0.0.0"` | 监听地址。`0.0.0.0` = 所有网络接口，`127.0.0.1` = 仅本机访问 |
-
-### 安全配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `web_panel_reset_password` | bool | `false` | 设为 `true` 后重启，密码将重置为随机值并显示在日志中 |
-| `web_panel_trust_proxy` | bool | `false` | 信任反向代理的 `X-Real-IP` / `X-Forwarded-For` 头。仅在使用 Nginx 等反代时开启 |
-| `web_panel_ip_bind_check` | bool | `true` | JWT 绑定登录 IP，防止 Token 被窃取后在其他IP使用 |
-
-### IP 访问控制
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `web_panel_ip_mode` | string | `"disabled"` | IP 访问控制模式：`disabled`（不启用）、`whitelist`（白名单，仅允许列表内IP）、`blacklist`（黑名单，拒绝列表内IP） |
-| `web_panel_ip_list` | list | `[]` | 白名单/黑名单 IP 地址列表 |
-| `web_panel_protected_ips` | list | `[]` | 受保护IP列表，永远不会被封禁（配置文件专属，Web端只读） |
-
-### 防爬虫
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `web_panel_anti_spider` | bool | `false` | 启用防爬虫检测（UA 匹配 + 频率限制 + 扫描路径识别） |
-| `web_panel_anti_spider_rate_limit` | int | `60` | 每分钟请求数阈值，超过则封禁 |
-| `web_panel_anti_spider_ban_duration` | int | `300` | 自动封禁持续时间（秒） |
-
-### 日志管理
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `web_panel_log_auto_clean` | bool | `false` | 自动清理过期访问日志 |
-| `web_panel_log_retention_days` | int | `7` | 日志保留天数 |
-| `web_panel_log_clean_interval_hours` | int | `24` | 清理检查间隔（小时） |
-
----
 
 ## 概率与决策系统
 
@@ -643,18 +593,6 @@
 | `plugin_gcp_reset_allowed_user_ids` | list | `[]` | 允许使用 `gcp_reset`（清除所有群历史）的用户ID列表 |
 | `plugin_gcp_reset_here_allowed_user_ids` | list | `[]` | 允许使用 `gcp_reset_here`（清除当前群历史）的用户ID列表 |
 | `gcp_clear_image_cache_allowed_user_ids` | list | `[]` | 允许清除图片缓存的用户ID列表 |
-
----
-
-## 私聊功能（开发中）
-
-> **⚠️ 警告：私聊功能目前仍在开发测试阶段，请勿启用！当前版本的私聊模块尚未完善，开启可能导致异常行为。**
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enable_private_chat` | bool | `false` | **⚠️ 请保持 false！** 私聊处理总开关 |
-
-私聊模块有独立的 30+ 个配置项（类似群聊的简化版），包含消息聚合、用户过滤、图片处理等功能。待正式发布后将补充完整文档。
 
 ---
 

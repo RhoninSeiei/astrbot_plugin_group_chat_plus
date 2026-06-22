@@ -158,7 +158,6 @@ from .utils.step_image_service import (
 )
 from .utils.system_prompt_rewriter import SystemPromptRewriter
 from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
-from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
     PLUGIN_FALLBACK_PAYLOAD,
@@ -1564,60 +1563,6 @@ class ChatPlus(Star):
         )  # 近似重复最小文本长度（4-50）
         self._duplicate_similarity_recent_limit = 2  # 仅额外检查最近两条近似回复
 
-        # === 私信功能开关 ===
-        self.enable_private_chat = config.get(
-            "enable_private_chat", False
-        )  # 私信功能开关
-
-        # === 私信指令过滤配置（独立于群聊） ===
-        self.private_enable_command_filter = config.get(
-            "private_enable_command_filter", True
-        )  # 私信指令过滤开关
-        self.private_command_prefixes = config.get(
-            "private_command_prefixes", ["/", "!", "#"]
-        )  # 私信指令前缀列表
-        self.private_enable_full_command_detection = config.get(
-            "private_enable_full_command_detection", False
-        )  # 私信完整指令检测开关
-        self.private_full_command_list = config.get(
-            "private_full_command_list", ["new", "help", "reset"]
-        )  # 私信完整指令列表
-        self.private_enable_command_prefix_match = config.get(
-            "private_enable_command_prefix_match", False
-        )  # 私信指令前缀匹配开关
-        self.private_command_prefix_match_list = config.get(
-            "private_command_prefix_match_list", []
-        )  # 私信指令前缀匹配列表
-        self.private_chat_enable_debug_log = config.get(
-            "private_chat_enable_debug_log", False
-        )  # 启用私信处理的详细日志
-
-        # === 私信图片缓存配置（因省钱缓存需要群聊/私信协调，故在 main.py 统一读取） ===
-        # 其他私信图片配置（provider、prompt、timeout等）在 private_chat_main.py 中读取
-        self.private_enable_image_description_cache = config.get(
-            "private_enable_image_description_cache", False
-        )  # 私信图片描述缓存开关（用于缓存协调）
-        self.private_image_description_cache_max_entries = config.get(
-            "private_image_description_cache_max_entries", 500
-        )  # 私信图片描述缓存最大条目数（用于缓存协调）
-
-        # === 私信清除缓存指令名单配置（因 gcp_clear_image_cache 命令处理器位于群聊模块 main.py 中，
-        #     但需同时处理私信来源的指令，故在此处统一读取私信专用的名单配置，
-        #     通过变量传递到命令处理器中使用，避免重复读取） ===
-        self.private_gcp_clear_image_cache_filter_mode = config.get(
-            "private_gcp_clear_image_cache_filter_mode", "blacklist"
-        )  # 私信清除缓存指令名单模式（blacklist/whitelist）
-        self.private_gcp_clear_image_cache_filter_list = config.get(
-            "private_gcp_clear_image_cache_filter_list", []
-        )  # 私信清除缓存指令用户ID名单
-
-        # === Web 配置面板 ===
-        self.enable_web_panel = config.get("enable_web_panel", False)
-        self.web_panel_port = config.get("web_panel_port", 1451)
-        self.web_panel_host = config.get("web_panel_host", "0.0.0.0")
-        self.web_panel_reset_password = config.get("web_panel_reset_password", False)
-        self._web_server = None  # Web 面板服务器实例
-
         # ========== 配置参数集中提取区块结束 ==========
 
         # Dashboard 配置与重启 URL
@@ -1663,45 +1608,17 @@ class ChatPlus(Star):
             str(data_dir), custom_storage_max_messages=self.custom_storage_max_messages
         )
 
-        # 🆕 v1.2.0: 初始化图片描述缓存（群聊+私信共享同一份缓存文件）
-        # 协调逻辑：需同时考虑「处理主开关」和「省钱缓存开关」的组合
-        # - 群聊缓存生效 = 群聊处理开关开 AND 群聊省钱缓存开关开
-        # - 私信缓存生效 = 私信处理开关开 AND 私信省钱缓存开关开
-        # - 两边都生效且 max_entries 不同 → 取中间值
-        # - 只有一边生效 → 以该边的限制为准
-        # - 两边都不生效 → 不启用缓存
+        # 🆕 v1.2.0: 初始化群聊图片描述缓存
         _group_cache_active = (
             self.enable_group_chat and self.enable_image_description_cache
         )
-        _private_cache_active = (
-            self.enable_private_chat and self.private_enable_image_description_cache
-        )
-        _cache_enabled = _group_cache_active or _private_cache_active
+        _cache_enabled = _group_cache_active
 
         if _cache_enabled:
-            _group_max = self.image_description_cache_max_entries
-            _private_max = self.private_image_description_cache_max_entries
-
-            if _group_cache_active and _private_cache_active:
-                # 两边都生效，需要协调
-                if _group_max != _private_max:
-                    _reconciled_max = (_group_max + _private_max) // 2
-                    logger.info(
-                        f"💾 [缓存协调] 群聊({_group_max})和私信({_private_max})"
-                        f"缓存上限不同，取中间值: {_reconciled_max}"
-                    )
-                else:
-                    _reconciled_max = _group_max
-            elif _group_cache_active:
-                # 仅群聊缓存生效，以群聊限制为准
-                _reconciled_max = _group_max
-            else:
-                # 仅私信缓存生效，以私信限制为准
-                _reconciled_max = _private_max
-
+            _reconciled_max = self.image_description_cache_max_entries
             _reconciled_max = max(10, min(_reconciled_max, 10000))  # 硬上限保护
         else:
-            # 两边都不生效，使用默认值（缓存不启用，此值无实际影响）
+            # 群聊缓存未启用时，此值仅作为缓存对象默认上限。
             _reconciled_max = 500
 
         self.image_description_cache = ImageDescriptionCache(
@@ -1710,14 +1627,9 @@ class ChatPlus(Star):
             enabled=_cache_enabled,
         )
         if _cache_enabled:
-            _active_sides = []
-            if _group_cache_active:
-                _active_sides.append("群聊")
-            if _private_cache_active:
-                _active_sides.append("私信")
             stats = self.image_description_cache.get_stats()
             logger.info(
-                f"💾 图片描述缓存已启用（{'和'.join(_active_sides)}生效，共享缓存文件），"
+                "💾 群聊图片描述缓存已启用，"
                 f"当前 {stats['entry_count']} 条，上限 {stats['max_entries']} 条"
             )
 
@@ -1826,23 +1738,6 @@ class ChatPlus(Star):
         # 标记被识别为指令的消息（用于跨处理器通信）
         # 格式: {message_id: timestamp}，定期清理超过10秒的旧记录
         self.command_messages = {}
-
-        # 🆕 私信指令标记（独立于群聊，用于私信跨处理器通信）
-        # 格式: {message_id: timestamp}，定期清理超过10秒的旧记录
-        self.private_command_messages = {}
-
-        # 🆕 初始化私信处理器
-        # 缓存相关由 main.py 协调后传入，其他私信图片配置由 private_chat_main.py 自行读取 config
-        self.private_chat_handler = PrivateChatMain(
-            context=self.context,
-            config=config,
-            plugin_instance=self,
-            data_dir=str(data_dir),
-            private_chat_debug_mode=self.private_chat_enable_debug_log,
-            # 省钱缓存（由 main.py 协调群聊/私信后传入）
-            enable_image_description_cache=self.private_enable_image_description_cache,
-            image_description_cache=self.image_description_cache,
-        )
 
         # 🆕 最近发送的回复缓存（用于去重检查）
         # 格式: {chat_id: [{"content": "回复内容", "timestamp": 时间戳}]}
@@ -2614,27 +2509,6 @@ class ChatPlus(Star):
         elif not self.enable_group_chat and self.proactive_enabled:
             logger.info("⏸️ [主动对话] 群聊功能总开关已关闭，跳过启动主动对话后台任务")
 
-        # 🌐 启动 Web 配置面板
-        if self.enable_web_panel:
-            try:
-                from .web.server import WebPanelServer
-
-                self._web_server = WebPanelServer(
-                    self, host=self.web_panel_host, port=self.web_panel_port
-                )
-
-                # 检测密码重置标志
-                if self.web_panel_reset_password:
-                    self._web_server.auth_mgr.reset_to_default()
-                    self.config["web_panel_reset_password"] = False
-                    self.config.save_config()
-                    logger.info("🌐 Web 面板密码已重置，新密码已输出到日志")
-
-                await self._web_server.start()
-            except Exception as e:
-                logger.error(f"🌐 Web 配置面板启动失败: {e}", exc_info=True)
-                self._web_server = None
-
     async def terminate(self):
         """
         🆕 v1.1.0: 插件禁用/重载时调用
@@ -2649,13 +2523,6 @@ class ChatPlus(Star):
                 logger.error(f"[主动对话] 停止后台任务失败: {e}", exc_info=True)
         if hasattr(self, "session"):
             await self.session.close()
-
-        # 🌐 停止 Web 配置面板
-        if hasattr(self, "_web_server") and self._web_server:
-            try:
-                await self._web_server.stop()
-            except Exception as e:
-                logger.error(f"🌐 Web 配置面板停止失败: {e}", exc_info=True)
 
         for task in list(getattr(self, "_idle_flush_tasks", {}).values()):
             if task and not task.done():
@@ -2796,31 +2663,6 @@ class ChatPlus(Star):
 
                     # 检测到指令，标记后直接返回（不调用 stop_event，让其他插件处理）
                     return
-            elif self.enable_private_chat and event.is_private_chat():
-                # 🆕 私信指令过滤逻辑（独立于群聊，使用私信专用配置和数据）
-
-                # 定期清理过期的私信指令标记（避免内存泄漏）
-                current_time = time.time()
-                expired_ids = [
-                    mid
-                    for mid, timestamp in self.private_command_messages.items()
-                    if current_time - timestamp > 10
-                ]
-                for mid in expired_ids:
-                    del self.private_command_messages[mid]
-
-                # 检测是否为指令消息（使用私信专用配置）
-                if self._is_private_command_message(event):
-                    # 生成消息唯一标识（用于跨处理器通信）
-                    msg_id = self._get_message_id(event)
-                    self.private_command_messages[msg_id] = current_time
-
-                    if self.private_chat_enable_debug_log:
-                        logger.info(
-                            "[私信指令过滤] 检测到私信指令，标记后让其他插件处理"
-                        )
-                    # 检测到指令，标记后直接返回
-                    return
             else:
                 return
         except Exception as e:
@@ -2828,83 +2670,6 @@ class ChatPlus(Star):
             logger.error(f"[指令过滤] 处理消息时发生错误: {e}", exc_info=True)
             # 出错时直接返回，不影响其他handler的执行
             return
-
-    @event_message_type(EventMessageType.PRIVATE_MESSAGE)
-    async def on_private_message(self, event: AstrMessageEvent):
-        """
-        🆕 私信消息事件监听
-
-        独立的私信处理入口，跳转到私信专用处理模块
-
-        Args:
-            event: 消息事件对象
-        """
-        try:
-            # 检测私信处理开关
-            if not self.enable_private_chat or not event.is_private_chat():
-                return
-
-            if self._is_vacuum_message(event):
-                if self.private_chat_enable_debug_log:
-                    logger.info("[真空消息过滤] 私聊消息没有可处理内容，跳过处理")
-                event.call_llm = True
-                return
-
-            # 获取消息ID
-            msg_id = self._get_message_id(event)
-
-            # 🔧 消息去重：检查是否已经在处理相同的消息
-            # 防止平台重复推送同一条消息（网络重连、WebSocket断线等）导致重复AI回复
-            current_time = time.time()
-            # 定期清理超过60秒的旧记录（避免内存泄漏）
-            if len(self._seen_message_ids) > 100:
-                self._seen_message_ids = {
-                    k: v
-                    for k, v in self._seen_message_ids.items()
-                    if current_time - v < 60
-                }
-            if msg_id in self._seen_message_ids:
-                if self.private_chat_enable_debug_log:
-                    logger.info(
-                        f"[私信-消息去重] 检测到重复消息 {msg_id[:30]}...，跳过处理"
-                        f"（距首次处理 {current_time - self._seen_message_ids[msg_id]:.1f}秒）"
-                    )
-                # 🔧 阻止框架的默认LLM调用（仅阻止默认链路，不影响其他插件）
-                # 因为第一份消息已经处理过，重复消息不应再触发框架的默认LLM回复
-                event.call_llm = True
-                return
-            self._seen_message_ids[msg_id] = current_time
-
-            # 检查是否被高优先级处理器标记为私信指令消息
-            if msg_id in self.private_command_messages:
-                # 这条消息已被识别为指令，跳过处理
-                if self.private_chat_enable_debug_log:
-                    logger.info("[私信] 消息已被标记为指令，跳过处理")
-                return
-
-            # 【🆕 转发消息解析】在指令检查和去重之后，将转发消息转换为纯文本
-            # 指令消息已提前丢弃，避免不必要的 API 调用
-            if self.enable_forward_message_parsing:
-                try:
-                    _forward_parsed = await ForwardMessageParser.try_parse_and_replace(
-                        event,
-                        include_sender_info=self.include_sender_info,
-                        include_timestamp=self.include_timestamp,
-                        max_nesting_depth=self.forward_max_nesting_depth,
-                        debug_mode=self.private_chat_enable_debug_log,
-                    )
-                    if _forward_parsed and self.private_chat_enable_debug_log:
-                        logger.info("[转发消息] 私聊：已成功解析转发消息并替换为纯文本")
-                except Exception as e:
-                    logger.warning(
-                        f"[转发消息] 私聊：解析转发消息时出错（已跳过，不影响后续处理）: {e}"
-                    )
-
-            # 通过所有过滤检查，将消息传递给私信处理模块
-            await self.private_chat_handler.handle_message(event)
-
-        except Exception as e:
-            logger.error(f"处理私信消息时发生错误: {e}", exc_info=True)
 
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -3384,32 +3149,18 @@ class ChatPlus(Star):
         """
         清除本地图片描述缓存并重启AstrBot。
 
-        触发条件（群聊和私信分别检查）：
-        - 群聊来源：群聊功能已启用 + 该群已启用 + 群聊白名单检查通过
-        - 私信来源：私信功能已启用 + 私信名单检查通过（支持黑名单/白名单模式）
-
-        名单逻辑说明：
-        - 群聊：使用 gcp_clear_image_cache_allowed_user_ids（白名单模式，留空=允许所有人）
-        - 私信：使用 private_gcp_clear_image_cache_filter_mode + private_gcp_clear_image_cache_filter_list
-          · blacklist 模式：名单内用户不能使用，其他人可以
-          · whitelist 模式：仅名单内用户能使用
-          · 名单留空=不过滤，允许所有人使用
+        触发条件：
+        - 群聊功能已启用
+        - 当前群已启用本插件
+        - 发送者通过 gcp_clear_image_cache_allowed_user_ids 白名单检查
         """
         try:
-            is_private = event.is_private_chat()
-
-            # ========== 来源判断：群聊 or 私信 ==========
-            if is_private:
-                # --- 私信来源 ---
-                if not self.enable_private_chat:
-                    return
-            else:
-                # --- 群聊来源 ---
-                if not self.enable_group_chat:
-                    return
-                # 群未启用则直接忽略
-                if not self._is_enabled(event):
-                    return
+            if event.is_private_chat():
+                return
+            if not self.enable_group_chat:
+                return
+            if not self._is_enabled(event):
+                return
 
             # 需要能访问到原始消息链
             if not hasattr(event, "message_obj") or not hasattr(
@@ -3424,39 +3175,26 @@ class ChatPlus(Star):
                 return
 
             # ========== 重启权限检查：必须具备 AstrBot 管理员身份 ==========
-            if is_private:
-                filter_list = self.private_gcp_clear_image_cache_filter_list
-                filter_mode = self.private_gcp_clear_image_cache_filter_mode
-                command_allowlist = filter_list if filter_mode == "whitelist" else None
-                command_denylist = filter_list if filter_mode != "whitelist" else None
-            else:
-                command_allowlist = self.gcp_clear_image_cache_allowed_user_ids
-                command_denylist = None
             if not self._authorize_restart_command(
                 event,
                 command_name="gcp_clear_image_cache",
-                command_allowlist=command_allowlist,
-                command_denylist=command_denylist,
+                command_allowlist=self.gcp_clear_image_cache_allowed_user_ids,
+                command_denylist=None,
             ):
                 return
 
-            # ========== 执行清除（群聊/私信共享同一份缓存文件） ==========
-            source_label = "私信" if is_private else "群聊"
+            # ========== 执行清除 ==========
             try:
                 stats_before = self.image_description_cache.get_stats()
                 success = self.image_description_cache.clear()
 
                 if success:
                     platform_name = event.get_platform_name()
-                    if is_private:
-                        chat_id = event.get_sender_id()
-                        session_str = f"{platform_name}:PrivateMessage:{chat_id}"
-                    else:
-                        chat_id = event.get_group_id()
-                        session_str = f"{platform_name}:GroupMessage:{chat_id}"
+                    chat_id = event.get_group_id()
+                    session_str = f"{platform_name}:GroupMessage:{chat_id}"
                     notice = (
                         f"【Group Chat Plus】图片描述缓存清除结果：成功\n"
-                        f"已清除 {stats_before['entry_count']} 条缓存记录（来源：{source_label}），即将重启AstrBot。"
+                        f"已清除 {stats_before['entry_count']} 条缓存记录（来源：群聊），即将重启AstrBot。"
                     )
                     yield event.plain_result(notice)
                     logger.info(f"{session_str}: {notice}")
@@ -3467,7 +3205,7 @@ class ChatPlus(Star):
                     self.config["restart_start_ts"] = time.time()
                     self.config.save_config()
                     logger.info(
-                        "重启：图片缓存清除后准备重启（来源：%s）", source_label
+                        "重启：图片缓存清除后准备重启（来源：群聊）"
                     )
                     try:
                         await self.restart_core()
@@ -10946,165 +10684,6 @@ class ChatPlus(Star):
         except Exception as e:
             # 出错时不影响主流程，只记录错误日志
             logger.error(f"[指令检测] 发生错误: {e}", exc_info=True)
-            return False
-
-    def _is_private_command_message(self, event: AstrMessageEvent) -> bool:
-        """
-        检测私信消息是否为指令消息（使用私信专用配置，独立于群聊）
-
-        检测逻辑与群聊的 _is_command_message 相同，但使用私信专属配置变量：
-        - self.private_enable_command_filter
-        - self.private_command_prefixes
-        - self.private_enable_full_command_detection
-        - self.private_full_command_list
-        - self.private_enable_command_prefix_match
-        - self.private_command_prefix_match_list
-
-        Args:
-            event: 消息事件对象
-
-        Returns:
-            True=是指令消息（应跳过），False=不是指令消息
-        """
-        # 检查是否启用私信指令过滤功能
-        if not self.private_enable_command_filter:
-            if self.debug_mode:
-                logger.info("[私信指令过滤] 私信指令过滤功能未启用")
-            return False
-
-        # 获取私信配置的指令前缀列表
-        command_prefixes = self.private_command_prefixes
-
-        # 获取私信完整指令检测配置
-        enable_full_cmd = self.private_enable_full_command_detection
-        full_command_list = self.private_full_command_list
-
-        # 获取私信指令前缀匹配配置
-        enable_prefix_match = self.private_enable_command_prefix_match
-        prefix_match_list = self.private_command_prefix_match_list
-
-        # 如果所有检测方式都未配置，直接返回
-        has_prefix_filter = bool(command_prefixes)
-        has_full_cmd = enable_full_cmd and bool(full_command_list)
-        has_prefix_match = enable_prefix_match and bool(prefix_match_list)
-
-        if not has_prefix_filter and not has_full_cmd and not has_prefix_match:
-            if self.debug_mode:
-                logger.info(
-                    "[私信指令过滤] 已启用，但未配置任何前缀、完整指令或前缀匹配指令！"
-                )
-            return False
-
-        if self.debug_mode:
-            logger.info("[私信指令检测] 开始检测")
-            if command_prefixes:
-                logger.info(f"  - 配置的前缀: {command_prefixes}")
-            if has_full_cmd:
-                logger.info(f"  - 完整指令列表: {full_command_list}")
-            if has_prefix_match:
-                logger.info(f"  - 前缀匹配指令列表: {prefix_match_list}")
-            logger.info(f"  - 消息内容: {event.get_message_str()}")
-
-        try:
-            original_messages = event.message_obj.message
-            if not original_messages:
-                if self.debug_mode:
-                    logger.info("[私信指令检测] 原始消息链为空")
-                return False
-
-            if self.debug_mode:
-                logger.info(
-                    f"[私信指令检测] 原始消息链组件数: {len(original_messages)}"
-                )
-
-            # ========== 第一步：检查指令前缀 ==========
-            if command_prefixes:
-                for component in original_messages:
-                    if isinstance(component, Plain):
-                        first_text = component.text.strip()
-                        if self.debug_mode:
-                            logger.info(
-                                f"[私信前缀检测] 第一个Plain文本: '{first_text}'"
-                            )
-                        for prefix in command_prefixes:
-                            if prefix and first_text.startswith(prefix):
-                                if self.debug_mode:
-                                    logger.info(
-                                        f"🚫 [私信指令过滤-前缀] "
-                                        f"检测到指令前缀 '{prefix}'，"
-                                        f"原始文本: "
-                                        f"{first_text[:50]}... "
-                                        f"- 插件跳过处理"
-                                    )
-                                return True
-                        break
-
-            # ========== 第二步：检查完整指令字符串 ==========
-            if enable_full_cmd and full_command_list:
-                plain_texts = []
-                for component in original_messages:
-                    if isinstance(component, Plain):
-                        plain_texts.append(component.text)
-                combined_text = "".join(plain_texts)
-                cleaned_text = "".join(combined_text.split())
-
-                if self.debug_mode:
-                    logger.info(f"[私信完整指令检测] 合并后文本: '{combined_text}'")
-                    logger.info(f"[私信完整指令检测] 清理后文本: '{cleaned_text}'")
-
-                for cmd in full_command_list:
-                    if not cmd:
-                        continue
-                    cleaned_cmd = "".join(str(cmd).split())
-                    if cleaned_text == cleaned_cmd:
-                        if self.debug_mode:
-                            logger.info(
-                                f"🚫 [私信指令过滤-完整匹配] "
-                                f"检测到完整指令 '{cmd}'，"
-                                f"清理后文本: '{cleaned_text}' "
-                                f"- 插件跳过处理"
-                            )
-                        return True
-
-            # ========== 第三步：检查指令前缀匹配 ==========
-            if has_prefix_match:
-                plain_texts = []
-                for component in original_messages:
-                    if isinstance(component, Plain):
-                        plain_texts.append(component.text)
-                combined_text = "".join(plain_texts)
-                stripped_text = combined_text.lstrip()
-
-                if self.debug_mode:
-                    logger.info(
-                        f"[私信前缀匹配检测] 去除开头空白后文本: '{stripped_text}'"
-                    )
-
-                for cmd in prefix_match_list:
-                    if not cmd:
-                        continue
-                    cmd_str = str(cmd).strip()
-                    if not cmd_str:
-                        continue
-                    if stripped_text.startswith(cmd_str):
-                        remaining = stripped_text[len(cmd_str) :]
-                        if not remaining or remaining[0].isspace():
-                            if self.debug_mode:
-                                logger.info(
-                                    f"🚫 [私信指令过滤-前缀匹配] "
-                                    f"检测到指令前缀 '{cmd_str}'，"
-                                    f"原始文本: "
-                                    f"'{stripped_text[:50]}...' "
-                                    f"- 插件跳过处理"
-                                )
-                            return True
-
-            if self.debug_mode:
-                logger.info("[私信指令检测] 未检测到指令格式，继续正常处理")
-            return False
-
-        except Exception as e:
-            logger.error(f"[私信指令检测] 发生错误: {e}", exc_info=True)
             return False
 
     def _is_user_blacklisted(self, event: AstrMessageEvent) -> bool:

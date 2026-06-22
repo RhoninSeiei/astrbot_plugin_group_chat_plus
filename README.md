@@ -2,14 +2,16 @@
 
 > **自用版本说明**
 >
-> 本仓库是基于 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 修改后的自用维护版本，面向 RhoninSeiei 的 AstrBot 实际部署场景。代码会参考上游更新，但以线上运行效果和自用需求为准，保留与上游不同的实现。
+> 本仓库是基于 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 修改后的 RhoninSeiei 自用维护版本，面向实际 AstrBot 部署场景。代码会参考上游更新，但以线上运行效果和自用需求为准，保留与上游不同的实现。
 >
-> 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、正式回复阶段放行 AstrBot 工具循环（搜索、MCP、知识库与其他 `@llm_tool` 工具）、会话级人格与模型选择、StepFun `step-image-edit-2` 群聊生图与修图工具、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、Web 面板安全强化、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
+> 当前自用版只面向指定 QQ 群聊场景，核心目标是低打扰读空气回复、正式回复阶段工具调用、StepFun `step-image-edit-2` 群聊生图与修图，以及会话级人格与模型选择。Web 面板与私聊模块已从运行入口移除，相关历史代码仅作为遗留参考保留。
+>
+> 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、正式回复阶段放行 AstrBot 工具循环（搜索、MCP、知识库与其他 `@llm_tool` 工具）、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v1.2.1-blue.svg)](https://github.com/Him666233/astrbot_plugin_group_chat_plus)
-[![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A5v4.11.0-green.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![Version](https://img.shields.io/badge/version-v1.2.1--rhonin.1-blue.svg)](https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A5v4.24.0-green.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 
 一个以 **AI读空气** 为核心的群聊增强插件，让你的Bot更懂氛围、更自然地参与群聊互动
@@ -45,12 +47,6 @@
 
 > **图片处理须知：** 目前必须配置 `image_to_text_provider_id`（图片转文字提供商ID）才能正常处理图片。留空直接传递图片给多模态AI的方式目前无法可靠工作。
 
-## ⚠️ 私聊功能警告
-
-> **私聊处理功能目前仍在开发中，请勿开启 `enable_private_chat`！** 当前版本的私聊模块尚未完善，开启可能导致异常行为。请耐心等待后续版本正式支持。
-
----
-
 ## 📚 文档导航
 
 > 不知道从哪里看起？根据你的需求选择对应的文档：
@@ -58,7 +54,6 @@
 | 你想了解… | 去看这个文档 |
 |-----------|-------------|
 | **AI 回复太多/太少/读空气不准怎么调？** | [深度指南 → 常见问题排查](docs/ARCHITECTURE.md#ai-回复频率相关问题) |
-| **Web 管理面板怎么用？打不开怎么办？** | [深度指南 → Web 管理面板](docs/ARCHITECTURE.md#web-管理面板相关问题) |
 | **插件的工作原理是什么？为什么要"偷天换日"？** | [深度指南 → 工作原理](docs/ARCHITECTURE.md#一句话概括) |
 | **平台的"群聊上下文感知"和"自动理解图片"怎么配？** | [深度指南 → 平台配置](docs/ARCHITECTURE.md#推荐的平台设置) |
 | **某个配置项是什么意思？默认值是多少？** | [配置项完整参考](docs/CONFIG_REFERENCE.md) |
@@ -81,16 +76,9 @@
 
 ---
 
-## 🆕 v1.2.1 更新亮点
+## 🆕 v1.2.1-rhonin.1 更新亮点
 
-**本次更新带来了全新的 Web 管理面板，以及多项拟人化和智能化增强。**
-
-### 全新 Web 管理面板
-
-- **可视化配置管理** — 支持在 Web 界面直接修改插件配置，无需手动编辑 JSON
-- **访问日志与统计** — 实时查看消息处理记录、回复统计图表、各群聊活跃度
-- **IP 安全管理** — 白名单/黑名单/封禁管理，防爬虫自动封禁，IP 访问控制
-- **JWT 认证保护** — Bearer Token + Cookie 双重认证，暴力破解分级锁定，会话安全
+**本次自用维护版将插件边界限定为指定 QQ 群聊场景，并保留已经在线验证的群聊增强能力。**
 
 ### 新增功能
 
@@ -106,8 +94,8 @@
 
 ### 兼容性
 
-- 完全向下兼容 v1.2.0 配置，升级无需修改任何配置
-- 新功能默认使用安全合理的默认值
+- 群聊主流程保留原有配置兼容
+- 已移出运行入口的管理与私聊配置会从插件配置 schema 中移除
 
 ---
 
@@ -162,17 +150,12 @@
 2. 安装依赖：`pip install pypinyin`
 3. 重启 AstrBot，在插件管理面板中配置
 
-> **使用打包启动器部署的用户请注意**：若启动后报错 `ModuleNotFoundError: No module named 'aiohttp'`，请额外执行 `pip install aiohttp>=3.8.0`（详见下方依赖说明）。
-
 ### 依赖要求
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| AstrBot | >= v4.11.0 | 平台框架 |
+| AstrBot | >= v4.24.0, < v5 | 平台框架 |
 | `pypinyin` | >= 0.44.0 | 打字错误生成器（拼音相似性），**需手动安装** |
-| `aiohttp` | >= 3.8.0 | Web 管理面板 HTTP 服务器，通常由 AstrBot 平台自动安装，**无需手动安装** |
-
-> **关于 `aiohttp`**：该库是 AstrBot 平台本身的核心依赖，通过 pip 或源码方式部署时，AstrBot 在安装时会自动包含此依赖，插件本身无需重复声明。但若使用 **AstrBot 新版打包启动器（exe/独立包）** 进行部署，平台依赖可能未完整暴露给插件环境，此时需要手动安装：`pip install aiohttp>=3.8.0`
 
 - **推荐**: `astrbot_plugin_livingmemory` 或 `astrbot_plugin_play_sy` (记忆系统)
 
@@ -461,9 +444,7 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
   "enable_duplicate_filter": true,
   "duplicate_filter_check_count": 5,
   "enable_duplicate_time_limit": true,
-  "duplicate_filter_time_limit": 1800,
-
-  "enable_private_chat": false
+  "duplicate_filter_time_limit": 1800
 }
 ```
 
@@ -475,7 +456,6 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 > - `decision_ai_provider_id` 留空使用默认提供商，建议使用轻量快速的模型
 > - `memory_plugin_mode` 设为 `"auto"` 会自动检测已安装的记忆插件（优先 LivingMemory）
 > - `reply_time_periods` 和 `proactive_time_periods` 的值为 JSON 字符串格式
-> - `enable_private_chat` **必须保持 false**，私聊功能尚未完善
 > - 本推荐配置偏保守，AI发言频率较低，如需更活跃可适当提高 `initial_probability` 和 `after_reply_probability`
 > - 其他所有配置项的详细说明均可在 AstrBot 插件配置面板中直接查看
 
@@ -493,17 +473,19 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 
 ## 📝 更新日志
 
+### v1.2.1-rhonin.1 (2026-06-22)
+
+**群聊运行边界整理**
+
+- 插件元数据改为 RhoninSeiei 自用 fork 信息，支持平台限定为 aiocqhttp
+- 主运行入口移除管理面板服务器启动与停止逻辑
+- 主运行入口移除私聊事件处理器、私聊指令过滤和私聊图片缓存协调
+- 配置 schema 移除管理面板与私聊配置项
+- 运行依赖仅保留群聊主流程实际需要的 `pypinyin`
+
 ### v1.2.1 (2026-03-13)
 
-**新增 Web 管理面板 + 多项拟人化与智能化增强**
-
-**🖥️ 全新 Web 管理面板**:
-- **可视化配置编辑** — 在网页界面直接修改插件全部配置项，无需手动编辑 JSON
-- **实时统计图表** — 查看消息处理量、回复率、各群聊活跃度趋势
-- **访问日志** — 实时记录消息事件，支持按群/用户/时间筛选
-- **IP 安全管理** — 白名单/黑名单/封禁管理，防爬虫自动检测与封禁，支持封禁持久化重启恢复
-- **JWT 双重认证** — Bearer Token + Cookie，暴力破解分级锁定（5/10/15/20次 → 30/60/300/600秒），会话安全可靠
-- **技术树可视化** — 功能关联图谱，直观了解各模块工作流程
+**多项拟人化与智能化增强**
 
 **🆕 新增功能**:
 - **回复密度限制** — 滑动窗口统计短时间内回复次数（默认5分钟内4次），超过软限制时降低概率，达到硬限制后停止回复；支持向AI注入提示说明当前状态
@@ -519,7 +501,6 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 - 所有新功能均有合理默认值，不影响现有行为
 
 **修改文件**:
-- `web/` — **新增** 完整 Web 管理面板（server.py / auth.py / security.py / templates / static）
 - `utils/reply_density_manager.py` — **新增** 回复密度管理器
 - `utils/message_quality_scorer.py` — **新增** 消息质量预判器
 - `utils/welcome_message_parser.py` — **新增** 欢迎消息解析器
