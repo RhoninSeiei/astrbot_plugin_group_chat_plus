@@ -24,34 +24,6 @@ astrbot_plugin_group_chat_plus/
 │   ├── CONFIG_REFERENCE.md     # 配置项完整参考
 │   └── PROJECT_STRUCTURE.md    # 本文件
 │
-├── web/                        # 遗留管理面板代码（当前运行入口不加载）
-│   ├── __init__.py
-│   ├── server.py               # HTTP 服务器（路由/中间件/API）
-│   ├── auth.py                 # 认证模块（密码/JWT）
-│   ├── security.py             # 安全管理器（防护/封禁/日志）
-│   ├── templates/              # HTML 页面模板
-│   │   ├── login.html          # 登录页
-│   │   ├── panel.html          # 管理面板页
-│   │   └── error.html          # 错误/拦截页
-│   └── static/                 # 前端静态资源
-│       ├── css/                # 样式文件
-│       │   ├── main.css        # 主题系统（亮/暗色）
-│       │   ├── login.css       # 登录页样式
-│       │   ├── config-panel.css# 配置编辑器样式
-│       │   ├── charts.css      # 图表样式
-│       │   └── tech-tree.css   # 技术树样式
-│       └── js/                 # JavaScript 模块
-│           ├── api.js          # HTTP 客户端 & Token 管理
-│           ├── auth.js         # 前端认证逻辑
-│           ├── app.js          # 面板入口
-│           ├── charts.js       # 统计图表
-│           ├── config-editor.js# 配置可视化编辑器
-│           ├── flow-data.js    # 消息流程可视化数据
-│           ├── prompt-data.js  # 系统提示词模板数据
-│           ├── session-mgr.js  # 会话管理
-│           ├── tech-tree.js    # 技术树可视化
-│           └── utils.js        # 通用工具函数
-│
 ├── utils/                      # 🧩 群聊工具模块
 │   ├── __init__.py             # 模块导出
 │   ├── probability_manager.py  # 概率管理器
@@ -86,12 +58,9 @@ astrbot_plugin_group_chat_plus/
 │   ├── reply_density_manager.py# 回复密度限制
 │   └── _session_guard.py       # 会话安全守卫
 │
-└── private_chat/               # 遗留私聊模块（当前运行入口不加载）
-    ├── __init__.py
-    ├── private_chat_main.py    # 私聊主处理器
-    └── private_chat_utils/     # 私聊工具模块
-        ├── __init__.py
-        └── ... (14 个模块)    # 群聊工具的私聊版本
+└── legacy/                     # 遗留参考代码（当前运行入口不加载）
+    ├── web/                    # 历史管理面板代码
+    └── private_chat/           # 历史私聊模块
 ```
 
 ---
@@ -132,7 +101,7 @@ pypinyin    # 拼音处理，用于打字错误生成器
 
 ---
 
-## web/ — 遗留管理面板代码
+## legacy/web/ — 遗留管理面板代码
 
 > 当前自用版已从 `main.py` 移除管理面板启动与停止逻辑，该目录仅作为历史实现参考保留。
 
@@ -255,7 +224,7 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 
 ---
 
-## private_chat/ — 遗留私聊模块
+## legacy/private_chat/ — 遗留私聊模块
 
 > 当前自用版已从 `main.py` 移除私聊事件入口、私聊指令过滤与私聊处理器初始化，该目录仅作为历史实现参考保留。
 
@@ -269,7 +238,7 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 ### 文件结构
 
 ```
-private_chat/
+legacy/private_chat/
 ├── __init__.py
 ├── private_chat_main.py              # 私聊主处理器（PrivateChatMain 类）
 └── private_chat_utils/               # 私聊版工具模块
@@ -315,8 +284,8 @@ private_chat/
                      (插件主入口)
                     ┌──────┼──────┐
                     ↓      ↓      ↓
-               main.py  utils/   legacy dirs
-            (群聊入口) (群聊工具) (web 与 private_chat 仅保留历史代码)
+               main.py  utils/   legacy/
+(群聊入口) (群聊工具) (web 与 private_chat 仅保留历史代码)
 ```
 
 ```

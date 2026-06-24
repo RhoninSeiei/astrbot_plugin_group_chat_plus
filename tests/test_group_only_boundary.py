@@ -7,6 +7,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class GroupOnlyBoundaryTest(unittest.TestCase):
+    def test_legacy_web_and_private_modules_are_not_in_plugin_root(self):
+        self.assertFalse((REPO_ROOT / "web").exists())
+        self.assertFalse((REPO_ROOT / "private_chat").exists())
+        self.assertTrue((REPO_ROOT / "legacy" / "web").is_dir())
+        self.assertTrue((REPO_ROOT / "legacy" / "private_chat").is_dir())
+
     def test_main_runtime_does_not_register_web_or_private_entrypoints(self):
         source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 

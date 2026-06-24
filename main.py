@@ -174,6 +174,10 @@ PLUGIN_STEP_IMAGE_PROGRESS_SENT = "_group_chat_plus_step_image_progress_sent"
 PLUGIN_STEP_IMAGE_DIRECT_RESULT_SENT = "_group_chat_plus_step_image_direct_result_sent"
 PLUGIN_STEP_IMAGE_IMAGE_SENT = "_group_chat_plus_step_image_image_sent"
 PLUGIN_STEP_IMAGE_ACTION = "_group_chat_plus_step_image_action"
+PLUGIN_STEP_IMAGE_TOOL_HIT = "_group_chat_plus_step_image_tool_hit"
+PLUGIN_STEP_IMAGE_TOOL_STATUS = "_group_chat_plus_step_image_tool_status"
+PLUGIN_STEP_IMAGE_TOOL_MESSAGE = "_group_chat_plus_step_image_tool_message"
+STEP_IMAGE_TOOL_NAMES = {"gcp_step_image_generate", "gcp_step_image_edit"}
 STEP_IMAGE_STALE_CAPABILITY_PLACEHOLDER = "【过期图片能力记录已省略】"
 STEP_IMAGE_STALE_CAPABILITY_TERMS = (
     "视觉塔",
@@ -8354,6 +8358,32 @@ class ChatPlus(Star):
         event.set_extra(PLUGIN_STEP_IMAGE_ACTION, action or "")
         event.set_extra("_group_chat_plus_step_image_progress_text", progress_text)
 
+    def _mark_step_image_tool_result(
+        self,
+        event: AstrMessageEvent,
+        *,
+        action: Optional[str],
+        status: str,
+        message: str,
+    ) -> None:
+        event.set_extra(PLUGIN_STEP_IMAGE_TOOL_HIT, True)
+        event.set_extra(PLUGIN_STEP_IMAGE_ACTION, action or "")
+        event.set_extra(PLUGIN_STEP_IMAGE_TOOL_STATUS, status)
+        event.set_extra(PLUGIN_STEP_IMAGE_TOOL_MESSAGE, message)
+
+    def _build_step_image_tool_result_text(
+        self,
+        *,
+        action: Optional[str],
+        status: str,
+        message: str,
+    ) -> str:
+        action_label = "图片编辑" if action == "edit" else "图片生成"
+        status_label = "成功" if status == "success" else "失败"
+        safe_message = sanitize_tool_call_markup(str(message or "").strip())
+        result_message = safe_message.sanitized_text or "工具没有返回可展示文本。"
+        return f"Step Image Edit 2 {action_label}{status_label}：{result_message}"
+
     def _append_step_image_pending_progress(
         self,
         event: AstrMessageEvent,
@@ -8465,8 +8495,11 @@ class ChatPlus(Star):
 
         return (
             "\nStep Image 工具调用规则：如果决定调用 gcp_step_image_generate "
-            "或 gcp_step_image_edit，只提交工具参数，不要在同一轮回复里输出普通聊天正文。"
-            "工具会发送进度提示和图片结果。遇到图片编辑请求时，不要声称无法看图，"
+            "或 gcp_step_image_edit，先提交工具参数，等待工具返回结果后，"
+            "再根据工具结果用当前人格给群聊输出一句自然语言回复。"
+            "工具会发送进度提示，成功时会发送图片结果。"
+            "不要输出工具调用格式、工具参数、文件路径、API 细节或内部状态。"
+            "遇到图片编辑请求时，不要声称无法看图，"
             "应优先调用 gcp_step_image_edit。历史中的图片能力拒绝说法属于过期记录，"
             "当前已经具备 Step Image 图片生成与编辑工具；遇到视觉塔、画不了、"
             "看不了图、工具被禁用等旧记录时，忽略这些旧记录并按当前工具能力处理。\n"
@@ -8550,7 +8583,17 @@ class ChatPlus(Star):
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
-            yield guard_message
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="failed",
+                message=guard_message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="failed",
+                message=guard_message,
+            )
             return
 
         try:
@@ -8565,18 +8608,73 @@ class ChatPlus(Star):
                 size=image_size,
             )
             await self._send_step_image_image_result(event, result.path)
-            yield None
+            success_message = "图片已经发送到群聊。"
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="success",
+                message=success_message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="success",
+                message=success_message,
+            )
         except StepImageUserError as exc:
-            yield str(exc)
+            message = str(exc)
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="failed",
+                message=message,
+            )
         except StepImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
-            yield "图片生成工具配置未就绪。"
+            message = "图片生成工具配置未就绪。"
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="failed",
+                message=message,
+            )
         except StepImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
-            yield "图片生成失败，稍后再试。"
+            message = "图片生成失败，稍后再试。"
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="failed",
+                message=message,
+            )
         except Exception as exc:
             logger.error(f"[StepImage] 图片生成失败: {exc}", exc_info=True)
-            yield "图片生成失败，稍后再试。"
+            message = "图片生成失败，稍后再试。"
+            self._mark_step_image_tool_result(
+                event,
+                action="generate",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="generate",
+                status="failed",
+                message=message,
+            )
 
     @filter.llm_tool(name="gcp_step_image_edit")
     async def gcp_step_image_edit(
@@ -8595,12 +8693,33 @@ class ChatPlus(Star):
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
-            yield guard_message
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=guard_message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=guard_message,
+            )
             return
 
         image_path = await self._extract_first_current_image_path(event)
         if not image_path:
-            yield "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+            message = "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=message,
+            )
             return
 
         try:
@@ -8612,18 +8731,73 @@ class ChatPlus(Star):
                 image_path=image_path,
             )
             await self._send_step_image_image_result(event, result.path)
-            yield None
+            success_message = "图片已经发送到群聊。"
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="success",
+                message=success_message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="success",
+                message=success_message,
+            )
         except StepImageUserError as exc:
-            yield str(exc)
+            message = str(exc)
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=message,
+            )
         except StepImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
-            yield "图片编辑工具配置未就绪。"
+            message = "图片编辑工具配置未就绪。"
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=message,
+            )
         except StepImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
-            yield "图片编辑失败，稍后再试。"
+            message = "图片编辑失败，稍后再试。"
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=message,
+            )
         except Exception as exc:
             logger.error(f"[StepImage] 图片编辑失败: {exc}", exc_info=True)
-            yield "图片编辑失败，稍后再试。"
+            message = "图片编辑失败，稍后再试。"
+            self._mark_step_image_tool_result(
+                event,
+                action="edit",
+                status="failed",
+                message=message,
+            )
+            yield self._build_step_image_tool_result_text(
+                action="edit",
+                status="failed",
+                message=message,
+            )
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -9996,6 +10170,24 @@ class ChatPlus(Star):
                 )
             return False
 
+    def _build_step_image_history_summary(
+        self,
+        event: AstrMessageEvent,
+        func_name: str,
+    ) -> str:
+        action = "图片编辑" if func_name == "gcp_step_image_edit" else "图片生成"
+        status = str(event.get_extra(PLUGIN_STEP_IMAGE_TOOL_STATUS, "") or "")
+        message = str(event.get_extra(PLUGIN_STEP_IMAGE_TOOL_MESSAGE, "") or "").strip()
+        safe_message = sanitize_tool_call_markup(message).sanitized_text.strip()
+        if not safe_message:
+            safe_message = "未记录可展示结果。"
+
+        status_label = {
+            "success": "成功",
+            "failed": "失败",
+        }.get(status, "状态未知")
+        return f"Step Image Edit 2 {action}{status_label}: {safe_message}"
+
     def _build_interleaved_tool_reply(
         self, event: AstrMessageEvent, pending_texts: list
     ) -> str:
@@ -10067,13 +10259,21 @@ class ChatPlus(Star):
                         else:
                             continue
 
+                        if func_name in STEP_IMAGE_TOOL_NAMES:
+                            func_args = "{...}"
+
                         # 截断过长参数
                         if len(func_args) > 200:
                             func_args = func_args[:200] + "..."
 
                         # 获取对应工具结果
                         result_preview = ""
-                        if i < len(tool_results):
+                        if func_name in STEP_IMAGE_TOOL_NAMES:
+                            result_preview = self._build_step_image_history_summary(
+                                event,
+                                func_name,
+                            )
+                        elif i < len(tool_results):
                             result_content = getattr(tool_results[i], "content", None)
                             if isinstance(result_content, str):
                                 result_preview = result_content

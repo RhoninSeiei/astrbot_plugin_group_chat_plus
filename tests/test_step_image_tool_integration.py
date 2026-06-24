@@ -23,7 +23,38 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("self._is_step_image_enabled_for_event(event)", self.main_source)
         self.assertIn("await self._send_step_image_progress", self.main_source)
         self.assertIn("await self._send_step_image_image_result", self.main_source)
-        self.assertIn("yield None", self.main_source)
+
+    def test_successful_step_image_tools_return_model_facing_result(self):
+        self.assertIn("_build_step_image_tool_result_text", self.main_source)
+        self.assertIn("yield self._build_step_image_tool_result_text", self.main_source)
+        self.assertNotIn(
+            "The tool has no return value, or has sent the result directly to the user.",
+            self.main_source,
+        )
+
+    def test_step_image_tool_records_hit_status_and_model_facing_result(self):
+        for marker in (
+            "PLUGIN_STEP_IMAGE_TOOL_HIT",
+            "PLUGIN_STEP_IMAGE_TOOL_STATUS",
+            "PLUGIN_STEP_IMAGE_TOOL_MESSAGE",
+            "def _mark_step_image_tool_result",
+            "def _build_step_image_tool_result_text",
+        ):
+            self.assertIn(marker, self.main_source)
+
+        for status in ('status="success"', 'status="failed"'):
+            self.assertIn(status, self.main_source)
+
+        self.assertIn("Step Image Edit 2", self.main_source)
+        self.assertIn("自然语言", self.main_source)
+        self.assertIn("不要输出工具调用格式", self.main_source)
+
+    def test_step_image_tool_history_uses_safe_status_summary(self):
+        self.assertIn("def _build_step_image_history_summary", self.main_source)
+        self.assertIn("func_name in STEP_IMAGE_TOOL_NAMES", self.main_source)
+        self.assertIn('func_args = "{...}"', self.main_source)
+        self.assertIn("event.get_extra(PLUGIN_STEP_IMAGE_TOOL_STATUS", self.main_source)
+        self.assertIn("event.get_extra(PLUGIN_STEP_IMAGE_TOOL_MESSAGE", self.main_source)
 
     def test_tool_sends_image_directly_without_response_stage_image_result(self):
         self.assertIn("PLUGIN_STEP_IMAGE_IMAGE_SENT", self.main_source)
@@ -31,8 +62,10 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "MessageEventResult().file_image(str(image_path))",
             self.main_source,
         )
-        self.assertIn("await event.send(MessageChain(image_result.chain))", self.main_source)
-        self.assertIn("[StepImage] 图片结果已通过工具发送", self.main_source)
+        self.assertIn(
+            "await event.send(MessageChain(image_result.chain))", self.main_source
+        )
+        self.assertIn("图片结果已通过工具发送", self.main_source)
         self.assertNotIn("yield self._build_step_image_direct_result", self.main_source)
 
     def test_step_image_guard_uses_group_id_fallbacks(self):
@@ -43,10 +76,9 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("str(group_id) in enabled_groups", self.main_source)
 
     def test_step_image_context_removes_stale_capability_refusals(self):
+        self.assertIn("STEP_IMAGE_STALE_CAPABILITY_PLACEHOLDER", self.main_source)
+        self.assertIn("STEP_IMAGE_STALE_CAPABILITY_TERMS", self.main_source)
         self.assertIn("def _sanitize_step_image_stale_text", self.main_source)
-        self.assertIn("视觉塔", self.main_source)
-        self.assertIn("画不了", self.main_source)
-        self.assertIn("过期图片能力记录已省略", self.main_source)
         self.assertIn("历史中的图片能力拒绝说法属于过期记录", self.main_source)
 
     def test_intermediate_step_image_text_becomes_progress_message(self):
@@ -78,7 +110,10 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
         self.assertIn("1080p", self.main_source)
         self.assertIn("16:9", self.main_source)
-        self.assertIn("工具会发送进度提示和图片结果", self.main_source)
+        self.assertIn("工具返回结果后", self.main_source)
+        self.assertIn("根据工具结果", self.main_source)
+        self.assertIn("自然语言", self.main_source)
+        self.assertNotIn("工具会发送进度提示和图片结果。", self.main_source)
 
 
 if __name__ == "__main__":

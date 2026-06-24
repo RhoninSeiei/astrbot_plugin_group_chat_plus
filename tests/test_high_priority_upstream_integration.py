@@ -17,14 +17,14 @@ class HighPriorityUpstreamIntegrationTest(unittest.TestCase):
         self.cache_source = (
             REPO_ROOT / "utils" / "message_cache_manager.py"
         ).read_text(encoding="utf-8")
-        self.server_source = (REPO_ROOT / "web" / "server.py").read_text(
+        self.server_source = (REPO_ROOT / "legacy" / "web" / "server.py").read_text(
             encoding="utf-8"
         )
-        self.api_source = (REPO_ROOT / "web" / "static" / "js" / "api.js").read_text(
-            encoding="utf-8"
-        )
+        self.api_source = (
+            REPO_ROOT / "legacy" / "web" / "static" / "js" / "api.js"
+        ).read_text(encoding="utf-8")
         self.session_mgr_source = (
-            REPO_ROOT / "web" / "static" / "js" / "session-mgr.js"
+            REPO_ROOT / "legacy" / "web" / "static" / "js" / "session-mgr.js"
         ).read_text(encoding="utf-8")
 
     def test_main_has_poke_persistence_and_smart_batch_fallback(self):

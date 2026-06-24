@@ -16,12 +16,13 @@ class ReplyLeakageGuardTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.private_reply_source = (
             REPO_ROOT
+            / "legacy"
             / "private_chat"
             / "private_chat_utils"
             / "private_chat_reply_handler.py"
         ).read_text(encoding="utf-8")
         self.prompt_data_source = (
-            REPO_ROOT / "web" / "static" / "js" / "prompt-data.js"
+            REPO_ROOT / "legacy" / "web" / "static" / "js" / "prompt-data.js"
         ).read_text(encoding="utf-8")
 
     def test_reply_prompt_is_action_oriented(self):
