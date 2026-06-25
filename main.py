@@ -30,11 +30,11 @@
 - enabled_groups留空=全部群启用，填群号=仅指定群启用
 - @消息会跳过所有判断直接回复
 
-作者: Him666233
-版本: v1.2.1
+作者: RhoninSeiei 自用维护（原项目作者 Him666233）
+版本: v1.2.1-rhonin.1
 
 v1.2.1 更新内容：
-- 🆕 Web管理面板 - 全新可视化管理界面，支持JWT认证、访问日志、统计图表、IP安全管理
+- 🆕 自用版运行边界 - Web 面板与私聊模块已从运行入口移除，仅保留为 legacy 参考代码
 - 🆕 回复密度限制 - 限制短时间内回复次数，避免刷屏，支持软限制与AI提示
 - 🆕 消息质量预判 - 根据消息质量（疑问句加权/水聊降权）动态调整回复概率
 - 🆕 欢迎消息解析 - 支持解析群成员入群欢迎消息，可选概率跳过或完整处理
@@ -202,10 +202,10 @@ STEP_IMAGE_STALE_CAPABILITY_TERMS = (
 
 @register(
     "chat_plus",
-    "Him666233",
-    "一个以AI读空气为主的群聊聊天效果增强插件",
-    "v1.2.1",
-    "https://github.com/Him666233/astrbot_plugin_group_chat_plus",
+    "RhoninSeiei",
+    "面向群聊场景的 AstrBot 智能参与与工具调用增强插件",
+    "v1.2.1-rhonin.1",
+    "https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus",
 )
 class ChatPlus(Star):
     """
@@ -1973,7 +1973,7 @@ class ChatPlus(Star):
 
         # ========== 日志输出 ==========
         logger.info("=" * 50)
-        logger.info("群聊增强插件已加载 - v1.2.1")
+        logger.info("群聊增强插件已加载 - v1.2.1-rhonin.1")
         logger.info(
             f"🔘 群聊功能总开关: {'✓ 已启用' if self.enable_group_chat else '✗ 已禁用'}"
         )
@@ -9200,10 +9200,10 @@ class ChatPlus(Star):
 
             self.raw_reply_cache[message_id] = reply_text
 
-            # 🔧 多轮工具调用支持：累积原始回复文本
-            if message_id not in self._pending_bot_replies:
-                self._pending_bot_replies[message_id] = []
-            self._pending_bot_replies[message_id].append(reply_text)
+            # 🔧 多轮工具调用支持：累积原始回复文本，相邻重复进度提示只保存一次
+            pending_replies = self._pending_bot_replies.setdefault(message_id, [])
+            if not pending_replies or pending_replies[-1] != reply_text:
+                pending_replies.append(reply_text)
 
             # 🆕 v1.2.0: 应用输出内容过滤（独立于保存过滤）
             filtered_reply_text = reply_text

@@ -69,16 +69,17 @@ astrbot_plugin_group_chat_plus/
 
 ### main.py — 插件主入口
 
-插件的核心文件（约 8400+ 行），包含：
+插件的核心文件（约 10900+ 行），包含：
 
 - **插件类定义** — 继承 AstrBot 插件基类，注册事件处理器
 - **配置读取** — 从 `_conf_schema.json` 读取并初始化所有配置项
 - **模块初始化** — 创建并管理所有 `utils/` 中的工具模块实例
 - **事件处理器**：
-  - `on_group_message()` — 群聊消息入口，执行 Phase 1-3
-  - `_process_message()` — 消息主处理管线，执行 Phase 4-9
+  - `on_group_message()` — 群聊消息入口，执行基础过滤、消息增强和触发检测
+  - `_process_message()` — 消息主处理管线，执行预筛、读空气判断、主模型最终判断和正式回复阶段工具循环
   - `on_llm_request()` — LLM 请求钩子（优先级 -1），负责上下文注入和历史处理
   - `after_message_sent()` — 消息发送后的统计和状态更新
+- **StepImage 工具** — 注册 `gcp_step_image_generate` 与 `gcp_step_image_edit`，负责群聊文生图、修图、进度提示和图片结果发送
 - **主动对话** — 定时任务，独立于消息流程运行
 
 ### metadata.yaml — 插件元数据
@@ -97,6 +98,8 @@ JSON Schema 文件定义了群聊运行相关配置项的：
 
 ```
 pypinyin    # 拼音处理，用于打字错误生成器
+aiohttp     # 异步 HTTP 会话与 Dashboard 辅助请求
+httpx       # StepFun Step Image Edit 2 请求
 ```
 
 ---

@@ -30,12 +30,12 @@
 
 > **本插件完全免费且开源，不会以任何形式进行商业收费！**
 >
-> 近期我们发现有人疑似在其他渠道贩卖本插件。在此郑重声明：
+> 本仓库是 RhoninSeiei 自用维护 fork，上游原项目由 Him666233 维护。在此郑重声明：
 >
 > - 本插件**永久免费、开源**，不存在任何付费版本，不会进行任何商业性收费行为
-> - **唯一官方开源仓库**：[GitHub - Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus)
-> - **唯一官方获取渠道**：上述 GitHub 仓库 及 内部内测交流群（QQ群：1021544792）
-> - 从其他渠道获取到的版本**可能被篡改并包含恶意代码或病毒**，请务必通过官方渠道获取，保障自身安全
+> - 当前自用 fork 的公开来源以 [RhoninSeiei/astrbot_plugin_group_chat_plus](https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus) 为准
+> - 上游原项目来源为 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus)
+> - 从非 GitHub 渠道获取的压缩包需自行核对来源与差异，避免使用被篡改的版本
 >
 > **如果有人向你收费或在非官方渠道分发本插件，请提高警惕！**
 
@@ -126,7 +126,7 @@
 ### 消息处理
 
 - **图片处理** — 支持图片转文字，可配置范围，结果自动缓存
-- **StepFun 图片工具** — 启用后，群聊正式回复阶段可调用 `step-image-edit-2` 进行文生图或编辑同条消息中的图片；工具发送进度与图片，工具结果再交给主模型生成自然语言收尾
+- **StepFun 图片工具** — 启用后，群聊正式回复阶段可调用 `step-image-edit-2` 进行文生图或编辑同条消息中的图片；尺寸沿用 StepFun `height x width`（高x宽）格式，工具发送进度与图片，工具结果再交给主模型生成自然语言收尾
 - **转发解析** — QQ合并转发消息自动解析为可读文本
 - **关键词系统** — 触发词跳过概率/智能模式，黑名单词直接过滤
 - **戳一戳** — 智能响应QQ戳一戳，支持反戳和回复后戳
@@ -516,7 +516,7 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 
 ## 🤝 贡献与反馈
 
-如遇问题请开启 `enable_debug_log` 获取详细日志后在 [GitHub Issues](https://github.com/Him666233/astrbot_plugin_group_chat_plus/issues) 提交，欢迎 Pull Request！
+如遇问题请开启 `enable_debug_log` 获取详细日志后在 [GitHub Issues](https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus/issues) 提交。
 
 也欢迎加入 **QQ群 1021544792** 进行交流、反馈Bug和功能建议！
 
@@ -553,7 +553,9 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 
 ## 👤 作者
 
-**Him666233** — [@Him666233](https://github.com/Him666233)
+**RhoninSeiei** — [@RhoninSeiei](https://github.com/RhoninSeiei)
+
+上游原项目作者：**Him666233** — [@Him666233](https://github.com/Him666233)
 
 ---
 
@@ -561,12 +563,12 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 
 如果这个插件对你有帮助，请给个Star支持一下！
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Him666233/astrbot_plugin_group_chat_plus&type=Date)](https://star-history.com/#Him666233/astrbot_plugin_group_chat_plus&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=RhoninSeiei/astrbot_plugin_group_chat_plus&type=Date)](https://star-history.com/#RhoninSeiei/astrbot_plugin_group_chat_plus&Date)
 
 ---
 
 <div align="center">
 
-Made with ❤️ by Him666233
+RhoninSeiei self-use fork based on Him666233/astrbot_plugin_group_chat_plus
 
 </div>

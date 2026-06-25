@@ -86,6 +86,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("self._infer_step_image_action(event)", self.main_source)
         self.assertIn("阶跃星辰 Step Image Edit 2", self.main_source)
         self.assertIn("PLUGIN_STEP_IMAGE_PROGRESS_SENT", self.main_source)
+        self.assertIn("pending_replies[-1] != reply_text", self.main_source)
 
     def test_tool_uses_current_message_image_for_editing(self):
         self.assertIn("async def _extract_first_current_image_path", self.main_source)

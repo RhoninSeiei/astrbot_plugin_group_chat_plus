@@ -61,6 +61,8 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         for package_name in ("argon2-cffi", "pytest", "hypothesis"):
             self.assertNotIn(package_name, requirements)
         self.assertIn("pypinyin", requirements)
+        self.assertIn("aiohttp", requirements)
+        self.assertIn("httpx", requirements)
 
     def test_metadata_declares_rhonin_group_chat_fork(self):
         metadata = (REPO_ROOT / "metadata.yaml").read_text(encoding="utf-8")
@@ -75,6 +77,22 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn("  - aiocqhttp", metadata)
         self.assertNotIn("Web", metadata)
         self.assertNotIn("Him666233", metadata)
+
+    def test_register_metadata_matches_rhonin_group_chat_fork(self):
+        source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn('"RhoninSeiei"', source)
+        self.assertIn('"v1.2.1-rhonin.1"', source)
+        self.assertIn("群聊增强插件已加载 - v1.2.1-rhonin.1", source)
+        self.assertNotIn("群聊增强插件已加载 - v1.2.1\")", source)
+        self.assertIn(
+            '"https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus"',
+            source,
+        )
+        self.assertNotIn(
+            '"https://github.com/Him666233/astrbot_plugin_group_chat_plus"',
+            source,
+        )
 
     def test_readme_declares_current_group_chat_scope(self):
         readme_head = "\n".join(

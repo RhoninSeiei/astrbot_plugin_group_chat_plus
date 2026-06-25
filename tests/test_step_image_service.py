@@ -121,6 +121,7 @@ class StepImageServiceTest(unittest.TestCase):
         module = _load_service_module()
 
         self.assertEqual(module.DEFAULT_GENERATION_SIZE, "768x1360")
+        self.assertIn("高x宽", module.GENERATION_SIZE_HINT)
         self.assertEqual(
             module.StepImageService.normalize_generation_size("1920x1080"),
             "768x1360",
