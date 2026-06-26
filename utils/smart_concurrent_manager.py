@@ -83,13 +83,15 @@ class SmartConcurrentManager:
             logger.warning(f"[SmartConcurrent] attach_payload 失败: {e}")
 
     async def is_consumed(self, processing_id: str) -> bool:
-        return processing_id in self._consumed
+        async with self._get_lock():
+            return processing_id in self._consumed
 
     async def get_consumer(self, processing_id: str) -> Optional[str]:
-        info = self._consumed.get(processing_id)
-        if not info:
-            return None
-        return info.get("anchor_processing_id")
+        async with self._get_lock():
+            info = self._consumed.get(processing_id)
+            if not info:
+                return None
+            return info.get("anchor_processing_id")
 
     async def has_earlier_pending(self, chat_id: str, processing_id: str) -> bool:
         try:

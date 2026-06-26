@@ -9,6 +9,18 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+class CountingAsyncLock:
+    def __init__(self):
+        self.enter_count = 0
+
+    async def __aenter__(self):
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 def _load_smart_manager():
     astrbot_module = sys.modules.get("astrbot") or types.ModuleType("astrbot")
     astrbot_api_module = sys.modules.get("astrbot.api") or types.ModuleType("astrbot.api")
@@ -98,6 +110,21 @@ class SmartConcurrentManagerTest(unittest.TestCase):
             )
             self.assertFalse(await second.is_consumed("m2"))
             self.assertTrue(await first.is_consumed("m2"))
+
+        asyncio.run(scenario())
+
+    def test_consumed_reads_use_manager_lock(self):
+        async def scenario():
+            counting_lock = CountingAsyncLock()
+            self.manager._lock = counting_lock
+            self.manager._consumed["m2"] = {
+                "consumed_at": 1.0,
+                "anchor_processing_id": "m1",
+            }
+
+            self.assertTrue(await self.manager.is_consumed("m2"))
+            self.assertEqual(await self.manager.get_consumer("m2"), "m1")
+            self.assertEqual(counting_lock.enter_count, 2)
 
         asyncio.run(scenario())
 

@@ -142,6 +142,8 @@ from .utils import (
     ReplyDensityManager,  # 🆕 v1.2.1: 回复密度管理器
     MessageQualityScorer,  # 🆕 v1.2.1: 消息质量预判器
     SmartConcurrentManager,  # 智能并发合并管理器
+    RuntimeState,  # 运行态容器
+    ToolPolicy,  # 正式回复阶段工具策略
 )
 from .utils.image_description_cache import (
     ImageDescriptionCache,
@@ -1707,10 +1709,12 @@ class ChatPlus(Star):
         self._idle_flush_tasks = {}
         self._idle_flush_meta = {}
 
+        self.runtime_state = RuntimeState()
+
         # 标记本插件正在处理的消息（用于after_message_sent筛选）
         # 🔧 修复：使用message_id作为键，避免同一会话中多条消息并发时标记冲突
         # 格式: {message_id: chat_id}
-        self.processing_sessions = {}
+        self.processing_sessions = self.runtime_state.processing_sessions
 
         # 🔧 并发控制锁，保护 processing_sessions 的检查-标记流程，避免竞态条件
         self.concurrent_lock = asyncio.Lock()
@@ -1726,8 +1730,8 @@ class ChatPlus(Star):
 
         # 🔧 并发保护：存储消息缓存快照，供 after_message_sent 使用
         # 格式: {message_id: cached_message_dict}
-        self._message_cache_snapshots = {}
-        self._smart_batch_snapshots = {}
+        self._message_cache_snapshots = self.runtime_state.message_cache_snapshots
+        self._smart_batch_snapshots = self.runtime_state.smart_batch_snapshots
         self._smart_arrival_seq = 0
         self.smart_concurrent = SmartConcurrentManager(
             expire_seconds=float(self.smart_concurrent_merge_wait),
@@ -1737,44 +1741,46 @@ class ChatPlus(Star):
         # 🆕 主动对话正在处理的会话标记（用于普通对话和主动对话之间的并发保护）
         # 格式: {chat_id: timestamp}，记录主动对话开始处理的时间
         # 普通对话在清空缓存前会检查此标记，避免与主动对话冲突
-        self.proactive_processing_sessions = {}
+        self.proactive_processing_sessions = (
+            self.runtime_state.proactive_processing_sessions
+        )
 
         # 标记被识别为指令的消息（用于跨处理器通信）
         # 格式: {message_id: timestamp}，定期清理超过10秒的旧记录
-        self.command_messages = {}
+        self.command_messages = self.runtime_state.command_messages
 
         # 🆕 最近发送的回复缓存（用于去重检查）
         # 格式: {chat_id: [{"content": "回复内容", "timestamp": 时间戳}]}
         # 最多保留最近5条回复，超过30分钟的自动清理
-        self.recent_replies_cache = {}
-        self.raw_reply_cache = {}
+        self.recent_replies_cache = self.runtime_state.recent_replies_cache
+        self.raw_reply_cache = self.runtime_state.raw_reply_cache
 
         # 🔧 多轮工具调用支持：累积AI回复文本
         # 当AI先说话再调用工具再说话时，需要累积所有回复文本，
         # 等agent真正完成后再统一保存，避免只保存第一段话
         # 格式: {message_id: [原始文本1, 原始文本2, ...]}
-        self._pending_bot_replies: dict[str, list[str]] = {}
+        self._pending_bot_replies = self.runtime_state.pending_bot_replies
         # agent完成标志：on_llm_response 设置，after_message_sent 消费
         # 格式: set of message_ids
-        self._agent_done_flags: set[str] = set()
+        self._agent_done_flags = self.runtime_state.agent_done_flags
 
         # 🔧 重复消息拦截标记（用于 after_message_sent 判断是否跳过AI消息保存）
         # 格式: {message_id: True}
         # 当消息被重复检测拦截时，添加到此字典，after_message_sent 会跳过AI消息保存但继续保存用户消息
-        self._duplicate_blocked_messages = {}
+        self._duplicate_blocked_messages = self.runtime_state.duplicate_blocked_messages
 
         # 🔧 已保存消息标记（防止分段消息重复保存）
         # 格式: {message_id: timestamp}
         # 记录已成功保存的消息ID，避免分段插件导致同一消息多次保存
         # 定期清理超过5分钟的旧记录
-        self._saved_messages = {}
+        self._saved_messages = self.runtime_state.saved_messages
 
         # 🔧 消息去重：防止平台重复推送同一消息导致重复处理
         # 格式: {message_id: timestamp}
         # 当同一条消息被平台重复推送时（网络重连、WebSocket断线重连等），
         # 两个event拥有相同的message_id，此缓存确保只处理第一个
         # 定期清理超过60秒的旧记录
-        self._seen_message_ids = {}
+        self._seen_message_ids = self.runtime_state.seen_message_ids
 
         # ========== v1.0.2 新增功能初始化 ==========
 
@@ -5781,15 +5787,15 @@ class ChatPlus(Star):
                 except Exception as e:
                     logger.warning(f"人格工具过滤失败,使用全部工具: {e}")
 
+            tool_policy = ToolPolicy.from_allowed_tool_names(
+                allowed_tool_names,
+                allow_step_image=self.enable_step_image_tools,
+            )
             old_len = len(final_message)
+            visible_tools = []
             try:
                 visible_tools = ToolsReminder.get_available_tools(self.context)
-                if allowed_tool_names is not None:
-                    visible_tools = [
-                        tool
-                        for tool in visible_tools
-                        if tool.get("name") in allowed_tool_names
-                    ]
+                visible_tools = tool_policy.filter_tools(visible_tools)
                 visible_tool_names = sorted(
                     {
                         str(tool.get("name", "")).strip()
@@ -5799,11 +5805,13 @@ class ChatPlus(Star):
                 )
                 event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)
             except Exception as e:
-                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, [])
+                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
                 logger.warning(f"记录提示工具列表失败: {e}")
 
             final_message = ToolsReminder.inject_tools_to_message(
-                final_message, self.context, allowed_tool_names
+                final_message,
+                self.context,
+                tool_policy.allowed_names_for_prompt(visible_tools),
             )
             if self.debug_mode:
                 logger.info(
@@ -8936,10 +8944,45 @@ class ChatPlus(Star):
                     len(executable_tool_names),
                 )
 
+        def _filter_tool_container_for_visible_names(tool_container, visible_names):
+            if tool_container is None or visible_names is None:
+                return
+            for tool in list(_get_compatible_tools(tool_container)):
+                tool_name = str(getattr(tool, "name", "")).strip()
+                if not tool_name or tool_name in visible_names:
+                    continue
+                if hasattr(tool_container, "remove_tool"):
+                    tool_container.remove_tool(tool_name)
+                elif hasattr(tool_container, "remove_func"):
+                    tool_container.remove_func(tool_name)
+                elif hasattr(tool_container, "tools"):
+                    tool_container.tools = [
+                        item
+                        for item in getattr(tool_container, "tools", [])
+                        if str(getattr(item, "name", "")).strip() != tool_name
+                    ]
+                elif hasattr(tool_container, "func_list"):
+                    tool_container.func_list = [
+                        item
+                        for item in getattr(tool_container, "func_list", [])
+                        if str(getattr(item, "name", "")).strip() != tool_name
+                    ]
+
+        visible_tool_names_extra = event.get_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
+        if visible_tool_names_extra is None:
+            visible_tool_names = None
+        else:
+            visible_tool_names = {
+                str(name).strip()
+                for name in visible_tool_names_extra
+                if str(name).strip()
+            }
+
         # 正式回复阶段保留平台 build_main_agent 注入的工具，并合并插件注册工具。
         # 读空气判断与最终判断仍走无工具的 Provider 直连，避免判断阶段产生外部副作用。
         plugin_tool_set = event.get_extra(PLUGIN_FUNC_TOOL)
         if plugin_tool_set is not None:
+            _filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)
             plugin_tools = _get_compatible_tools(plugin_tool_set)
             if req.func_tool is None:
                 req.func_tool = plugin_tool_set
@@ -8980,9 +9023,8 @@ class ChatPlus(Star):
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
 
         current_tools = _get_compatible_tools(req.func_tool)
-        visible_tool_names = set(event.get_extra(PLUGIN_VISIBLE_TOOL_NAMES, []) or [])
         _log_tool_visibility_delta(
-            visible_tool_names,
+            visible_tool_names or set(),
             _get_tool_name_set(req.func_tool),
         )
         if current_tools:
