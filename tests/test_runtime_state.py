@@ -54,6 +54,38 @@ class RuntimeStateTest(unittest.TestCase):
         self.assertNotIn("m1", state.raw_reply_cache)
         self.assertNotIn("m1", state.saved_messages)
 
+    def test_clear_all_removes_every_runtime_container(self):
+        runtime_state = _load_runtime_state()
+        state = runtime_state()
+
+        state.processing_sessions["m1"] = "g1"
+        state.proactive_processing_sessions["g1"] = 1.0
+        state.message_cache_snapshots["m1"] = {"content": "message"}
+        state.smart_batch_snapshots["m1"] = [{"content": "merged message"}]
+        state.pending_bot_replies["m1"] = ["reply"]
+        state.agent_done_flags.add("m1")
+        state.duplicate_blocked_messages["m1"] = True
+        state.saved_messages["m1"] = 1.0
+        state.seen_message_ids["m1"] = 1.0
+        state.command_messages["m1"] = 1.0
+        state.recent_replies_cache["g1"] = [{"content": "reply"}]
+        state.raw_reply_cache["m1"] = "raw reply"
+
+        state.clear_all()
+
+        self.assertEqual(state.processing_sessions, {})
+        self.assertEqual(state.proactive_processing_sessions, {})
+        self.assertEqual(state.message_cache_snapshots, {})
+        self.assertEqual(state.smart_batch_snapshots, {})
+        self.assertEqual(state.pending_bot_replies, {})
+        self.assertEqual(state.agent_done_flags, set())
+        self.assertEqual(state.duplicate_blocked_messages, {})
+        self.assertEqual(state.saved_messages, {})
+        self.assertEqual(state.seen_message_ids, {})
+        self.assertEqual(state.command_messages, {})
+        self.assertEqual(state.recent_replies_cache, {})
+        self.assertEqual(state.raw_reply_cache, {})
+
     def test_main_initializes_runtime_state_and_keeps_legacy_aliases(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
@@ -71,6 +103,16 @@ class RuntimeStateTest(unittest.TestCase):
             "self._pending_bot_replies = self.runtime_state.pending_bot_replies",
             main_source,
         )
+
+    def test_global_reset_clears_runtime_state_container(self):
+        main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+
+        reset_pos = main_source.index("async def _reset_plugin_data_and_reload")
+        clear_pos = main_source.index("self.runtime_state.clear_all()", reset_pos)
+        legacy_clear_pos = main_source.index("self.pending_messages_cache.clear()", reset_pos)
+
+        self.assertLess(clear_pos, legacy_clear_pos)
+        self.assertIn("已清空运行态容器 RuntimeState", main_source)
 
 
 if __name__ == "__main__":

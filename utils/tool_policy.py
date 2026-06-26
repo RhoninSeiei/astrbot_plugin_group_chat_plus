@@ -16,6 +16,8 @@ class ToolPolicy:
     allowed_tool_names: frozenset[str] = frozenset()
     denied_tool_names: frozenset[str] = frozenset()
     allowed_plugin_names: frozenset[str] = frozenset()
+    # Reserved for future AstrBot tool-loop integration. These fields are not
+    # wired to ProviderRequest or the agent runner yet.
     max_steps: int = 0
     tool_call_timeout: float = 0.0
     allow_step_image: bool = True
@@ -71,6 +73,54 @@ class ToolPolicy:
 
     def filter_tools(self, tools: Iterable[dict]) -> list[dict]:
         return [tool for tool in tools or [] if self.allows_tool(tool)]
+
+    @staticmethod
+    def _get_container_tools(tool_container) -> list:
+        if not tool_container:
+            return []
+        tools = getattr(tool_container, "tools", None)
+        if tools is not None:
+            return list(tools)
+        func_list = getattr(tool_container, "func_list", None)
+        if func_list is not None:
+            return list(func_list)
+        return []
+
+    @classmethod
+    def filter_tool_container_for_visible_names(
+        cls,
+        tool_container,
+        visible_names: Optional[Iterable[str]],
+    ) -> list[str]:
+        if tool_container is None or visible_names is None:
+            return []
+
+        visible_set = _normalize_names(visible_names)
+        removed_names: list[str] = []
+        for tool in cls._get_container_tools(tool_container):
+            tool_name = str(getattr(tool, "name", "")).strip()
+            if not tool_name or tool_name in visible_set:
+                continue
+
+            removed_names.append(tool_name)
+            if hasattr(tool_container, "remove_tool"):
+                tool_container.remove_tool(tool_name)
+            elif hasattr(tool_container, "remove_func"):
+                tool_container.remove_func(tool_name)
+            elif hasattr(tool_container, "tools"):
+                tool_container.tools = [
+                    item
+                    for item in getattr(tool_container, "tools", [])
+                    if str(getattr(item, "name", "")).strip() != tool_name
+                ]
+            elif hasattr(tool_container, "func_list"):
+                tool_container.func_list = [
+                    item
+                    for item in getattr(tool_container, "func_list", [])
+                    if str(getattr(item, "name", "")).strip() != tool_name
+                ]
+
+        return removed_names
 
     def allowed_names_for_prompt(
         self, visible_tools: Optional[Iterable[dict]] = None

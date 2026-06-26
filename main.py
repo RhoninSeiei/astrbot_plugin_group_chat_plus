@@ -3565,6 +3565,11 @@ class ChatPlus(Star):
             except Exception:
                 pass
             try:
+                self.runtime_state.clear_all()
+                logger.info("【插件重置】已清空运行态容器 RuntimeState")
+            except Exception:
+                logger.warning("【插件重置】清空 RuntimeState 失败", exc_info=True)
+            try:
                 # 待转正的消息缓存（主动回复模式产生）
                 pending_total = sum(
                     len(v) for v in self.pending_messages_cache.values()
@@ -5796,13 +5801,16 @@ class ChatPlus(Star):
             try:
                 visible_tools = ToolsReminder.get_available_tools(self.context)
                 visible_tools = tool_policy.filter_tools(visible_tools)
-                visible_tool_names = sorted(
-                    {
-                        str(tool.get("name", "")).strip()
-                        for tool in visible_tools
-                        if str(tool.get("name", "")).strip()
-                    }
-                )
+                if tool_policy.is_unrestricted():
+                    visible_tool_names = None
+                else:
+                    visible_tool_names = sorted(
+                        {
+                            str(tool.get("name", "")).strip()
+                            for tool in visible_tools
+                            if str(tool.get("name", "")).strip()
+                        }
+                    )
                 event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)
             except Exception as e:
                 event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
@@ -8944,30 +8952,6 @@ class ChatPlus(Star):
                     len(executable_tool_names),
                 )
 
-        def _filter_tool_container_for_visible_names(tool_container, visible_names):
-            if tool_container is None or visible_names is None:
-                return
-            for tool in list(_get_compatible_tools(tool_container)):
-                tool_name = str(getattr(tool, "name", "")).strip()
-                if not tool_name or tool_name in visible_names:
-                    continue
-                if hasattr(tool_container, "remove_tool"):
-                    tool_container.remove_tool(tool_name)
-                elif hasattr(tool_container, "remove_func"):
-                    tool_container.remove_func(tool_name)
-                elif hasattr(tool_container, "tools"):
-                    tool_container.tools = [
-                        item
-                        for item in getattr(tool_container, "tools", [])
-                        if str(getattr(item, "name", "")).strip() != tool_name
-                    ]
-                elif hasattr(tool_container, "func_list"):
-                    tool_container.func_list = [
-                        item
-                        for item in getattr(tool_container, "func_list", [])
-                        if str(getattr(item, "name", "")).strip() != tool_name
-                    ]
-
         visible_tool_names_extra = event.get_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
         if visible_tool_names_extra is None:
             visible_tool_names = None
@@ -8982,7 +8966,7 @@ class ChatPlus(Star):
         # 读空气判断与最终判断仍走无工具的 Provider 直连，避免判断阶段产生外部副作用。
         plugin_tool_set = event.get_extra(PLUGIN_FUNC_TOOL)
         if plugin_tool_set is not None:
-            _filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)
+            ToolPolicy.filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)
             plugin_tools = _get_compatible_tools(plugin_tool_set)
             if req.func_tool is None:
                 req.func_tool = plugin_tool_set
@@ -9022,11 +9006,13 @@ class ChatPlus(Star):
         except Exception as e:
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
 
+        ToolPolicy.filter_tool_container_for_visible_names(req.func_tool, visible_tool_names)
         current_tools = _get_compatible_tools(req.func_tool)
-        _log_tool_visibility_delta(
-            visible_tool_names or set(),
-            _get_tool_name_set(req.func_tool),
-        )
+        if visible_tool_names is not None:
+            _log_tool_visibility_delta(
+                visible_tool_names,
+                _get_tool_name_set(req.func_tool),
+            )
         if current_tools:
             try:
                 from astrbot.core.astr_main_agent_resources import TOOL_CALL_PROMPT

@@ -16,6 +16,27 @@ def _load_tool_policy():
     return module.ToolPolicy
 
 
+class FakeTool:
+    def __init__(self, name):
+        self.name = name
+
+
+class RemoveToolContainer:
+    def __init__(self, names):
+        self.tools = [FakeTool(name) for name in names]
+
+    def remove_tool(self, name):
+        self.tools = [tool for tool in self.tools if tool.name != name]
+
+
+class FuncListContainer:
+    def __init__(self, names):
+        self.func_list = [FakeTool(name) for name in names]
+
+    def remove_func(self, name):
+        self.func_list = [tool for tool in self.func_list if tool.name != name]
+
+
 class ToolPolicyTest(unittest.TestCase):
     def test_filters_by_allowed_names_denied_names_plugins_and_step_image_flag(self):
         tool_policy = _load_tool_policy()
@@ -66,6 +87,39 @@ class ToolPolicyTest(unittest.TestCase):
             ["search_tool"],
         )
 
+    def test_filters_toolset_like_container_by_visible_names(self):
+        tool_policy = _load_tool_policy()
+        container = RemoveToolContainer(["a", "b", "c"])
+
+        removed = tool_policy.filter_tool_container_for_visible_names(
+            container,
+            {"a", "c"},
+        )
+
+        self.assertEqual([tool.name for tool in container.tools], ["a", "c"])
+        self.assertEqual(removed, ["b"])
+
+    def test_filters_func_list_container_by_visible_names(self):
+        tool_policy = _load_tool_policy()
+        container = FuncListContainer(["a", "b", "c"])
+
+        removed = tool_policy.filter_tool_container_for_visible_names(
+            container,
+            {"b"},
+        )
+
+        self.assertEqual([tool.name for tool in container.func_list], ["b"])
+        self.assertEqual(removed, ["a", "c"])
+
+    def test_filter_container_skips_unrestricted_visible_names(self):
+        tool_policy = _load_tool_policy()
+        container = RemoveToolContainer(["a", "b"])
+
+        removed = tool_policy.filter_tool_container_for_visible_names(container, None)
+
+        self.assertEqual([tool.name for tool in container.tools], ["a", "b"])
+        self.assertEqual(removed, [])
+
     def test_main_uses_tool_policy_for_visible_tool_filtering(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
@@ -76,11 +130,23 @@ class ToolPolicyTest(unittest.TestCase):
             "tool_policy.allowed_names_for_prompt(visible_tools)",
             main_source,
         )
-        self.assertIn("def _filter_tool_container_for_visible_names", main_source)
+        self.assertNotIn("def _filter_tool_container_for_visible_names", main_source)
         self.assertIn(
-            "_filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)",
+            "ToolPolicy.filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)",
             main_source,
         )
+        plugin_filter_pos = main_source.index(
+            "ToolPolicy.filter_tool_container_for_visible_names(plugin_tool_set, visible_tool_names)"
+        )
+        req_filter_pos = main_source.index(
+            "ToolPolicy.filter_tool_container_for_visible_names(req.func_tool, visible_tool_names)"
+        )
+        current_tools_pos = main_source.index(
+            "current_tools = _get_compatible_tools(req.func_tool)"
+        )
+        self.assertLess(plugin_filter_pos, req_filter_pos)
+        self.assertLess(req_filter_pos, current_tools_pos)
+        self.assertIn("if tool_policy.is_unrestricted():", main_source)
 
 
 if __name__ == "__main__":

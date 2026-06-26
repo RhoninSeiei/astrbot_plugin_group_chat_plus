@@ -1,9 +1,6 @@
 """
-工具模块初始化
-导出所有工具类供主插件使用
-
-作者: Him666233
-版本: v1.2.1
+Group Chat Plus 工具模块导出
+RhoninSeiei 自用维护版，基于 Him666233 原项目修改
 """
 
 from .probability_manager import ProbabilityManager

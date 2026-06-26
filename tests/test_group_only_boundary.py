@@ -64,6 +64,15 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn("aiohttp", requirements)
         self.assertIn("httpx", requirements)
 
+    def test_utils_header_declares_rhonin_maintenance_scope(self):
+        utils_init = (REPO_ROOT / "utils" / "__init__.py").read_text(encoding="utf-8")
+        header = "\n".join(utils_init.splitlines()[:8])
+
+        self.assertIn("RhoninSeiei", header)
+        self.assertIn("基于 Him666233 原项目修改", header)
+        self.assertNotIn("作者: Him666233", header)
+        self.assertNotIn("版本: v1.2.1", header)
+
     def test_readme_runtime_dependency_instructions_match_requirements(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
