@@ -3564,9 +3564,31 @@ class ChatPlus(Star):
                 )
             except Exception:
                 pass
+            runtime_counts = {
+                "processing_sessions": len(self.processing_sessions),
+                "proactive_processing_sessions": len(
+                    self.proactive_processing_sessions
+                ),
+                "message_cache_snapshots": len(self._message_cache_snapshots),
+                "smart_batch_snapshots": len(self._smart_batch_snapshots),
+                "pending_bot_replies": len(self._pending_bot_replies),
+                "pending_bot_reply_segments": sum(
+                    len(v) for v in self._pending_bot_replies.values()
+                ),
+                "agent_done_flags": len(self._agent_done_flags),
+                "duplicate_blocked_messages": len(self._duplicate_blocked_messages),
+                "saved_messages": len(self._saved_messages),
+                "seen_message_ids": len(self._seen_message_ids),
+                "command_messages": len(self.command_messages),
+                "recent_reply_sessions": len(self.recent_replies_cache),
+                "recent_reply_items": sum(
+                    len(v) for v in self.recent_replies_cache.values()
+                ),
+                "raw_reply_cache": len(self.raw_reply_cache),
+            }
             try:
                 self.runtime_state.clear_all()
-                logger.info("【插件重置】已清空运行态容器 RuntimeState")
+                logger.info("【插件重置】已清空 RuntimeState: %s", runtime_counts)
             except Exception:
                 logger.warning("【插件重置】清空 RuntimeState 失败", exc_info=True)
             try:
@@ -3587,7 +3609,7 @@ class ChatPlus(Star):
                 # 会话处理中标记
                 # 🔒 使用锁保护清空操作，避免与并发检测冲突
                 async with self.concurrent_lock:
-                    processing_count = len(self.processing_sessions)
+                    processing_count = runtime_counts["processing_sessions"]
                     self.processing_sessions.clear()
 
                 logger.info(
@@ -3598,7 +3620,7 @@ class ChatPlus(Star):
                 logger.warning("【插件重置】清空处理中标记失败", exc_info=True)
             try:
                 # 指令标记缓存（跨处理器通信用）
-                command_count = len(self.command_messages)
+                command_count = runtime_counts["command_messages"]
                 self.command_messages.clear()
 
                 logger.info(
@@ -3609,7 +3631,8 @@ class ChatPlus(Star):
                 logger.warning("【插件重置】清空指令标记缓存失败", exc_info=True)
             try:
                 # 最近回复缓存（去重使用）
-                replies_total = sum(len(v) for v in self.recent_replies_cache.values())
+                replies_sessions = runtime_counts["recent_reply_sessions"]
+                replies_total = runtime_counts["recent_reply_items"]
                 self.recent_replies_cache.clear()
                 self.raw_reply_cache.clear()
                 self._pending_bot_replies.clear()
@@ -3617,8 +3640,8 @@ class ChatPlus(Star):
 
                 logger.info(
                     "【插件重置】已清空最近回复缓存 清理会话=%s, 清理条目=%s",
+                    replies_sessions,
                     replies_total,
-                    len(self.recent_replies_cache),
                 )
             except Exception:
                 logger.warning("【插件重置】清空最近回复缓存失败", exc_info=True)
@@ -5770,56 +5793,56 @@ class ChatPlus(Star):
                 )
 
         # 注入工具信息
+        # 工具策略独立于提示词注入开关：提示关闭时仍限制实际可执行工具。
+        allowed_tool_names = None
+        if self.tools_reminder_persona_filter:
+            try:
+                umo = event.unified_msg_origin
+                allowed_tool_names = await ToolsReminder.get_persona_tool_names(
+                    self.context, umo, platform_name
+                )
+                if self.debug_mode:
+                    if allowed_tool_names is not None:
+                        logger.info(
+                            f"  人格工具过滤: 允许 {len(allowed_tool_names)} 个工具"
+                        )
+                    else:
+                        logger.info("  人格未限制工具,使用全部工具")
+            except Exception as e:
+                logger.warning(f"人格工具过滤失败,使用全部工具: {e}")
+
+        tool_policy = ToolPolicy.from_allowed_tool_names(
+            allowed_tool_names,
+            allow_step_image=self.enable_step_image_tools,
+        )
+        policy_visible_tools = []
+        try:
+            available_tools = ToolsReminder.get_available_tools(self.context)
+            policy_visible_tools = tool_policy.filter_tools(available_tools)
+            if tool_policy.is_unrestricted():
+                visible_tool_names = None
+            else:
+                visible_tool_names = sorted(
+                    {
+                        str(tool.get("name", "")).strip()
+                        for tool in policy_visible_tools
+                        if str(tool.get("name", "")).strip()
+                    }
+                )
+            event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)
+        except Exception as e:
+            event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
+            logger.warning(f"记录提示工具列表失败: {e}")
+
         if self.enable_tools_reminder:
             if self.debug_mode:
                 logger.info("【步骤12】注入工具信息")
 
-            # 按人格过滤工具
-            allowed_tool_names = None
-            if self.tools_reminder_persona_filter:
-                try:
-                    umo = event.unified_msg_origin
-                    allowed_tool_names = await ToolsReminder.get_persona_tool_names(
-                        self.context, umo, platform_name
-                    )
-                    if self.debug_mode:
-                        if allowed_tool_names is not None:
-                            logger.info(
-                                f"  人格工具过滤: 允许 {len(allowed_tool_names)} 个工具"
-                            )
-                        else:
-                            logger.info("  人格未限制工具,使用全部工具")
-                except Exception as e:
-                    logger.warning(f"人格工具过滤失败,使用全部工具: {e}")
-
-            tool_policy = ToolPolicy.from_allowed_tool_names(
-                allowed_tool_names,
-                allow_step_image=self.enable_step_image_tools,
-            )
             old_len = len(final_message)
-            visible_tools = []
-            try:
-                visible_tools = ToolsReminder.get_available_tools(self.context)
-                visible_tools = tool_policy.filter_tools(visible_tools)
-                if tool_policy.is_unrestricted():
-                    visible_tool_names = None
-                else:
-                    visible_tool_names = sorted(
-                        {
-                            str(tool.get("name", "")).strip()
-                            for tool in visible_tools
-                            if str(tool.get("name", "")).strip()
-                        }
-                    )
-                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)
-            except Exception as e:
-                event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
-                logger.warning(f"记录提示工具列表失败: {e}")
-
             final_message = ToolsReminder.inject_tools_to_message(
                 final_message,
                 self.context,
-                tool_policy.allowed_names_for_prompt(visible_tools),
+                tool_policy.allowed_names_for_prompt(policy_visible_tools),
             )
             if self.debug_mode:
                 logger.info(

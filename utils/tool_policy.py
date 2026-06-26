@@ -16,6 +16,8 @@ class ToolPolicy:
     allowed_tool_names: frozenset[str] = frozenset()
     denied_tool_names: frozenset[str] = frozenset()
     allowed_plugin_names: frozenset[str] = frozenset()
+    # Reserved for dict-style visible tool filtering; executable ToolSet filtering
+    # currently uses resolved visible tool names.
     # Reserved for future AstrBot tool-loop integration. These fields are not
     # wired to ProviderRequest or the agent runner yet.
     max_steps: int = 0

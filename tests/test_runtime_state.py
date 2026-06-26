@@ -108,11 +108,16 @@ class RuntimeStateTest(unittest.TestCase):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
         reset_pos = main_source.index("async def _reset_plugin_data_and_reload")
+        counts_pos = main_source.index("runtime_counts = {", reset_pos)
         clear_pos = main_source.index("self.runtime_state.clear_all()", reset_pos)
         legacy_clear_pos = main_source.index("self.pending_messages_cache.clear()", reset_pos)
 
+        self.assertLess(counts_pos, clear_pos)
         self.assertLess(clear_pos, legacy_clear_pos)
-        self.assertIn("已清空运行态容器 RuntimeState", main_source)
+        self.assertIn("【插件重置】已清空 RuntimeState: %s", main_source)
+        self.assertIn('"processing_sessions"', main_source)
+        self.assertIn('"pending_bot_reply_segments"', main_source)
+        self.assertIn('"recent_reply_items"', main_source)
 
 
 if __name__ == "__main__":

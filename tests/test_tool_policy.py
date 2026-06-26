@@ -125,9 +125,9 @@ class ToolPolicyTest(unittest.TestCase):
 
         self.assertIn("ToolPolicy", main_source)
         self.assertIn("tool_policy = ToolPolicy", main_source)
-        self.assertIn("visible_tools = tool_policy.filter_tools", main_source)
+        self.assertIn("policy_visible_tools = tool_policy.filter_tools", main_source)
         self.assertIn(
-            "tool_policy.allowed_names_for_prompt(visible_tools)",
+            "tool_policy.allowed_names_for_prompt(policy_visible_tools)",
             main_source,
         )
         self.assertNotIn("def _filter_tool_container_for_visible_names", main_source)
@@ -147,6 +147,32 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertLess(plugin_filter_pos, req_filter_pos)
         self.assertLess(req_filter_pos, current_tools_pos)
         self.assertIn("if tool_policy.is_unrestricted():", main_source)
+
+    def test_main_decouples_tool_policy_from_tool_reminder_prompt(self):
+        main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        section_start = main_source.index("# 注入工具信息")
+        section_end = main_source.index("# 🆕 v1.0.2: 注入情绪状态", section_start)
+        tool_section = main_source[section_start:section_end]
+
+        policy_pos = tool_section.index("tool_policy = ToolPolicy.from_allowed_tool_names")
+        set_visible_pos = tool_section.index(
+            "event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)"
+        )
+        reminder_if_pos = tool_section.index("if self.enable_tools_reminder:")
+        inject_pos = tool_section.index("ToolsReminder.inject_tools_to_message")
+
+        self.assertLess(policy_pos, reminder_if_pos)
+        self.assertLess(set_visible_pos, reminder_if_pos)
+        self.assertGreater(inject_pos, reminder_if_pos)
+        self.assertIn("policy_visible_tools = tool_policy.filter_tools", tool_section)
+
+    def test_allowed_plugin_names_documents_executable_filter_scope(self):
+        policy_source = (REPO_ROOT / "utils" / "tool_policy.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("allowed_plugin_names: frozenset[str] = frozenset()", policy_source)
+        self.assertIn("executable ToolSet filtering", policy_source)
 
 
 if __name__ == "__main__":
