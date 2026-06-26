@@ -147,7 +147,7 @@
 ### 安装
 
 1. 在 AstrBot 插件市场搜索安装，或下载本仓库放入 `/data/plugins` 目录
-2. 安装依赖：`pip install pypinyin`
+2. 安装依赖：`pip install -r requirements.txt`
 3. 重启 AstrBot，在插件管理面板中配置
 
 ### 依赖要求
@@ -155,7 +155,9 @@
 | 依赖 | 版本 | 说明 |
 |------|------|------|
 | AstrBot | >= v4.24.0, < v5 | 平台框架 |
-| `pypinyin` | >= 0.44.0 | 打字错误生成器（拼音相似性），**需手动安装** |
+| `pypinyin` | >= 0.44.0 | 打字错误生成器（拼音相似性） |
+| `aiohttp` | >= 3.8.0 | AstrBot Dashboard 辅助请求与通用异步 HTTP 会话 |
+| `httpx` | >= 0.24.0 | StepFun Step Image Edit 2 图片生成与编辑请求 |
 
 - **推荐**: `astrbot_plugin_livingmemory` 或 `astrbot_plugin_play_sy` (记忆系统)
 
@@ -481,7 +483,7 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
 - 主运行入口移除管理面板服务器启动与停止逻辑
 - 主运行入口移除私聊事件处理器、私聊指令过滤和私聊图片缓存协调
 - 配置 schema 移除管理面板与私聊配置项
-- 运行依赖仅保留群聊主流程实际需要的 `pypinyin`
+- 运行依赖保留群聊主流程需要的 `pypinyin`、AstrBot Dashboard 重启辅助请求使用的 `aiohttp`，以及 StepFun 图片请求使用的 `httpx`
 
 ### v1.2.1 (2026-03-13)
 

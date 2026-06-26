@@ -64,6 +64,20 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn("aiohttp", requirements)
         self.assertIn("httpx", requirements)
 
+    def test_readme_runtime_dependency_instructions_match_requirements(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("pip install -r requirements.txt", readme)
+        self.assertIn("`pypinyin` | >= 0.44.0 | 打字错误生成器（拼音相似性）", readme)
+        self.assertIn(
+            "`aiohttp` | >= 3.8.0 | AstrBot Dashboard 辅助请求与通用异步 HTTP 会话",
+            readme,
+        )
+        self.assertIn(
+            "`httpx` | >= 0.24.0 | StepFun Step Image Edit 2 图片生成与编辑请求",
+            readme,
+        )
+
     def test_metadata_declares_rhonin_group_chat_fork(self):
         metadata = (REPO_ROOT / "metadata.yaml").read_text(encoding="utf-8")
 

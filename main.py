@@ -215,7 +215,7 @@ class ChatPlus(Star):
     """
 
     def _migrate_legacy_config_types(self) -> None:
-        """兼容旧版本配置类型，避免 WebUI 全量校验失败。"""
+        """兼容旧版本配置类型，避免 AstrBot 配置面板校验失败。"""
         key = "_emoji_filter_section_header"
         default_value = "--- 表情包过滤设置区 ---"
         try:
@@ -1569,15 +1569,17 @@ class ChatPlus(Star):
 
         # ========== 配置参数集中提取区块结束 ==========
 
-        # Dashboard 配置与重启 URL
-        self.dbc = self.context.get_config().get("dashboard", {})
-        self.host = self.dbc.get("host", "127.0.0.1")
-        self.port = self.dbc.get("port", 6185)
+        # AstrBot Dashboard 重启 API 辅助配置
+        self.dashboard_config = self.context.get_config().get("dashboard", {})
+        self.dashboard_host = self.dashboard_config.get("host", "127.0.0.1")
+        self.dashboard_port = self.dashboard_config.get("port", 6185)
         if os.environ.get("DASHBOARD_PORT"):
-            self.port = int(os.environ.get("DASHBOARD_PORT"))
-        if self.host == "0.0.0.0":
-            self.host = "127.0.0.1"
-        self.restart_url = f"http://{self.host}:{self.port}/api/stat/restart-core"
+            self.dashboard_port = int(os.environ.get("DASHBOARD_PORT"))
+        if self.dashboard_host == "0.0.0.0":
+            self.dashboard_host = "127.0.0.1"
+        self.dashboard_restart_url = (
+            f"http://{self.dashboard_host}:{self.dashboard_port}/api/stat/restart-core"
+        )
 
         # 统一设置详细日志开关到本插件的 utils 包及其子模块（使用相对导入，避免命名冲突）
         try:
@@ -1727,11 +1729,9 @@ class ChatPlus(Star):
         self._message_cache_snapshots = {}
         self._smart_batch_snapshots = {}
         self._smart_arrival_seq = 0
-        SmartConcurrentManager._EXPIRE_SECONDS = float(
-            self.smart_concurrent_merge_wait
-        )
-        SmartConcurrentManager._MAX_BATCH_SIZE = max(
-            1, int(self.smart_concurrent_max_batch_size)
+        self.smart_concurrent = SmartConcurrentManager(
+            expire_seconds=float(self.smart_concurrent_merge_wait),
+            max_batch_size=max(1, int(self.smart_concurrent_max_batch_size)),
         )
 
         # 🆕 主动对话正在处理的会话标记（用于普通对话和主动对话之间的并发保护）
@@ -2492,7 +2492,7 @@ class ChatPlus(Star):
 
         启动主动对话功能的后台任务
         """
-        self.session = aiohttp.ClientSession()
+        self.dashboard_http_session = aiohttp.ClientSession()
         # 生成运行时签名，用于追踪插件实例状态
         self._session_sig = self._compute_session_integrity("init")
         self._emit_session_metadata()
@@ -2525,8 +2525,8 @@ class ChatPlus(Star):
                 logger.info("⏹️ [主动对话] 后台任务已停止，状态已保存")
             except Exception as e:
                 logger.error(f"[主动对话] 停止后台任务失败: {e}", exc_info=True)
-        if hasattr(self, "session"):
-            await self.session.close()
+        if hasattr(self, "dashboard_http_session"):
+            await self.dashboard_http_session.close()
 
         for task in list(getattr(self, "_idle_flush_tasks", {}).values()):
             if task and not task.done():
@@ -2609,14 +2609,18 @@ class ChatPlus(Star):
         self.config["restart_start_ts"] = 0
         self.config.save_config()
 
-    async def _get_auth_token(self):
-        """获取认证token"""
-        login_url = f"http://{self.host}:{self.port}/api/auth/login"
+    async def _get_dashboard_auth_token(self):
+        """获取 AstrBot Dashboard API 认证 token。"""
+        login_url = (
+            f"http://{self.dashboard_host}:{self.dashboard_port}/api/auth/login"
+        )
         login_data = {
-            "username": self.dbc["username"],
-            "password": self.dbc["password"],
+            "username": self.dashboard_config["username"],
+            "password": self.dashboard_config["password"],
         }
-        async with self.session.post(login_url, json=login_data) as response:
+        async with self.dashboard_http_session.post(
+            login_url, json=login_data
+        ) as response:
             if response.status == 200:
                 data = await response.json()
                 if data and data.get("status") == "ok" and "data" in data:
@@ -2856,7 +2860,7 @@ class ChatPlus(Star):
                             if hasattr(event, "get_extra")
                             else ""
                         )
-                        await SmartConcurrentManager.remove_self(
+                        await self.smart_concurrent.remove_self(
                             smart_chat_id,
                             _cleanup_message_id,
                         )
@@ -2932,9 +2936,11 @@ class ChatPlus(Star):
         发送重启请求,重启AstrBot,并记录重启信息
         """
         try:
-            token = await self._get_auth_token()
+            token = await self._get_dashboard_auth_token()
             headers = {"Authorization": f"Bearer {token}"}
-            async with self.session.post(self.restart_url, headers=headers) as response:
+            async with self.dashboard_http_session.post(
+                self.dashboard_restart_url, headers=headers
+            ) as response:
                 if response.status == 200:
                     logger.info("系统重启请求已发送")
                 else:
@@ -5669,6 +5675,10 @@ class ChatPlus(Star):
         """
         # 记录开始时间
         _process_start_time = time.time()
+        try:
+            message_id_for_reply = self._get_message_id(event)
+        except Exception:
+            message_id_for_reply = None
 
         # 如果image_urls为None，初始化为空列表
         if image_urls is None:
@@ -5838,11 +5848,7 @@ class ChatPlus(Star):
         _start_time = time.time()
 
         ai_error_flag = False
-        message_id_for_error = None
-        try:
-            message_id_for_error = self._get_message_id(event)
-        except Exception:
-            message_id_for_error = None
+        message_id_for_error = message_id_for_reply
 
         enable_final_decision_gate = (
             self.enable_main_model_final_decision
@@ -5929,15 +5935,22 @@ class ChatPlus(Star):
                 except Exception as e:
                     logger.warning(f"[拟人增强] 记录主模型最终判断失败: {e}")
 
-            if cached_message_data:
+            declined_message_cache = current_message_cache
+            if not declined_message_cache and message_id_for_reply:
+                declined_message_cache = self._message_cache_snapshots.get(
+                    message_id_for_reply
+                )
+
+            if declined_message_cache:
                 self.cache_manager.add_to_cache(
-                    chat_id, cached_message_data, source="主模型最终判断过滤"
+                    chat_id, declined_message_cache, source="主模型最终判断过滤"
                 )
                 logger.info("📦 主模型最终判断: 不回复此消息，已缓存消息，等待后续转正")
             else:
                 logger.info("📦 主模型最终判断: 不回复此消息，无待缓存数据")
 
-            self._message_cache_snapshots.pop(early_message_id, None)
+            if message_id_for_reply:
+                self._message_cache_snapshots.pop(message_id_for_reply, None)
             event.call_llm = True
             try:
                 event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
@@ -7506,14 +7519,14 @@ class ChatPlus(Star):
         if self.concurrent_mode == "smart" and current_message_cache:
             try:
                 self._smart_arrival_seq += 1
-                await SmartConcurrentManager.register_arrival(
+                await self.smart_concurrent.register_arrival(
                     chat_id=chat_id,
                     processing_id=early_message_id,
                     source_event_id=early_message_id,
                     arrival_seq=self._smart_arrival_seq,
                     arrival_monotonic=time.monotonic(),
                 )
-                await SmartConcurrentManager.attach_payload(
+                await self.smart_concurrent.attach_payload(
                     chat_id=chat_id,
                     processing_id=early_message_id,
                     content=ContextManager.normalize_message_content(
@@ -7525,8 +7538,8 @@ class ChatPlus(Star):
                     is_forced=bool(is_at_message or has_trigger_keyword),
                 )
 
-                if await SmartConcurrentManager.is_consumed(early_message_id):
-                    consumer_id = await SmartConcurrentManager.get_consumer(
+                if await self.smart_concurrent.is_consumed(early_message_id):
+                    consumer_id = await self.smart_concurrent.get_consumer(
                         early_message_id
                     )
                     logger.info(
@@ -7535,15 +7548,15 @@ class ChatPlus(Star):
                     event.call_llm = True
                     return
 
-                if await SmartConcurrentManager.has_earlier_pending(
+                if await self.smart_concurrent.has_earlier_pending(
                     chat_id, early_message_id
                 ):
                     wait_deadline = time.monotonic() + float(
                         self.smart_concurrent_merge_wait
                     )
                     while time.monotonic() < wait_deadline:
-                        if await SmartConcurrentManager.is_consumed(early_message_id):
-                            consumer_id = await SmartConcurrentManager.get_consumer(
+                        if await self.smart_concurrent.is_consumed(early_message_id):
+                            consumer_id = await self.smart_concurrent.get_consumer(
                                 early_message_id
                             )
                             logger.info(
@@ -7551,7 +7564,7 @@ class ChatPlus(Star):
                             )
                             event.call_llm = True
                             return
-                        if not await SmartConcurrentManager.has_earlier_pending(
+                        if not await self.smart_concurrent.has_earlier_pending(
                             chat_id, early_message_id
                         ):
                             break
@@ -7560,7 +7573,7 @@ class ChatPlus(Star):
                 if self.smart_concurrent_claim_delay > 0:
                     await asyncio.sleep(float(self.smart_concurrent_claim_delay))
 
-                smart_claim = await SmartConcurrentManager.claim_batch(
+                smart_claim = await self.smart_concurrent.claim_batch(
                     chat_id, early_message_id
                 )
                 if smart_claim.get("is_consumed"):
@@ -7686,7 +7699,7 @@ class ChatPlus(Star):
                 source="AI决策过滤-smart-batch",
             )
             if self.concurrent_mode == "smart":
-                await SmartConcurrentManager.remove_self(chat_id, early_message_id)
+                await self.smart_concurrent.remove_self(chat_id, early_message_id)
 
             if self.debug_mode:
                 logger.info("=" * 60)
