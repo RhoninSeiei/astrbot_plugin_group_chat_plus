@@ -5813,7 +5813,7 @@ class ChatPlus(Star):
 
         tool_policy = ToolPolicy.from_allowed_tool_names(
             allowed_tool_names,
-            allow_step_image=self.enable_step_image_tools,
+            allow_step_image=StepImageService.is_enabled(self.step_image_config),
         )
         policy_visible_tools = []
         try:

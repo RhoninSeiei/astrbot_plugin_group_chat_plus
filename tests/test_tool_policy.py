@@ -166,6 +166,18 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertGreater(inject_pos, reminder_if_pos)
         self.assertIn("policy_visible_tools = tool_policy.filter_tools", tool_section)
 
+    def test_main_uses_step_image_config_for_tool_policy_flag(self):
+        main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        policy_start = main_source.index("tool_policy = ToolPolicy.from_allowed_tool_names")
+        policy_end = main_source.index("policy_visible_tools =", policy_start)
+        policy_block = main_source[policy_start:policy_end]
+
+        self.assertIn(
+            "allow_step_image=StepImageService.is_enabled(self.step_image_config)",
+            policy_block,
+        )
+        self.assertNotIn("allow_step_image=self.enable_step_image_tools", policy_block)
+
     def test_allowed_plugin_names_documents_executable_filter_scope(self):
         policy_source = (REPO_ROOT / "utils" / "tool_policy.py").read_text(
             encoding="utf-8"
