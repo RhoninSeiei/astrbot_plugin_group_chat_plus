@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -87,6 +88,25 @@ class ToolPolicy:
         if func_list is not None:
             return list(func_list)
         return []
+
+    @staticmethod
+    def clone_tool_container(tool_container):
+        if tool_container is None:
+            return None
+
+        tools = getattr(tool_container, "tools", None)
+        if tools is not None:
+            cloned = copy.copy(tool_container)
+            cloned.tools = list(tools)
+            return cloned
+
+        func_list = getattr(tool_container, "func_list", None)
+        if func_list is not None:
+            cloned = copy.copy(tool_container)
+            cloned.func_list = list(func_list)
+            return cloned
+
+        return copy.copy(tool_container)
 
     @classmethod
     def filter_tool_container_for_visible_names(

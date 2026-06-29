@@ -28,6 +28,17 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             self.reply_source,
         )
 
+    def test_formal_reply_clones_legacy_tool_manager_before_filtering(self):
+        self.assertIn("from .tool_policy import ToolPolicy", self.reply_source)
+        self.assertIn(
+            "plugin_tool_set = ToolPolicy.clone_tool_container(func_tools_mgr)",
+            self.reply_source,
+        )
+        self.assertNotIn(
+            "\n                    plugin_tool_set = func_tools_mgr\n",
+            self.reply_source,
+        )
+
     def test_on_llm_request_merges_platform_and_plugin_tools(self):
         self.assertIn("plugin_tools = _get_compatible_tools(plugin_tool_set)", self.main_source)
         self.assertIn("req.func_tool.merge(plugin_tool_set)", self.main_source)

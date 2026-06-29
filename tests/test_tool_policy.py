@@ -120,6 +120,30 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertEqual([tool.name for tool in container.tools], ["a", "b"])
         self.assertEqual(removed, [])
 
+    def test_clone_tool_container_keeps_original_toolset_like_container_intact(self):
+        tool_policy = _load_tool_policy()
+        original = RemoveToolContainer(["a", "b", "c"])
+
+        cloned = tool_policy.clone_tool_container(original)
+        removed = tool_policy.filter_tool_container_for_visible_names(cloned, {"a", "c"})
+
+        self.assertIsNot(cloned, original)
+        self.assertEqual([tool.name for tool in original.tools], ["a", "b", "c"])
+        self.assertEqual([tool.name for tool in cloned.tools], ["a", "c"])
+        self.assertEqual(removed, ["b"])
+
+    def test_clone_tool_container_keeps_original_func_list_container_intact(self):
+        tool_policy = _load_tool_policy()
+        original = FuncListContainer(["a", "b", "c"])
+
+        cloned = tool_policy.clone_tool_container(original)
+        removed = tool_policy.filter_tool_container_for_visible_names(cloned, {"b"})
+
+        self.assertIsNot(cloned, original)
+        self.assertEqual([tool.name for tool in original.func_list], ["a", "b", "c"])
+        self.assertEqual([tool.name for tool in cloned.func_list], ["b"])
+        self.assertEqual(removed, ["a", "c"])
+
     def test_main_uses_tool_policy_for_visible_tool_filtering(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 

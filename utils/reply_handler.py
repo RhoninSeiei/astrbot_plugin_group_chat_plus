@@ -18,6 +18,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
 from .ai_error_formatter import format_ai_error
 from .session_preferences import resolve_session_persona
+from .tool_policy import ToolPolicy
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -459,7 +460,7 @@ class ReplyHandler:
                 if hasattr(func_tools_mgr, "get_full_tool_set"):
                     plugin_tool_set = func_tools_mgr.get_full_tool_set()
                 else:
-                    plugin_tool_set = func_tools_mgr
+                    plugin_tool_set = ToolPolicy.clone_tool_container(func_tools_mgr)
 
                 plugin_tools = getattr(plugin_tool_set, "tools", None)
                 if plugin_tools is None:
