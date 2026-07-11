@@ -113,11 +113,16 @@ class TimeoutAccessProvider:
         error_type,
         fail_stage: str,
         fail_call: bool = False,
+        write_before_initial_error: bool = False,
+        fail_setup_rollback: bool = False,
     ):
         self.result_path = result_path
         self.error_type = error_type
         self.fail_stage = fail_stage
         self.fail_call = fail_call
+        self.write_before_initial_error = write_before_initial_error
+        self.fail_setup_rollback = fail_setup_rollback
+        self.setup_rollback_attempted = False
         self.calls = []
         self._timeout = 120
 
@@ -136,7 +141,12 @@ class TimeoutAccessProvider:
     @timeout.setter
     def timeout(self, value):
         if self.fail_stage == "initial_setter" and value == 300.0:
+            if self.write_before_initial_error:
+                self._timeout = value
             self._raise_sensitive("timeout initial setter")
+        if self.fail_setup_rollback and value == 120 and self._timeout == 300.0:
+            self.setup_rollback_attempted = True
+            self._raise_sensitive("timeout setup rollback")
         if self.fail_stage == "restore_setter" and value == 120:
             self._raise_sensitive("timeout restore setter")
         self._timeout = value
@@ -148,6 +158,47 @@ class TimeoutAccessProvider:
                 "call exposed sensitive-token-value, "
                 "openai_oauth/private-provider, and /private/codex/call.json"
             )
+        return [
+            SimpleNamespace(
+                path=str(self.result_path),
+                mime_type="image/png",
+                revised_prompt="",
+            )
+        ]
+
+
+class MissingTimeoutDeleteProvider:
+    capabilities = {"image_generate": True, "image_edit": True}
+
+    def __init__(self, result_path: Path, error_type):
+        self.result_path = result_path
+        self.error_type = error_type
+        self.calls = []
+        self._has_timeout = False
+
+    @property
+    def timeout(self):
+        if not self._has_timeout:
+            raise AttributeError("timeout is absent")
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value):
+        self._timeout = value
+        self._has_timeout = True
+
+    @timeout.deleter
+    def timeout(self):
+        if self._has_timeout:
+            del self._timeout
+            self._has_timeout = False
+        raise self.error_type(
+            "timeout delete exposed sensitive-token-value, "
+            "openai_oauth/private-provider, and /private/codex/timeout-delete.json"
+        )
+
+    async def generate_image(self, **kwargs):
+        self.calls.append(kwargs)
         return [
             SimpleNamespace(
                 path=str(self.result_path),
@@ -372,6 +423,67 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertEqual(
             str(caught.exception),
             "Codex OAuth 图片 Provider 调用失败。",
+        )
+        self.assert_sanitized_error(caught.exception)
+
+    def test_initial_timeout_setter_failure_rolls_back_changed_value(self):
+        provider = TimeoutAccessProvider(
+            Path("unused.png"),
+            error_type=CodexOAuthImageConfigError,
+            fail_stage="initial_setter",
+            write_before_initial_error=True,
+        )
+        with self.assertRaises(CodexOAuthImageProviderError) as caught:
+            asyncio.run(
+                self.make_service(provider).generate(prompt="cat", size="1:1")
+            )
+
+        self.assertEqual(provider.timeout, 120)
+        self.assertEqual(
+            str(caught.exception),
+            "Codex OAuth 图片 Provider 超时访问失败。",
+        )
+        self.assert_sanitized_error(caught.exception)
+
+    def test_setup_error_wins_when_setup_rollback_also_fails(self):
+        provider = TimeoutAccessProvider(
+            Path("unused.png"),
+            error_type=CodexOAuthImageUserError,
+            fail_stage="initial_setter",
+            write_before_initial_error=True,
+            fail_setup_rollback=True,
+        )
+        with self.assertRaises(CodexOAuthImageProviderError) as caught:
+            asyncio.run(
+                self.make_service(provider).generate(prompt="cat", size="1:1")
+            )
+
+        self.assertEqual(
+            str(caught.exception),
+            "Codex OAuth 图片 Provider 超时访问失败。",
+        )
+        self.assertTrue(provider.setup_rollback_attempted)
+        self.assert_sanitized_error(caught.exception)
+
+    def test_missing_timeout_delete_failure_is_sanitized_after_attribute_removed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = MissingTimeoutDeleteProvider(
+                result_path,
+                CodexOAuthImageConfigError,
+            )
+            self.assertFalse(hasattr(provider, "timeout"))
+
+            with self.assertRaises(CodexOAuthImageProviderError) as caught:
+                asyncio.run(
+                    self.make_service(provider).generate(prompt="cat", size="1:1")
+                )
+
+        self.assertFalse(hasattr(provider, "timeout"))
+        self.assertEqual(
+            str(caught.exception),
+            "Codex OAuth 图片 Provider 超时恢复失败。",
         )
         self.assert_sanitized_error(caught.exception)
 

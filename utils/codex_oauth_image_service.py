@@ -85,18 +85,41 @@ async def _temporary_provider_timeout(provider: Any, timeout: float):
     async with _provider_timeout_lock(provider):
         missing_timeout = object()
         previous_timeout = missing_timeout
+        previous_timeout_known = False
+        state = _ProviderTimeoutState()
         setup_error = None
         try:
             previous_timeout = getattr(provider, "timeout", missing_timeout)
-            setattr(provider, "timeout", timeout)
+            previous_timeout_known = True
         except Exception:
             setup_error = CodexOAuthImageProviderError(
                 "Codex OAuth 图片 Provider 超时访问失败。"
             )
+
+        if setup_error is None:
+            try:
+                setattr(provider, "timeout", timeout)
+            except Exception:
+                setup_error = CodexOAuthImageProviderError(
+                    "Codex OAuth 图片 Provider 超时访问失败。"
+                )
+
+        if setup_error is not None and previous_timeout_known:
+            setup_restore_error = None
+            try:
+                if previous_timeout is missing_timeout:
+                    delattr(provider, "timeout")
+                else:
+                    setattr(provider, "timeout", previous_timeout)
+            except Exception:
+                setup_restore_error = CodexOAuthImageProviderError(
+                    "Codex OAuth 图片 Provider 超时恢复失败。"
+                )
+            state.restore_error = setup_restore_error
+
         if setup_error is not None:
             raise setup_error
 
-        state = _ProviderTimeoutState()
         try:
             yield state
         finally:
