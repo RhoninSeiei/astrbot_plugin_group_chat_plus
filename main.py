@@ -8412,7 +8412,7 @@ class ChatPlus(Star):
     def _build_step_image_progress_text(self, action: Optional[str] = None) -> str:
         backend_name = self._get_step_image_service().display_name()
         verb = "编辑这张图" if action == "edit" else "生成图片"
-        return f"正在用{backend_name}{verb}，稍等一下。"
+        return f"正在用 {backend_name}{verb}，稍等一下。"
 
     def _mark_step_image_progress_sent(
         self,
