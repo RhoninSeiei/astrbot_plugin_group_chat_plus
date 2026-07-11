@@ -62,6 +62,20 @@ class FailingProvider(FakeProvider):
         )
 
 
+class ClassifiedFailingProvider(FakeProvider):
+    def __init__(self, result_path: Path, error_type):
+        super().__init__(result_path)
+        self.error_type = error_type
+
+    async def generate_image(self, **kwargs):
+        self.calls.append(kwargs)
+        self.timeout_during_call = self.timeout
+        raise self.error_type(
+            "provider exposed sensitive-token-value, "
+            "openai_oauth/private-provider, and /private/codex/provider-error.json"
+        )
+
+
 class ConcurrentProvider(FakeProvider):
     __hash__ = None
 
@@ -220,6 +234,25 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertEqual(provider.timeout, 120)
         self.assert_sanitized_error(caught.exception)
 
+    def test_provider_classified_errors_are_always_sanitized_as_provider_errors(self):
+        for error_type in (
+            CodexOAuthImageUserError,
+            CodexOAuthImageConfigError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                provider = ClassifiedFailingProvider(Path("unused.png"), error_type)
+                with self.assertRaises(CodexOAuthImageProviderError) as caught:
+                    asyncio.run(
+                        self.make_service(provider).generate(prompt="cat", size="1:1")
+                    )
+
+                self.assertEqual(provider.timeout_during_call, 300.0)
+                self.assertEqual(provider.timeout, 120)
+                self.assert_sanitized_error(caught.exception)
+                rendered = "".join(traceback.format_exception(caught.exception))
+                self.assertNotIn("openai_oauth/private-provider", rendered)
+                self.assertNotIn("openai_oauth/private-provider", str(caught.exception))
+
     def test_same_provider_calls_are_serialized_with_isolated_timeouts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "result.png"
@@ -255,6 +288,19 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
             )
 
         self.assert_sanitized_error(caught.exception)
+
+    def test_non_finite_timeouts_are_configuration_errors(self):
+        provider = FakeProvider(Path("unused.png"))
+        for timeout in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(CodexOAuthImageConfigError) as caught:
+                    asyncio.run(
+                        self.make_service(provider, timeout=timeout).generate(
+                            prompt="cat", size="1:1"
+                        )
+                    )
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertIsNone(caught.exception.__context__)
 
     def test_external_provider_interactions_are_sanitized(self):
         with tempfile.TemporaryDirectory() as tmpdir:

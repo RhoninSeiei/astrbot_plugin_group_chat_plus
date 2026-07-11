@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -165,7 +166,7 @@ class CodexOAuthImageService:
             timeout_error = CodexOAuthImageConfigError("Codex OAuth 超时配置无效。")
         if timeout_error is not None:
             raise timeout_error
-        if timeout < 30 or timeout > 900:
+        if not math.isfinite(timeout) or not 30 <= timeout <= 900:
             raise CodexOAuthImageConfigError("Codex OAuth 超时必须在 30 至 900 秒之间。")
         return timeout
 
@@ -240,16 +241,22 @@ class CodexOAuthImageService:
         generated = None
         service_error = None
         provider_error = None
+        provider_call_error = None
         try:
             async with _temporary_provider_timeout(provider, timeout):
-                generated = await generate_image(
-                    prompt=clean_prompt,
-                    model=model,
-                    size=resolved_size,
-                    n=1,
-                    reference_images=reference_images or None,
-                    action=action,
-                )
+                try:
+                    generated = await generate_image(
+                        prompt=clean_prompt,
+                        model=model,
+                        size=resolved_size,
+                        n=1,
+                        reference_images=reference_images or None,
+                        action=action,
+                    )
+                except Exception:
+                    provider_call_error = CodexOAuthImageProviderError(
+                        "Codex OAuth 图片 Provider 调用失败。"
+                    )
         except (CodexOAuthImageUserError, CodexOAuthImageConfigError) as error:
             service_error = error
         except Exception:
@@ -260,6 +267,8 @@ class CodexOAuthImageService:
             raise service_error
         if provider_error is not None:
             raise provider_error
+        if provider_call_error is not None:
+            raise provider_call_error
 
         results = None
         result_path = None
