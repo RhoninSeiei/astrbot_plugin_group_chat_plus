@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import unittest
 
@@ -18,7 +19,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         )
         self.assertIn('@filter.llm_tool(name="gcp_step_image_edit")', self.main_source)
         self.assertIn(
-            "StepImageService.is_enabled(self.step_image_config)", self.main_source
+            "GroupImageService.is_enabled(self.step_image_config)", self.main_source
         )
         self.assertIn("self._is_step_image_enabled_for_event(event)", self.main_source)
         self.assertIn("await self._send_step_image_progress", self.main_source)
@@ -45,9 +46,19 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         for status in ('status="success"', 'status="failed"'):
             self.assertIn(status, self.main_source)
 
-        self.assertIn("Step Image Edit 2", self.main_source)
+        self.assertIn("群聊图片工具", self.main_source)
         self.assertIn("自然语言", self.main_source)
-        self.assertIn("不要输出工具调用格式", self.main_source)
+        self.assertIn("先提交工具参数并等待工具结果", self.main_source)
+        self.assertIn("成功时图片由工具发送一次", self.main_source)
+        self.assertIn("禁止输出工具协议、参数、Provider ID", self.main_source)
+        self.assertIn(
+            'return f"群聊图片工具 {action_label}{status_label}：{result_message}"',
+            self.main_source,
+        )
+        self.assertIn(
+            'return f"群聊图片工具 {action}{status_label}: {safe_message}"',
+            self.main_source,
+        )
 
     def test_step_image_tool_history_uses_safe_status_summary(self):
         self.assertIn("def _build_step_image_history_summary", self.main_source)
@@ -84,7 +95,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
     def test_intermediate_step_image_text_becomes_progress_message(self):
         self.assertIn("_maybe_replace_step_image_intermediate_text", self.main_source)
         self.assertIn("self._infer_step_image_action(event)", self.main_source)
-        self.assertIn("阶跃星辰 Step Image Edit 2", self.main_source)
+        self.assertIn("self._get_step_image_service().display_name()", self.main_source)
         self.assertIn("PLUGIN_STEP_IMAGE_PROGRESS_SENT", self.main_source)
         self.assertIn("pending_replies[-1] != reply_text", self.main_source)
 
@@ -106,6 +117,46 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             self.assertIn(key, self.schema_source)
         self.assertIn('"_special": "select_provider"', self.schema_source)
         self.assertIn('"default": "768x1360"', self.schema_source)
+
+    def test_schema_exposes_configurable_image_backends(self):
+        schema = json.loads(self.schema_source)
+        self.assertEqual(schema["image_tool_backend"]["default"], "codex_oauth")
+        self.assertEqual(
+            schema["image_tool_backend"]["options"], ["codex_oauth", "stepfun"]
+        )
+        self.assertEqual(
+            schema["codex_oauth_image_provider_id"]["default"],
+            "openai_oauth/gpt-5.6-sol",
+        )
+        self.assertEqual(
+            schema["codex_oauth_image_provider_id"]["_special"], "select_provider"
+        )
+        self.assertEqual(
+            schema["codex_oauth_image_model"]["default"], "gpt-5.6-sol"
+        )
+        self.assertEqual(
+            schema["codex_oauth_image_default_size"]["options"],
+            ["1024x1024", "1536x1024", "1024x1536"],
+        )
+        self.assertEqual(schema["codex_oauth_image_timeout"]["default"], 300)
+
+    def test_main_routes_existing_tools_through_group_image_service(self):
+        self.assertIn(
+            "GroupImageService.is_enabled(self.step_image_config)", self.main_source
+        )
+        self.assertIn("return GroupImageService(", self.main_source)
+        self.assertIn(
+            "self._get_step_image_service().display_name()", self.main_source
+        )
+        self.assertIn("except GroupImageUserError", self.main_source)
+        self.assertIn("except GroupImageConfigError", self.main_source)
+        self.assertIn("except GroupImageProviderError", self.main_source)
+        self.assertIn(
+            '"image_tool_backend": config.get("image_tool_backend"),',
+            self.main_source,
+        )
+        self.assertNotIn('config.get("image_tool_backend",', self.main_source)
+        self.assertIn('size=str(size or "").strip(),', self.main_source)
 
     def test_tool_description_requires_model_refined_prompt(self):
         self.assertIn("正式回复模型整理后的图像提示词", self.main_source)

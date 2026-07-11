@@ -280,10 +280,41 @@
         "default": 10
     },
     "enable_step_image_tools": {
-        "description": "🖼️ 启用 StepFun 生图/修图工具",
+        "description": "🖼️ 启用群聊生图与修图工具",
         "type": "bool",
         "hint": "开启后，启用 group_chat_plus 的群聊可以通过正式回复阶段的工具调用生成图片或编辑当前消息中的图片。工具只返回图片，不向群聊暴露 API 地址、Key、原始响应或临时文件路径。判断阶段不会调用该工具。",
         "default": false
+    },
+    "image_tool_backend": {
+        "description": "🖼️ 群聊图片后端",
+        "type": "string",
+        "options": ["codex_oauth", "stepfun"],
+        "hint": "新配置默认使用 Codex OAuth 图像生成；旧配置缺少该字段时继续使用 StepFun。",
+        "default": "codex_oauth"
+    },
+    "codex_oauth_image_provider_id": {
+        "description": "🖼️ Codex OAuth 图片 Provider",
+        "type": "string",
+        "hint": "选择声明 image_generate 和 image_edit 能力的 Codex OAuth Provider。",
+        "default": "openai_oauth/gpt-5.6-sol",
+        "_special": "select_provider"
+    },
+    "codex_oauth_image_model": {
+        "description": "🖼️ Codex OAuth 主模型",
+        "type": "string",
+        "default": "gpt-5.6-sol"
+    },
+    "codex_oauth_image_default_size": {
+        "description": "🖼️ Codex OAuth 默认尺寸",
+        "type": "string",
+        "options": ["1024x1024", "1536x1024", "1024x1536"],
+        "default": "1024x1024"
+    },
+    "codex_oauth_image_timeout": {
+        "description": "🖼️ Codex OAuth 调用超时（秒）",
+        "type": "int",
+        "hint": "允许 30 至 900 秒，默认 300 秒。",
+        "default": 300
     },
     "step_image_provider_id": {
         "description": "🖼️ StepFun 图片模型 Provider",

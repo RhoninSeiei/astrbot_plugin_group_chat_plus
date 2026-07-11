@@ -162,7 +162,7 @@ class MultimodalHistoryContentTest(unittest.TestCase):
     def test_format_context_for_ai_omits_tool_call_record_blocks(self):
         bot_msg = self.AstrBotMessage()
         bot_msg.message_str = (
-            "正在用阶跃星辰 Step Image Edit 2 生成图片，稍等一下。\n"
+            "正在用 OpenAI Codex 图像生成服务生成图片，稍等一下。\n"
             "[工具调用记录]\n"
             '- gcp_step_image_generate({"prompt": "水彩少女"}) '
             "→ The tool has no return value, or has sent the result directly to the user.\n"
@@ -192,7 +192,7 @@ class MultimodalHistoryContentTest(unittest.TestCase):
             )
         )
 
-        self.assertIn("正在用阶跃星辰 Step Image Edit 2 生成图片", formatted)
+        self.assertIn("正在用 OpenAI Codex 图像生成服务生成图片", formatted)
         self.assertIn("收到，把细节加进提示词重新生成。", formatted)
         self.assertNotIn("[工具调用记录]", formatted)
         self.assertNotIn("gcp_step_image_generate", formatted)

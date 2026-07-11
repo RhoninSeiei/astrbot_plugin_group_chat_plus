@@ -197,7 +197,7 @@ class ToolPolicyTest(unittest.TestCase):
         policy_block = main_source[policy_start:policy_end]
 
         self.assertIn(
-            "allow_step_image=StepImageService.is_enabled(self.step_image_config)",
+            "allow_step_image=GroupImageService.is_enabled(self.step_image_config)",
             policy_block,
         )
         self.assertNotIn("allow_step_image=self.enable_step_image_tools", policy_block)

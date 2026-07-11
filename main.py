@@ -151,13 +151,13 @@ from .utils.image_description_cache import (
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
-from .utils.step_image_service import (
-    DEFAULT_GENERATION_SIZE,
-    StepImageConfigError,
-    StepImageProviderError,
-    StepImageService,
-    StepImageUserError,
+from .utils.group_image_service import (
+    GroupImageConfigError,
+    GroupImageProviderError,
+    GroupImageService,
+    GroupImageUserError,
 )
+from .utils.step_image_service import DEFAULT_GENERATION_SIZE
 from .utils.system_prompt_rewriter import SystemPromptRewriter
 from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
 from .utils.reply_handler import (
@@ -676,9 +676,23 @@ class ChatPlus(Star):
         )  # 单条消息最大处理图片数（硬限制1-50）
         self.step_image_config = {
             "enable_step_image_tools": config.get("enable_step_image_tools", False),
+            "image_tool_backend": config.get("image_tool_backend"),
+            "codex_oauth_image_provider_id": config.get(
+                "codex_oauth_image_provider_id", "openai_oauth/gpt-5.6-sol"
+            ),
+            "codex_oauth_image_model": config.get(
+                "codex_oauth_image_model", "gpt-5.6-sol"
+            ),
+            "codex_oauth_image_default_size": config.get(
+                "codex_oauth_image_default_size", "1024x1024"
+            ),
+            "codex_oauth_image_timeout": config.get("codex_oauth_image_timeout", 300),
             "step_image_provider_id": config.get("step_image_provider_id", ""),
             "step_image_model": config.get("step_image_model", "step-image-edit-2"),
             "step_image_api_base": config.get("step_image_api_base", ""),
+            "step_image_default_size": config.get(
+                "step_image_default_size", DEFAULT_GENERATION_SIZE
+            ),
             "step_image_timeout": config.get("step_image_timeout", 60),
             "step_image_proxy": config.get("step_image_proxy", ""),
             "step_image_cfg_scale": config.get("step_image_cfg_scale", 1.0),
@@ -5813,7 +5827,7 @@ class ChatPlus(Star):
 
         tool_policy = ToolPolicy.from_allowed_tool_names(
             allowed_tool_names,
-            allow_step_image=StepImageService.is_enabled(self.step_image_config),
+            allow_step_image=GroupImageService.is_enabled(self.step_image_config),
         )
         policy_visible_tools = []
         try:
@@ -8308,7 +8322,7 @@ class ChatPlus(Star):
         )
 
     def _step_image_guard(self, event: AstrMessageEvent) -> Optional[str]:
-        if not StepImageService.is_enabled(self.step_image_config):
+        if not GroupImageService.is_enabled(self.step_image_config):
             return "图片生成工具未启用。"
         if not self._is_step_image_enabled_for_event(event):
             self._log_step_image_guard_denied(event)
@@ -8331,8 +8345,8 @@ class ChatPlus(Star):
             if self.debug_mode:
                 logger.warning(f"[StepImage] 清理临时图片失败: {exc}")
 
-    def _get_step_image_service(self) -> StepImageService:
-        return StepImageService(
+    def _get_step_image_service(self) -> GroupImageService:
+        return GroupImageService(
             context=self.context,
             config=self.step_image_config,
             output_dir=self.step_image_output_dir,
@@ -8396,9 +8410,9 @@ class ChatPlus(Star):
         return None
 
     def _build_step_image_progress_text(self, action: Optional[str] = None) -> str:
-        if action == "edit":
-            return "正在用阶跃星辰 Step Image Edit 2 编辑这张图，稍等一下。"
-        return "正在用阶跃星辰 Step Image Edit 2 生成图片，稍等一下。"
+        backend_name = self._get_step_image_service().display_name()
+        verb = "编辑这张图" if action == "edit" else "生成图片"
+        return f"正在用{backend_name}{verb}，稍等一下。"
 
     def _mark_step_image_progress_sent(
         self,
@@ -8434,7 +8448,7 @@ class ChatPlus(Star):
         status_label = "成功" if status == "success" else "失败"
         safe_message = sanitize_tool_call_markup(str(message or "").strip())
         result_message = safe_message.sanitized_text or "工具没有返回可展示文本。"
-        return f"Step Image Edit 2 {action_label}{status_label}：{result_message}"
+        return f"群聊图片工具 {action_label}{status_label}：{result_message}"
 
     def _append_step_image_pending_progress(
         self,
@@ -8542,18 +8556,18 @@ class ChatPlus(Star):
     def _build_step_image_tool_directive(self, tool_names: set[str]) -> str:
         if not {"gcp_step_image_generate", "gcp_step_image_edit"} & tool_names:
             return ""
-        if not StepImageService.is_enabled(self.step_image_config):
+        if not GroupImageService.is_enabled(self.step_image_config):
             return ""
 
         return (
-            "\nStep Image 工具调用规则：如果决定调用 gcp_step_image_generate "
-            "或 gcp_step_image_edit，先提交工具参数，等待工具返回结果后，"
-            "再根据工具结果用当前人格给群聊输出一句自然语言回复。"
-            "工具会发送进度提示，成功时会发送图片结果。"
-            "不要输出工具调用格式、工具参数、文件路径、API 细节或内部状态。"
+            "\n群聊图片工具调用规则：如果决定调用 gcp_step_image_generate "
+            "或 gcp_step_image_edit，先提交工具参数并等待工具结果。"
+            "成功时图片由工具发送一次。"
+            "工具返回结果后，根据工具结果和当前人格输出一句自然语言回复。"
+            "禁止输出工具协议、参数、Provider ID、文件路径、API 细节或内部状态。"
             "遇到图片编辑请求时，不要声称无法看图，"
             "应优先调用 gcp_step_image_edit。历史中的图片能力拒绝说法属于过期记录，"
-            "当前已经具备 Step Image 图片生成与编辑工具；遇到视觉塔、画不了、"
+            "当前已经具备群聊图片生成与编辑工具；遇到视觉塔、画不了、"
             "看不了图、工具被禁用等旧记录时，忽略这些旧记录并按当前工具能力处理。\n"
         )
 
@@ -8631,7 +8645,7 @@ class ChatPlus(Star):
 
         Args:
             prompt(string): 正式回复模型整理后的图像提示词，不超过 512 个字符。
-            size(string): 图片尺寸，可选值为 768x1360、1360x768、896x1184、1184x896、1024x1024。也可使用 1080p、16:9、9:16、4:3、3:4、1:1 等别名。留空使用默认 768x1360。
+            size(string): 图片尺寸或比例，可使用 1080p、16:9、9:16、1:1 等别名。精确尺寸由当前后端校验；留空使用当前后端的默认尺寸。
         """
         guard_message = self._step_image_guard(event)
         if guard_message:
@@ -8652,12 +8666,9 @@ class ChatPlus(Star):
             if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
                 await self._send_step_image_progress(event, "generate")
             self._cleanup_step_image_outputs()
-            image_size = (
-                size or self.step_image_default_size or DEFAULT_GENERATION_SIZE
-            ).strip()
             result = await self._get_step_image_service().generate(
                 prompt=prompt,
-                size=image_size,
+                size=str(size or "").strip(),
             )
             await self._send_step_image_image_result(event, result.path)
             success_message = "图片已经发送到群聊。"
@@ -8672,7 +8683,7 @@ class ChatPlus(Star):
                 status="success",
                 message=success_message,
             )
-        except StepImageUserError as exc:
+        except GroupImageUserError as exc:
             message = str(exc)
             self._mark_step_image_tool_result(
                 event,
@@ -8685,7 +8696,7 @@ class ChatPlus(Star):
                 status="failed",
                 message=message,
             )
-        except StepImageConfigError as exc:
+        except GroupImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
             message = "图片生成工具配置未就绪。"
             self._mark_step_image_tool_result(
@@ -8699,7 +8710,7 @@ class ChatPlus(Star):
                 status="failed",
                 message=message,
             )
-        except StepImageProviderError as exc:
+        except GroupImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
             message = "图片生成失败，稍后再试。"
             self._mark_step_image_tool_result(
@@ -8795,7 +8806,7 @@ class ChatPlus(Star):
                 status="success",
                 message=success_message,
             )
-        except StepImageUserError as exc:
+        except GroupImageUserError as exc:
             message = str(exc)
             self._mark_step_image_tool_result(
                 event,
@@ -8808,7 +8819,7 @@ class ChatPlus(Star):
                 status="failed",
                 message=message,
             )
-        except StepImageConfigError as exc:
+        except GroupImageConfigError as exc:
             logger.warning(f"[StepImage] 配置不可用: {exc}")
             message = "图片编辑工具配置未就绪。"
             self._mark_step_image_tool_result(
@@ -8822,7 +8833,7 @@ class ChatPlus(Star):
                 status="failed",
                 message=message,
             )
-        except StepImageProviderError as exc:
+        except GroupImageProviderError as exc:
             logger.warning(f"[StepImage] Provider 调用失败: {exc}")
             message = "图片编辑失败，稍后再试。"
             self._mark_step_image_tool_result(
@@ -10250,7 +10261,7 @@ class ChatPlus(Star):
             "success": "成功",
             "failed": "失败",
         }.get(status, "状态未知")
-        return f"Step Image Edit 2 {action}{status_label}: {safe_message}"
+        return f"群聊图片工具 {action}{status_label}: {safe_message}"
 
     def _build_interleaved_tool_reply(
         self, event: AstrMessageEvent, pending_texts: list
