@@ -1,3 +1,4 @@
+import ast
 import json
 from pathlib import Path
 import unittest
@@ -26,6 +27,23 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         )
         self.requirements_source = (REPO_ROOT / "requirements.txt").read_text(
             encoding="utf-8"
+        )
+        self.context_manager_source = (
+            REPO_ROOT / "utils" / "context_manager.py"
+        ).read_text(encoding="utf-8")
+
+    def _context_manager_method(self, method_name):
+        tree = ast.parse(self.context_manager_source)
+        context_manager = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ContextManager"
+        )
+        return next(
+            node
+            for node in context_manager.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
         )
 
     def test_legacy_web_and_private_modules_are_not_in_plugin_root(self):
@@ -196,35 +214,60 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
             self.message_workflow_source,
             self.changelog_source,
         ):
-            self.assertNotIn("操作类型、后端显示名和安全状态摘要", source)
-            self.assertNotIn("模型上下文与历史保存前清除", source)
-            self.assertNotIn("群聊与历史记录不会保存工具协议", source)
-            self.assertNotIn("保存前清除工具协议", source)
+            for forbidden in (
+                "内部持久历史可按执行顺序保存交错的工具调用记录",
+                "内部持久历史可以按实际执行顺序保存交错的工具调用记录",
+                "内部持久历史可以保留交错的工具调用记录",
+                "内部工具名和已脱敏参数占位",
+                "内部工具调用记录属于持久历史审计内容",
+                "交错保存到历史",
+                "交错保存到对话历史",
+            ):
+                self.assertNotIn(forbidden, source)
 
-        for marker in (
-            "内部持久历史可按执行顺序保存交错的工具调用记录",
-            "内部工具名和已脱敏参数占位",
-            "图片工具摘要只包含操作类型、成功或失败状态和安全消息，不包含后端显示名",
-            "后续格式化为模型上下文时会过滤这些工具协议块",
-            "这些工具协议块不会发送到群聊",
-            "Provider ID、凭据、API 地址、原始响应和文件路径不会进入安全摘要或群聊文本",
-        ):
-            self.assertIn(marker, self.message_workflow_source)
-            self.assertIn(marker, self.changelog_source)
+            for marker in (
+                "主流程只在当前处理期间临时构造交错工具记录",
+                "保存前清除工具协议块",
+                "自定义历史与官方会话写入清理后的文本",
+                "后续格式化为模型上下文时再次过滤旧数据或外部数据",
+                "群聊输出不包含工具协议块",
+                "图片安全摘要只包含操作类型、成功或失败状态和安全消息，不包含后端显示名",
+                "Provider ID、凭据、API 地址、原始响应和文件路径不会进入安全摘要或群聊文本",
+            ):
+                self.assertIn(marker, source)
 
-        for marker in (
-            "内部持久历史可以按实际执行顺序保存交错的工具调用记录",
-            "图片工具摘要只记录操作类型、成功或失败状态和安全消息，不记录后端显示名",
-            "后续格式化模型上下文时会过滤工具协议块",
-        ):
-            self.assertIn(marker, self.readme_source)
+    def test_save_bot_message_sanitizes_before_persistent_writes(self):
+        method = self._context_manager_method("save_bot_message")
+        method_source = ast.get_source_segment(self.context_manager_source, method)
+        self.assertIsNotNone(method_source)
 
-        for marker in (
-            "内部持久历史可以保留交错的工具调用记录、内部工具名和已脱敏参数占位",
-            "图片工具摘要只包含操作类型、成功或失败状态和安全消息，不包含后端显示名",
-            "格式化后续模型上下文时会过滤工具协议块",
-        ):
-            self.assertIn(marker, self.config_reference_source)
+        def call_lines(attribute_name):
+            return sorted(
+                node.lineno
+                for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == attribute_name
+            )
+
+        def attribute_lines(attribute_name):
+            return sorted(
+                node.lineno
+                for node in ast.walk(method)
+                if isinstance(node, ast.Attribute) and node.attr == attribute_name
+            )
+
+        sanitize_lines = call_lines("strip_tool_call_record_blocks")
+        custom_write_lines = attribute_lines("_append_message_to_file")
+        official_write_lines = call_lines("insert")
+
+        self.assertTrue(sanitize_lines)
+        self.assertTrue(custom_write_lines)
+        self.assertTrue(official_write_lines)
+        self.assertLess(sanitize_lines[0], custom_write_lines[0])
+        self.assertLess(sanitize_lines[0], official_write_lines[0])
+        self.assertIn('"message_str": cleaned_message', method_source)
+        self.assertIn('{"type": "text", "data": {"text": cleaned_message}}', method_source)
 
     def test_group_image_service_structure_documentation_contract(self):
         for marker in (
