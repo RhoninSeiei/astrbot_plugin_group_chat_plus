@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,20 +111,58 @@ class CodexOAuthImageService:
             raise CodexOAuthImageConfigError("Codex OAuth 超时必须在 30 至 900 秒之间。")
         return timeout
 
+    @staticmethod
+    def _supports_timeout_keyword(generate_image: Any) -> bool:
+        try:
+            parameters = inspect.signature(generate_image).parameters.values()
+        except Exception:
+            return False
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "timeout"
+                and parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            )
+            for parameter in parameters
+        )
+
     def _resolve_provider(self, *, needs_edit: bool) -> tuple[Any, Any]:
         provider_id = str(
             self.config.get("codex_oauth_image_provider_id")
             or DEFAULT_CODEX_PROVIDER_ID
         ).strip()
         selected_provider = None
-        getter_is_callable = False
         lookup_error = None
         try:
             getter = getattr(self.context, "get_all_providers", None)
-            getter_is_callable = callable(getter)
-            providers = getter() if getter_is_callable else []
+        except Exception:
+            lookup_error = CodexOAuthImageProviderError(
+                "Codex OAuth 图片 Provider 查询失败。"
+            )
+        if lookup_error is not None:
+            raise lookup_error from None
+        if not callable(getter):
+            raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 查询接口不存在。")
+        try:
+            providers = getter()
+        except Exception:
+            lookup_error = CodexOAuthImageProviderError(
+                "Codex OAuth 图片 Provider 查询失败。"
+            )
+        if lookup_error is not None:
+            raise lookup_error from None
+        try:
             for provider in providers or []:
-                if provider.meta().id == provider_id:
+                try:
+                    metadata = provider.meta()
+                    candidate_id = getattr(metadata, "id", None)
+                except Exception:
+                    continue
+                if candidate_id == provider_id:
                     selected_provider = provider
                     break
         except Exception:
@@ -132,8 +171,6 @@ class CodexOAuthImageService:
             )
         if lookup_error is not None:
             raise lookup_error from None
-        if not getter_is_callable:
-            raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 查询接口不存在。")
         if selected_provider is None:
             raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 不存在。")
 
@@ -182,19 +219,22 @@ class CodexOAuthImageService:
             self.config.get("codex_oauth_image_model") or DEFAULT_CODEX_MODEL
         ).strip()
         timeout = self._resolve_timeout()
+        provider_call_kwargs = {
+            "prompt": clean_prompt,
+            "model": model,
+            "size": resolved_size,
+            "n": 1,
+            "reference_images": reference_images or None,
+            "action": action,
+        }
+        if self._supports_timeout_keyword(generate_image):
+            provider_call_kwargs["timeout"] = timeout
 
         generated = None
         provider_call_error = None
         try:
             generated = await asyncio.wait_for(
-                generate_image(
-                    prompt=clean_prompt,
-                    model=model,
-                    size=resolved_size,
-                    n=1,
-                    reference_images=reference_images or None,
-                    action=action,
-                ),
+                generate_image(**provider_call_kwargs),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:

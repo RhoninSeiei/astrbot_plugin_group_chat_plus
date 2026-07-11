@@ -193,7 +193,7 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 | `message_cleaner.py` | `MessageCleaner` | 清洗历史消息，过滤系统提示词和标记 |
 | `image_handler.py` | `ImageHandler` | 调用图片转文字 API，提取图片 URL，处理多图 |
 | `image_description_cache.py` | `ImageDescriptionCache` | 本地缓存图片描述结果，避免重复 API 调用 |
-| `codex_oauth_image_service.py` | `CodexOAuthImageService` | 通过 AstrBot Provider 公共 `generate_image()` 接口执行 Codex OAuth 文生图与单图编辑；Provider 管理 OAuth 凭据和 `image_generation` 请求 |
+| `codex_oauth_image_service.py` | `CodexOAuthImageService` | 通过 AstrBot Provider 公共 `generate_image()` 接口执行 Codex OAuth 文生图与单图编辑；按签名检测可选 `timeout`，支持时传入与外层等待一致的单次超时，旧 Provider 保留原调用参数；Provider 管理 OAuth 凭据和 `image_generation` 请求 |
 | `group_image_service.py` | `GroupImageService` | 按 `image_tool_backend` 选择 Codex OAuth 或 StepFun，并统一结果、显示名称与异常类型 |
 | `step_image_service.py` | `StepImageService` | 封装 StepFun `step-image-edit-2` 文生图与修图调用，并处理错误脱敏 |
 | `forward_message_parser.py` | `ForwardMessageParser` | 解析 QQ 合并转发消息，支持嵌套转发 |

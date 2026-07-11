@@ -1,5 +1,7 @@
 import asyncio
 import importlib.util
+import inspect
+import logging
 import sys
 import tempfile
 import traceback
@@ -105,6 +107,52 @@ class SlowProvider(FakeProvider):
             self.cancelled = True
 
 
+class ExplicitTimeoutProvider(FakeProvider):
+    async def generate_image(
+        self,
+        *,
+        prompt,
+        model,
+        size,
+        n,
+        reference_images,
+        action,
+        timeout=None,
+    ):
+        self.calls.append({
+            "prompt": prompt,
+            "model": model,
+            "size": size,
+            "n": n,
+            "reference_images": reference_images,
+            "action": action,
+            "timeout": timeout,
+        })
+        return [SimpleNamespace(path=str(self.result_path))]
+
+
+class LegacyProvider(FakeProvider):
+    async def generate_image(
+        self,
+        *,
+        prompt,
+        model,
+        size,
+        n,
+        reference_images,
+        action,
+    ):
+        self.calls.append({
+            "prompt": prompt,
+            "model": model,
+            "size": size,
+            "n": n,
+            "reference_images": reference_images,
+            "action": action,
+        })
+        return [SimpleNamespace(path=str(self.result_path))]
+
+
 class ExplodingIterable:
     def __iter__(self):
         raise RuntimeError(
@@ -193,6 +241,7 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
             "n": 1,
             "reference_images": None,
             "action": "generate",
+            "timeout": 300.0,
         }])
         self.assertEqual(provider.observed_timeouts, [120])
         self.assertEqual(provider.timeout, 120)
@@ -206,11 +255,42 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         )
         self.assertIn("get_all_providers", source)
         self.assertIn("provider.meta()", source)
+        self.assertIn("inspect.signature", source)
         self.assertIn("asyncio.wait_for", source)
         self.assertNotIn("get_provider_by_id", source)
         self.assertNotIn("_temporary_provider_timeout", source)
         self.assertNotIn("_provider_timeout_lock", source)
         self.assertNotIn("provider.timeout", source)
+
+    def test_documentation_explains_provider_timeout_compatibility(self):
+        expectations = {
+            "README.md": (
+                "支持可选 `timeout` 参数或 `**kwargs` 的 Provider",
+                "旧 Provider 只受插件外层最大等待限制",
+                "生产 Codex OAuth Provider 已支持单次超时参数",
+            ),
+            "docs/CONFIG_REFERENCE.md": (
+                "支持可选 `timeout` 参数或 `**kwargs` 的 Provider",
+                "实际请求仍可能受 Provider 自身 HTTP 超时约束",
+            ),
+            "docs/PROJECT_STRUCTURE.md": (
+                "按签名检测可选 `timeout`",
+                "旧 Provider 保留原调用参数",
+            ),
+            "docs/MESSAGE_WORKFLOW.md": (
+                "单次 Provider 超时与外层最大等待值一致",
+                "无法读取签名时按旧 Provider 处理",
+            ),
+            "CHANGELOG.md": (
+                "逐个跳过元数据异常或无有效 ID 的 Provider 成员",
+                "生产 Codex OAuth Provider 已支持单次超时参数",
+            ),
+        }
+        for relative_path, snippets in expectations.items():
+            with self.subTest(path=relative_path):
+                source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+                for snippet in snippets:
+                    self.assertIn(snippet, source)
 
     def test_edit_passes_reference_path_and_edit_action(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,7 +307,86 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
 
         self.assertEqual(provider.calls[0]["reference_images"], [str(source)])
         self.assertEqual(provider.calls[0]["action"], "edit")
+        self.assertEqual(provider.calls[0]["timeout"], 300.0)
         self.assertEqual(provider.timeout_write_count, 0)
+
+    def test_explicit_timeout_parameter_receives_same_outer_timeout_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = ExplicitTimeoutProvider(result_path)
+            observed_outer_timeouts = []
+
+            async def recording_wait_for(awaitable, timeout):
+                observed_outer_timeouts.append(timeout)
+                return await awaitable
+
+            with patch.object(
+                service_module.asyncio,
+                "wait_for",
+                side_effect=recording_wait_for,
+            ):
+                asyncio.run(
+                    self.make_service(provider, timeout=123).generate(
+                        prompt="cat", size="1:1"
+                    )
+                )
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0]["timeout"], 123.0)
+        self.assertEqual(observed_outer_timeouts, [123.0])
+
+    def test_kwargs_provider_receives_configured_timeout_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = FakeProvider(result_path)
+            asyncio.run(
+                self.make_service(provider, timeout=234).generate(
+                    prompt="cat", size="1:1"
+                )
+            )
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0]["timeout"], 234.0)
+
+    def test_legacy_provider_omits_timeout_and_is_called_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = LegacyProvider(result_path)
+            legacy_signature = inspect.signature(provider.generate_image)
+            with patch(
+                "inspect.signature", return_value=legacy_signature
+            ) as signature:
+                asyncio.run(
+                    self.make_service(provider, timeout=345).generate(
+                        prompt="cat", size="1:1"
+                    )
+                )
+
+        signature.assert_called_once_with(provider.generate_image)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertNotIn("timeout", provider.calls[0])
+
+    def test_signature_read_failure_uses_legacy_call_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = FakeProvider(result_path)
+            with patch(
+                "inspect.signature",
+                side_effect=RuntimeError("signature read failed"),
+            ) as signature:
+                asyncio.run(
+                    self.make_service(provider, timeout=456).generate(
+                        prompt="cat", size="1:1"
+                    )
+                )
+
+        signature.assert_called_once_with(provider.generate_image)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertNotIn("timeout", provider.calls[0])
 
     def test_size_aliases_are_width_by_height(self):
         self.assertEqual(CodexOAuthImageService.normalize_size("1:1"), "1024x1024")
@@ -306,7 +465,28 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertEqual(provider.timeout_write_count, 0)
         self.assert_sanitized_error(caught.exception)
 
-    def test_provider_lookup_failures_do_not_expose_configured_id(self):
+    def test_provider_lookup_skips_broken_member_before_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+
+            class ExplodingMetaProvider(FakeProvider):
+                def meta(self):
+                    raise RuntimeError("unrelated provider metadata failed")
+
+            provider = FakeProvider(result_path)
+            context = FakeContext(ExplodingMetaProvider(result_path), provider)
+            result = asyncio.run(
+                self.make_service(context=context).generate(
+                    prompt="cat", size="1:1"
+                )
+            )
+
+        self.assertEqual(context.get_all_calls, 1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(result.path, str(result_path))
+
+    def test_provider_list_failure_does_not_expose_configured_id(self):
         sensitive_id = "openai_oauth/private-provider"
 
         class ExplodingContext:
@@ -315,33 +495,61 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
                     "lookup exposed sensitive-token-value at /private/codex/provider.json"
                 )
 
+        service = self.make_service(
+            context=ExplodingContext(), provider_id=sensitive_id
+        )
+        with self.assertRaises(CodexOAuthImageProviderError) as caught:
+            asyncio.run(service.generate(prompt="cat", size="1:1"))
+        self.assertNotIn(sensitive_id, str(caught.exception))
+        self.assert_sanitized_error(caught.exception)
+
+    def test_all_invalid_provider_members_return_fixed_safe_config_error(self):
+        sensitive_id = "openai_oauth/private-provider"
+
         class ExplodingMetaProvider(FakeProvider):
             def meta(self):
                 raise RuntimeError(
-                    "meta exposed sensitive-token-value at /private/codex/meta.json"
+                    f"metadata failed for {sensitive_id} with sensitive-token-value"
                 )
 
-        cases = (
-            self.make_service(context=ExplodingContext(), provider_id=sensitive_id),
-            self.make_service(
-                context=FakeContext(ExplodingMetaProvider(Path("unused.png"))),
+        class NullMetaProvider(FakeProvider):
+            def meta(self):
+                return None
+
+        class MissingIdMetaProvider(FakeProvider):
+            def meta(self):
+                return SimpleNamespace(name=sensitive_id)
+
+        records = []
+
+        class RecordingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = RecordingHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        try:
+            service = self.make_service(
+                context=FakeContext(
+                    ExplodingMetaProvider(Path("unused.png")),
+                    NullMetaProvider(Path("unused.png")),
+                    MissingIdMetaProvider(Path("unused.png")),
+                ),
                 provider_id=sensitive_id,
-            ),
-        )
-        for service in cases:
-            with self.subTest(context=type(service.context).__name__):
-                with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                    asyncio.run(service.generate(prompt="cat", size="1:1"))
-                self.assertNotIn(sensitive_id, str(caught.exception))
-                self.assert_sanitized_error(caught.exception)
-
-        with self.assertRaises(CodexOAuthImageConfigError) as caught:
-            asyncio.run(
-                self.make_service(context=FakeContext(), provider_id=sensitive_id).generate(
-                    prompt="cat", size="1:1"
-                )
             )
-        self.assertNotIn(sensitive_id, str(caught.exception))
+            with self.assertRaises(CodexOAuthImageConfigError) as caught:
+                asyncio.run(service.generate(prompt="cat", size="1:1"))
+        finally:
+            root_logger.removeHandler(handler)
+
+        rendered = "".join(traceback.format_exception(caught.exception))
+        self.assertEqual(
+            str(caught.exception), "Codex OAuth 图片 Provider 不存在。"
+        )
+        self.assertNotIn(sensitive_id, "\n".join(records))
+        self.assertNotIn(sensitive_id, rendered)
+        self.assert_sanitized_error(caught.exception)
 
     def test_invalid_timeouts_are_sanitized_configuration_errors(self):
         provider = FakeProvider(Path("unused.png"))
