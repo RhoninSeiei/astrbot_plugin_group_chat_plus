@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import sys
 import types
+import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,14 +70,39 @@ class FailingBackend:
         raise self.error
 
 
+SENSITIVE_ERROR = (
+    "provider=openai_oauth/private-provider "
+    "token=sk-test-sensitive-value "
+    "file=C:\\private\\images\\result.png"
+)
+
+
+def raising_factory(error):
+    def factory(**kwargs):
+        raise error
+
+    return factory
+
+
 class GroupImageServiceTest(unittest.TestCase):
-    def make_service(self, *, config=None, stepfun=None, codex=None, output_dir=None):
+    def make_service(
+        self,
+        *,
+        config=None,
+        stepfun=None,
+        codex=None,
+        output_dir=None,
+        stepfun_factory=None,
+        codex_factory=None,
+    ):
         return GroupImageService(
             context=object(),
             config=config or {},
             output_dir=Path("unused") if output_dir is None else output_dir,
-            stepfun_factory=lambda **_: stepfun or RecordingBackend("stepfun"),
-            codex_factory=lambda **_: codex or RecordingBackend("codex_oauth"),
+            stepfun_factory=stepfun_factory
+            or (lambda **_: stepfun or RecordingBackend("stepfun")),
+            codex_factory=codex_factory
+            or (lambda **_: codex or RecordingBackend("codex_oauth")),
         )
 
     def test_old_config_without_backend_uses_stepfun(self):
@@ -167,35 +193,111 @@ class GroupImageServiceTest(unittest.TestCase):
         self.assertEqual(result.media_type, "image/png")
         self.assertEqual(result.revised_prompt, "")
 
-    def test_backend_errors_map_to_unified_errors_without_added_details(self):
-        cases = (
-            (service_module.StepImageUserError, GroupImageUserError, "stepfun"),
-            (service_module.StepImageConfigError, GroupImageConfigError, "stepfun"),
+    @staticmethod
+    def error_cases():
+        return (
+            (
+                service_module.StepImageUserError,
+                GroupImageUserError,
+                "stepfun",
+                "图片提示词不能为空。",
+                "图片提示词不能为空。",
+            ),
+            (
+                service_module.StepImageConfigError,
+                GroupImageConfigError,
+                "stepfun",
+                SENSITIVE_ERROR,
+                "图片工具配置不可用。",
+            ),
             (
                 service_module.StepImageProviderError,
                 GroupImageProviderError,
                 "stepfun",
+                SENSITIVE_ERROR,
+                "图片服务调用失败。",
             ),
             (
                 service_module.CodexOAuthImageUserError,
                 GroupImageUserError,
                 "codex_oauth",
+                "图片尺寸无效。",
+                "图片尺寸无效。",
             ),
             (
                 service_module.CodexOAuthImageConfigError,
                 GroupImageConfigError,
                 "codex_oauth",
+                SENSITIVE_ERROR,
+                "图片工具配置不可用。",
             ),
             (
                 service_module.CodexOAuthImageProviderError,
                 GroupImageProviderError,
                 "codex_oauth",
+                SENSITIVE_ERROR,
+                "图片服务调用失败。",
             ),
         )
 
-        for source_error, expected_error, backend_name in cases:
+    def assert_safe_mapping(self, caught, expected_message):
+        self.assertEqual(str(caught.exception), expected_message)
+        if expected_message in {
+            "图片工具配置不可用。",
+            "图片服务调用失败。",
+        }:
+            rendered = "".join(traceback.format_exception(caught.exception))
+            for sensitive_value in (
+                "private-provider",
+                "sk-test-sensitive-value",
+                "C:\\private\\images\\result.png",
+            ):
+                self.assertNotIn(sensitive_value, str(caught.exception))
+                self.assertNotIn(sensitive_value, rendered)
+
+    def test_factory_errors_map_for_generate_and_edit(self):
+        for (
+            source_error,
+            expected_error,
+            backend_name,
+            source_message,
+            expected_message,
+        ) in self.error_cases():
+            for operation in ("generate", "edit"):
+                with self.subTest(
+                    source_error=source_error.__name__, operation=operation
+                ):
+                    factory = raising_factory(source_error(source_message))
+                    service = self.make_service(
+                        config={"image_tool_backend": backend_name},
+                        stepfun_factory=factory if backend_name == "stepfun" else None,
+                        codex_factory=(
+                            factory if backend_name == "codex_oauth" else None
+                        ),
+                    )
+
+                    with self.assertRaises(expected_error) as caught:
+                        if operation == "generate":
+                            asyncio.run(service.generate(prompt="cat"))
+                        else:
+                            asyncio.run(
+                                service.edit(
+                                    prompt="blue sky", image_path="input.png"
+                                )
+                            )
+
+                    self.assert_safe_mapping(caught, expected_message)
+
+    def test_runtime_generate_errors_map_without_sensitive_details(self):
+        for (
+            source_error,
+            expected_error,
+            backend_name,
+            source_message,
+            expected_message,
+        ) in self.error_cases():
             with self.subTest(source_error=source_error.__name__):
-                backend = FailingBackend(source_error("图像服务调用失败。"))
+                backend = FailingBackend(source_error(source_message))
                 service = self.make_service(
                     config={"image_tool_backend": backend_name},
                     stepfun=backend if backend_name == "stepfun" else None,
@@ -205,9 +307,30 @@ class GroupImageServiceTest(unittest.TestCase):
                 with self.assertRaises(expected_error) as caught:
                     asyncio.run(service.generate(prompt="cat"))
 
-                self.assertEqual(str(caught.exception), "图像服务调用失败。")
-                self.assertNotIn("private-provider", str(caught.exception))
-                self.assertNotIn("/private/images/result.png", str(caught.exception))
+                self.assert_safe_mapping(caught, expected_message)
+
+    def test_runtime_edit_errors_map_without_sensitive_details(self):
+        for (
+            source_error,
+            expected_error,
+            backend_name,
+            source_message,
+            expected_message,
+        ) in self.error_cases():
+            with self.subTest(source_error=source_error.__name__):
+                backend = FailingBackend(source_error(source_message))
+                service = self.make_service(
+                    config={"image_tool_backend": backend_name},
+                    stepfun=backend if backend_name == "stepfun" else None,
+                    codex=backend if backend_name == "codex_oauth" else None,
+                )
+
+                with self.assertRaises(expected_error) as caught:
+                    asyncio.run(
+                        service.edit(prompt="blue sky", image_path="input.png")
+                    )
+
+                self.assert_safe_mapping(caught, expected_message)
 
 
 if __name__ == "__main__":

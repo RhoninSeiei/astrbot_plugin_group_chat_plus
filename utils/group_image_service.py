@@ -106,28 +106,28 @@ class GroupImageService:
         )
 
     async def generate(self, *, prompt: str, size: str = "") -> GroupImageResult:
-        backend = self._backend()
         try:
+            backend = self._backend()
             result = await backend.generate(
                 prompt=prompt,
                 size=str(size or self._default_size()).strip(),
             )
         except (StepImageUserError, CodexOAuthImageUserError) as exc:
-            raise GroupImageUserError(str(exc)) from exc
-        except (StepImageConfigError, CodexOAuthImageConfigError) as exc:
-            raise GroupImageConfigError(str(exc)) from exc
-        except (StepImageProviderError, CodexOAuthImageProviderError) as exc:
-            raise GroupImageProviderError(str(exc)) from exc
+            raise GroupImageUserError(str(exc)) from None
+        except (StepImageConfigError, CodexOAuthImageConfigError):
+            raise GroupImageConfigError("图片工具配置不可用。") from None
+        except (StepImageProviderError, CodexOAuthImageProviderError):
+            raise GroupImageProviderError("图片服务调用失败。") from None
         return self._convert_result(result)
 
     async def edit(self, *, prompt: str, image_path: str) -> GroupImageResult:
-        backend = self._backend()
         try:
+            backend = self._backend()
             result = await backend.edit(prompt=prompt, image_path=image_path)
         except (StepImageUserError, CodexOAuthImageUserError) as exc:
-            raise GroupImageUserError(str(exc)) from exc
-        except (StepImageConfigError, CodexOAuthImageConfigError) as exc:
-            raise GroupImageConfigError(str(exc)) from exc
-        except (StepImageProviderError, CodexOAuthImageProviderError) as exc:
-            raise GroupImageProviderError(str(exc)) from exc
+            raise GroupImageUserError(str(exc)) from None
+        except (StepImageConfigError, CodexOAuthImageConfigError):
+            raise GroupImageConfigError("图片工具配置不可用。") from None
+        except (StepImageProviderError, CodexOAuthImageProviderError):
+            raise GroupImageProviderError("图片服务调用失败。") from None
         return self._convert_result(result)
