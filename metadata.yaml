@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_chat_plus
 display_name: chat_plus
 desc: 面向群聊场景的 AstrBot 智能参与与工具调用增强插件
-help: 定群聊低打扰回复、两阶段读空气判断、群聊等待窗口、Smart 并发合并、正式回复阶段工具调用、StepFun 群聊生图与修图
+help: 定群聊低打扰回复、两阶段读空气判断、群聊等待窗口、Smart 并发合并、正式回复阶段工具调用、可配置 Codex OAuth 与 StepFun 群聊生图与修图
 version: v1.2.1-rhonin.1
 author: RhoninSeiei
 repo: https://github.com/RhoninSeiei/astrbot_plugin_group_chat_plus

@@ -124,7 +124,12 @@
 | `image_to_text_prompt` | string | `"请详细描述这张图片的内容"` | 发送给图片AI的提示语 |
 | `image_to_text_timeout` | int | `60` | 图片处理API调用超时（秒） |
 | `max_images_per_message` | int | `10` | 单条消息最大处理图片数量（1-50） |
-| `enable_step_image_tools` | bool | `false` | 启用 StepFun 图片工具。仅在启用本插件的群聊正式回复阶段可用 |
+| `enable_step_image_tools` | bool | `false` | 启用群聊生图与修图工具。仅在启用本插件的群聊正式回复阶段可用 |
+| `image_tool_backend` | string | `"codex_oauth"` | 图片工具后端，可选 `codex_oauth` 或 `stepfun`。新安装默认使用 Codex OAuth |
+| `codex_oauth_image_provider_id` | string | `"openai_oauth/gpt-5.6-sol"` | Codex OAuth 图片 Provider ID，必须选择声明 `image_generate` 与 `image_edit` 能力的 Provider |
+| `codex_oauth_image_model` | string | `"gpt-5.6-sol"` | 传给 Provider 的 Codex 主模型 |
+| `codex_oauth_image_default_size` | string | `"1024x1024"` | Codex OAuth 默认尺寸，采用 `width x height`（宽x高）；可选 `1024x1024`、`1536x1024`、`1024x1536` |
+| `codex_oauth_image_timeout` | int | `300` | Codex OAuth 调用超时，允许 30 至 900 秒 |
 | `step_image_provider_id` | string | `""` | StepFun 图片模型 Provider ID。留空时按 `step_image_model` 自动查找 |
 | `step_image_model` | string | `"step-image-edit-2"` | 文生图和修图使用的模型名 |
 | `step_image_api_base` | string | `""` | StepFun 图片 API Base。留空时复用 Provider 的 `api_base`，再回退到 `https://api.stepfun.com/v1` |
@@ -143,7 +148,11 @@
 | `platform_image_caption_fast_check_count` | int | `10` | 快速检查次数 |
 | `probability_filter_cache_delay` | int | `10000` | 概率过滤缓存延迟（毫秒） |
 
-StepImage 工具只在启用本插件的群聊正式回复阶段开放。文生图会使用主模型整理后的图像提示词和尺寸参数；修图要求图片与编辑指令位于同一条消息。工具命中后插件先发送自然语言进度提示，图片结果由工具发送，随后主模型根据工具返回的安全摘要生成自然语言收尾。失败时只向群聊返回简短失败说明，密钥、请求地址、provider 细节和原始工具调用格式不会外显。
+新安装会从 schema 取得 `image_tool_backend=codex_oauth`。旧配置缺少 `image_tool_backend` 时，运行时继续使用 StepFun，直到通过配置面板保存新字段或显式迁移；设置 `image_tool_backend=stepfun` 可以切换回 StepFun。
+
+Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超时。Provider 负责 OAuth 凭据以及 `image_generation` 请求，插件通过公共 `generate_image()` 接口取得结果。Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 尺寸继续采用 `height x width`（高x宽）。`httpx` 只供 StepFun HTTP 请求使用，Codex OAuth 后端不会新增运行时依赖。
+
+内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`。工具只在启用本插件的群聊正式回复阶段开放：文生图使用主模型整理后的图像提示词和尺寸参数；修图要求图片与编辑指令位于同一条消息。命中工具后，插件发送随当前后端变化的自然语言进度文本和一次图片结果，随后主模型根据安全摘要与当前群人格生成自然语言收尾。群聊内容不会包含工具协议、参数、Provider ID、文件路径或凭据。
 
 ---
 

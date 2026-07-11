@@ -4,7 +4,7 @@
 >
 > 本仓库是基于 [Him666233/astrbot_plugin_group_chat_plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 修改后的 RhoninSeiei 自用维护版本，面向实际 AstrBot 部署场景。代码会参考上游更新，但以线上运行效果和自用需求为准，保留与上游不同的实现。
 >
-> 当前自用版只面向指定 QQ 群聊场景，核心目标是低打扰读空气回复、正式回复阶段工具调用、StepFun `step-image-edit-2` 群聊生图与修图，以及会话级人格与模型选择。Web 面板与私聊模块已从运行入口移除，相关历史代码仅作为遗留参考保留。
+> 当前自用版只面向指定 QQ 群聊场景，核心目标是低打扰读空气回复、正式回复阶段工具调用、可配置的 Codex OAuth 与 StepFun 群聊生图及修图，以及会话级人格与模型选择。Web 面板与私聊模块已从运行入口移除，相关历史代码仅作为遗留参考保留。
 >
 > 主要差异包括：两阶段判断流程（读空气 AI 粗筛 + 主模型最终判断）、正式回复阶段放行 AstrBot 工具循环（搜索、MCP、知识库与其他 `@llm_tool` 工具）、判断型 AI 的人格与推理配置、候选注意力冷却、等待窗口模式细分、冷群缓存自动转正、LivingMemory 自动识别与人格兼容，以及基于自用版本融合的 Smart 并发处理。
 
@@ -126,7 +126,7 @@
 ### 消息处理
 
 - **图片处理** — 支持图片转文字，可配置范围，结果自动缓存
-- **StepFun 图片工具** — 启用后，群聊正式回复阶段可调用 `step-image-edit-2` 进行文生图或编辑同条消息中的图片；尺寸沿用 StepFun `height x width`（高x宽）格式，工具发送进度与图片，工具结果再交给主模型生成自然语言收尾
+- **可配置图片工具** — 启用后，群聊正式回复阶段可通过 Codex OAuth 或 StepFun 进行文生图，也可编辑同条消息中的图片；进度文本随当前后端变化，图片结果只发送一次，主模型再按群人格生成自然语言收尾
 - **转发解析** — QQ合并转发消息自动解析为可读文本
 - **关键词系统** — 触发词跳过概率/智能模式，黑名单词直接过滤
 - **戳一戳** — 智能响应QQ戳一戳，支持反戳和回复后戳
@@ -160,6 +160,14 @@
 | `httpx` | >= 0.24.0 | StepFun Step Image Edit 2 图片生成与编辑请求 |
 
 - **推荐**: `astrbot_plugin_livingmemory` 或 `astrbot_plugin_play_sy` (记忆系统)
+
+#### 群聊图片后端配置
+
+新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`，默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`。旧配置如果缺少 `image_tool_backend`，运行时会继续使用 StepFun，直到通过 AstrBot 配置面板保存新字段或显式迁移配置。需要切回 StepFun 时，设置 `image_tool_backend=stepfun`。
+
+Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。
+
+内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`，后端切换不会改变工具协议。群聊只显示随后端变化的进度文本、一次图片结果和主模型按当前人格生成的自然语言收尾；工具协议、参数、Provider ID、文件路径与凭据不会进入群聊内容。
 
 ---
 
@@ -234,6 +242,11 @@ sqlite3 data/data_v4.db "DELETE FROM platform_message_history;"
   "image_to_text_timeout": 60,
   "max_images_per_message": 10,
   "enable_step_image_tools": false,
+  "image_tool_backend": "codex_oauth",
+  "codex_oauth_image_provider_id": "openai_oauth/gpt-5.6-sol",
+  "codex_oauth_image_model": "gpt-5.6-sol",
+  "codex_oauth_image_default_size": "1024x1024",
+  "codex_oauth_image_timeout": 300,
   "step_image_provider_id": "",
   "step_image_model": "step-image-edit-2",
   "step_image_api_base": "",

@@ -33,6 +33,8 @@ astrbot_plugin_group_chat_plus/
 │   ├── context_manager.py      # 上下文管理器
 │   ├── image_handler.py        # 图片处理
 │   ├── image_description_cache.py # 图片描述缓存
+│   ├── codex_oauth_image_service.py # Codex OAuth Provider 图片适配器
+│   ├── group_image_service.py  # Codex OAuth 与 StepFun 图片服务门面
 │   ├── step_image_service.py   # StepFun 图片生成与编辑
 │   ├── keyword_checker.py      # 关键词检测
 │   ├── message_cleaner.py      # 历史消息清洗
@@ -79,7 +81,7 @@ astrbot_plugin_group_chat_plus/
   - `_process_message()` — 消息主处理管线，执行预筛、读空气判断、主模型最终判断和正式回复阶段工具循环
   - `on_llm_request()` — LLM 请求钩子（优先级 -1），负责上下文注入和历史处理
   - `after_message_sent()` — 消息发送后的统计和状态更新
-- **StepImage 工具** — 注册 `gcp_step_image_generate` 与 `gcp_step_image_edit`，负责群聊文生图、修图、进度提示和图片结果发送
+- **群聊图片工具** — 注册内部兼容工具 `gcp_step_image_generate` 与 `gcp_step_image_edit`，通过 `GroupImageService` 选择 Codex OAuth 或 StepFun 后端，负责进度提示和单次图片结果发送
 - **主动对话** — 定时任务，独立于消息流程运行
 
 ### metadata.yaml — 插件元数据
@@ -99,7 +101,7 @@ JSON Schema 文件定义了群聊运行相关配置项的：
 ```
 pypinyin    # 拼音处理，用于打字错误生成器
 aiohttp     # 异步 HTTP 会话与 Dashboard 辅助请求
-httpx       # StepFun Step Image Edit 2 请求
+httpx       # StepFun HTTP 图片生成与编辑请求
 ```
 
 ---
@@ -191,6 +193,8 @@ Web 面板的核心文件，基于 `aiohttp` 构建，包含：
 | `message_cleaner.py` | `MessageCleaner` | 清洗历史消息，过滤系统提示词和标记 |
 | `image_handler.py` | `ImageHandler` | 调用图片转文字 API，提取图片 URL，处理多图 |
 | `image_description_cache.py` | `ImageDescriptionCache` | 本地缓存图片描述结果，避免重复 API 调用 |
+| `codex_oauth_image_service.py` | `CodexOAuthImageService` | 通过 AstrBot Provider 公共 `generate_image()` 接口执行 Codex OAuth 文生图与单图编辑；Provider 管理 OAuth 凭据和 `image_generation` 请求 |
+| `group_image_service.py` | `GroupImageService` | 按 `image_tool_backend` 选择 Codex OAuth 或 StepFun，并统一结果、显示名称与异常类型 |
 | `step_image_service.py` | `StepImageService` | 封装 StepFun `step-image-edit-2` 文生图与修图调用，并处理错误脱敏 |
 | `forward_message_parser.py` | `ForwardMessageParser` | 解析 QQ 合并转发消息，支持嵌套转发 |
 | `welcome_message_parser.py` | `WelcomeMessageParser` | 检测新成员入群消息 |

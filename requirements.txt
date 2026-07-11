@@ -6,5 +6,5 @@ pypinyin>=0.44.0
 # AstrBot Dashboard 辅助请求与通用异步 HTTP 会话
 aiohttp>=3.8.0
 
-# StepFun Step Image Edit 2 图片生成与编辑请求
+# StepFun HTTP 图片生成与编辑请求
 httpx>=0.24.0

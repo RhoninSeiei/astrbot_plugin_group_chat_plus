@@ -63,6 +63,8 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn("pypinyin", requirements)
         self.assertIn("aiohttp", requirements)
         self.assertIn("httpx", requirements)
+        self.assertIn("# StepFun HTTP 图片生成与编辑请求", requirements)
+        self.assertNotIn("Codex OAuth", requirements)
 
     def test_utils_header_declares_rhonin_maintenance_scope(self):
         utils_init = (REPO_ROOT / "utils" / "__init__.py").read_text(encoding="utf-8")
@@ -98,6 +100,7 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn('astrbot_version: ">=4.24.0,<5"', metadata)
         self.assertIn("support_platforms:", metadata)
         self.assertIn("  - aiocqhttp", metadata)
+        self.assertIn("可配置 Codex OAuth 与 StepFun 群聊生图与修图", metadata)
         self.assertNotIn("Web", metadata)
         self.assertNotIn("Him666233", metadata)
 
@@ -118,14 +121,21 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         )
 
     def test_readme_declares_current_group_chat_scope(self):
-        readme_head = "\n".join(
-            (REPO_ROOT / "README.md").read_text(encoding="utf-8").splitlines()[:80]
-        )
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        readme_head = "\n".join(readme.splitlines()[:80])
 
         self.assertIn("当前自用版只面向指定 QQ 群聊场景", readme_head)
         self.assertIn("Web 面板与私聊模块已从运行入口移除", readme_head)
         self.assertNotIn("enable_private_chat", readme_head)
         self.assertNotIn("Web 管理面板怎么用", readme_head)
+        for marker in (
+            "image_tool_backend",
+            "codex_oauth",
+            "openai_oauth/gpt-5.6-sol",
+            "StepFun",
+            "generate_image()",
+        ):
+            self.assertIn(marker, readme)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,24 @@
 ## 📝 更新日志
 
+### 未发布 (2026-07-12)
+
+**可配置群聊图片后端**
+
+**新增**:
+- 群聊文生图与单图编辑支持 `codex_oauth` 和 `stepfun` 两种后端；新安装默认 `image_tool_backend=codex_oauth`，设置 `image_tool_backend=stepfun` 可切换为 StepFun
+- Codex OAuth 默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`，配置只保存 Provider ID、Codex 主模型、尺寸和超时；Provider 负责 OAuth 凭据与 `image_generation` 请求
+- Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 继续采用 `height x width`（高x宽）
+
+**兼容与消息行为**:
+- 旧配置缺少 `image_tool_backend` 时继续使用 StepFun，直到通过配置面板保存新字段或显式迁移
+- 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`
+- 进度文本随图片后端变化，图片结果只发送一次，主模型按当前群人格输出自然语言收尾
+- 群聊与历史记录不会保存工具协议、参数、Provider ID、文件路径或凭据
+- 新增 `codex_oauth_image_service.py` 与 `group_image_service.py`；Codex OAuth 复用 AstrBot Provider 公共 `generate_image()` 接口
+- 运行依赖保持不变，`httpx` 仅用于 StepFun HTTP 图片请求
+
+---
+
 ### 未发布 (2026-06-13)
 
 **群聊身份识别增强**
