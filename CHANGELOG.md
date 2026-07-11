@@ -13,7 +13,10 @@
 - 旧配置缺少 `image_tool_backend` 时继续使用 StepFun，直到通过配置面板保存新字段或显式迁移
 - 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`
 - 进度文本随图片后端变化，图片结果只发送一次，主模型按当前群人格输出自然语言收尾
-- 群聊与历史记录不会保存工具协议、参数、Provider ID、文件路径或凭据
+- 内部持久历史可按执行顺序保存交错的工具调用记录、内部工具名和已脱敏参数占位
+- 图片工具摘要只包含操作类型、成功或失败状态和安全消息，不包含后端显示名
+- 后续格式化为模型上下文时会过滤这些工具协议块；这些工具协议块不会发送到群聊
+- Provider ID、凭据、API 地址、原始响应和文件路径不会进入安全摘要或群聊文本
 - 新增 `codex_oauth_image_service.py` 与 `group_image_service.py`；Codex OAuth 复用 AstrBot Provider 公共 `generate_image()` 接口
 - 运行依赖保持不变，`httpx` 仅用于 StepFun HTTP 图片请求
 

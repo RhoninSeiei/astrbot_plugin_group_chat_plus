@@ -165,9 +165,11 @@
 
 新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`，默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`。旧配置如果缺少 `image_tool_backend`，运行时会继续使用 StepFun，直到通过 AstrBot 配置面板保存新字段或显式迁移配置。需要切回 StepFun 时，设置 `image_tool_backend=stepfun`。
 
-Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。
+Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。文生图需要 Provider 声明 `image_generate`，修图额外需要 `image_edit`。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。
 
 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`，后端切换不会改变工具协议。群聊只显示随后端变化的进度文本、一次图片结果和主模型按当前人格生成的自然语言收尾；工具协议、参数、Provider ID、文件路径与凭据不会进入群聊内容。
+
+内部持久历史可以按实际执行顺序保存交错的工具调用记录，其中包含内部工具名和已脱敏参数占位。图片工具摘要只记录操作类型、成功或失败状态和安全消息，不记录后端显示名。后续格式化模型上下文时会过滤工具协议块，这些协议块也不会发送到群聊。Provider ID、凭据、API 地址、原始响应和文件路径不会写入安全摘要或群聊文本。
 
 ---
 
