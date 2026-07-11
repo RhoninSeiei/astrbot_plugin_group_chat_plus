@@ -202,6 +202,35 @@ STEP_IMAGE_STALE_CAPABILITY_TERMS = (
 )
 
 
+def _migrate_image_tool_backend_config(config: AstrBotConfig) -> str:
+    """选择兼容后端，并把一次性迁移标记立即写入配置。"""
+    try:
+        config_version = int(
+            config.get("image_tool_backend_config_version", 0) or 0
+        )
+    except (TypeError, ValueError):
+        config_version = 0
+
+    configured_backend = str(config.get("image_tool_backend") or "").strip()
+    if config_version >= 1:
+        return configured_backend
+
+    selected_backend = (
+        "codex_oauth"
+        if getattr(config, "first_deploy", False) is True
+        else "stepfun"
+    )
+    try:
+        config["image_tool_backend"] = selected_backend
+        config["image_tool_backend_config_version"] = 1
+        config.save_config()
+    except Exception:
+        logger.warning("GROUP_IMAGE_BACKEND_MIGRATION_SAVE_FAILED")
+    else:
+        logger.info("GROUP_IMAGE_BACKEND_MIGRATION_APPLIED")
+    return selected_backend
+
+
 @register(
     "chat_plus",
     "RhoninSeiei",
@@ -254,6 +283,7 @@ class ChatPlus(Star):
         self.context = context
         self.config = config
         self._migrate_legacy_config_types()
+        runtime_image_tool_backend = _migrate_image_tool_backend_config(config)
 
         # ========== 🔧 配置参数集中提取区块 ==========
         # 说明：为避免 AstrBot 平台多次读取配置可能导致的问题，
@@ -676,7 +706,7 @@ class ChatPlus(Star):
         )  # 单条消息最大处理图片数（硬限制1-50）
         self.step_image_config = {
             "enable_step_image_tools": config.get("enable_step_image_tools", False),
-            "image_tool_backend": config.get("image_tool_backend"),
+            "image_tool_backend": runtime_image_tool_backend,
             "codex_oauth_image_provider_id": config.get(
                 "codex_oauth_image_provider_id", "openai_oauth/gpt-5.6-sol"
             ),
@@ -8343,7 +8373,10 @@ class ChatPlus(Star):
                     continue
         except Exception as exc:
             if self.debug_mode:
-                logger.warning(f"[StepImage] 清理临时图片失败: {exc}")
+                logger.warning(
+                    "STEP_IMAGE_CLEANUP_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
 
     def _get_step_image_service(self) -> GroupImageService:
         return GroupImageService(
@@ -8475,13 +8508,18 @@ class ChatPlus(Star):
         try:
             await event.send(MessageChain().message(progress_text))
         except Exception as exc:
-            logger.warning(f"[StepImage] 发送进度提示失败: {exc}", exc_info=True)
+            logger.warning(
+                "STEP_IMAGE_PROGRESS_SEND_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
     async def _send_step_image_image_result(
         self,
         event: AstrMessageEvent,
         image_path,
     ) -> None:
+        if event.get_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, False):
+            return
         image_result = MessageEventResult().file_image(str(image_path))
         event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, True)
         try:
@@ -8494,7 +8532,10 @@ class ChatPlus(Star):
             )
         except Exception as exc:
             event.set_extra(PLUGIN_STEP_IMAGE_IMAGE_SENT, None)
-            logger.warning(f"[StepImage] 发送图片结果失败: {exc}", exc_info=True)
+            logger.warning(
+                "STEP_IMAGE_IMAGE_SEND_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             raise
 
     def _clear_sent_step_image_direct_result(
@@ -8627,7 +8668,10 @@ class ChatPlus(Star):
                     if image_path:
                         return image_path
                 except Exception as exc:
-                    logger.warning(f"[StepImage] 提取待编辑图片失败: {exc}")
+                    logger.warning(
+                        "STEP_IMAGE_EXTRACT_FAILED error_type=%s",
+                        exc.__class__.__name__,
+                    )
         return None
 
     @filter.llm_tool(name="gcp_step_image_generate")
@@ -8697,7 +8741,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except GroupImageConfigError as exc:
-            logger.warning(f"[StepImage] 配置不可用: {exc}")
+            logger.warning(
+                "STEP_IMAGE_GENERATE_CONFIG_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片生成工具配置未就绪。"
             self._mark_step_image_tool_result(
                 event,
@@ -8711,7 +8758,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except GroupImageProviderError as exc:
-            logger.warning(f"[StepImage] Provider 调用失败: {exc}")
+            logger.warning(
+                "STEP_IMAGE_GENERATE_PROVIDER_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片生成失败，稍后再试。"
             self._mark_step_image_tool_result(
                 event,
@@ -8725,7 +8775,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except Exception as exc:
-            logger.error(f"[StepImage] 图片生成失败: {exc}", exc_info=True)
+            logger.error(
+                "STEP_IMAGE_GENERATE_UNEXPECTED_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片生成失败，稍后再试。"
             self._mark_step_image_tool_result(
                 event,
@@ -8820,7 +8873,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except GroupImageConfigError as exc:
-            logger.warning(f"[StepImage] 配置不可用: {exc}")
+            logger.warning(
+                "STEP_IMAGE_EDIT_CONFIG_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片编辑工具配置未就绪。"
             self._mark_step_image_tool_result(
                 event,
@@ -8834,7 +8890,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except GroupImageProviderError as exc:
-            logger.warning(f"[StepImage] Provider 调用失败: {exc}")
+            logger.warning(
+                "STEP_IMAGE_EDIT_PROVIDER_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片编辑失败，稍后再试。"
             self._mark_step_image_tool_result(
                 event,
@@ -8848,7 +8907,10 @@ class ChatPlus(Star):
                 message=message,
             )
         except Exception as exc:
-            logger.error(f"[StepImage] 图片编辑失败: {exc}", exc_info=True)
+            logger.error(
+                "STEP_IMAGE_EDIT_UNEXPECTED_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             message = "图片编辑失败，稍后再试。"
             self._mark_step_image_tool_result(
                 event,

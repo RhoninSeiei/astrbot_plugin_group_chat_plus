@@ -6,11 +6,12 @@
 
 **新增**:
 - 群聊文生图与单图编辑支持 `codex_oauth` 和 `stepfun` 两种后端；新安装默认 `image_tool_backend=codex_oauth`，设置 `image_tool_backend=stepfun` 可切换为 StepFun
+- 增加内部迁移标记 `image_tool_backend_config_version`：结合 `config.first_deploy` 区分新安装和 AstrBot schema 自动补齐后的旧配置，选定后立即保存；保存失败时本次运行仍采用选定后端
 - Codex OAuth 默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`，配置只保存 Provider ID、Codex 主模型、尺寸和超时；Provider 负责 OAuth 凭据与 `image_generation` 请求
 - Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 继续采用 `height x width`（高x宽）
 
 **兼容与消息行为**:
-- 旧配置缺少 `image_tool_backend` 时继续使用 StepFun，直到通过配置面板保存新字段或显式迁移
+- 旧配置首次加载时由迁移标记选择 StepFun，迁移后的显式后端配置保持不变
 - 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`
 - 进度文本随图片后端变化，图片结果只发送一次，主模型按当前群人格输出自然语言收尾
 - 主流程只在当前处理期间临时构造交错工具记录

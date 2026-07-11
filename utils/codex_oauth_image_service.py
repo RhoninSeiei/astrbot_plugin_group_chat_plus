@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import weakref
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,10 +10,6 @@ DEFAULT_CODEX_PROVIDER_ID = "openai_oauth/gpt-5.6-sol"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_SIZE = "1024x1024"
 VALID_CODEX_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
-_PROVIDER_TIMEOUT_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = (
-    weakref.WeakKeyDictionary()
-)
-_INSTANCE_LOCK_ATTR = "_codex_oauth_image_timeout_lock"
 
 
 class CodexOAuthImageUserError(Exception):
@@ -37,103 +31,6 @@ class CodexOAuthImageResult:
     backend: str = "codex_oauth"
     media_type: str = "image/png"
     revised_prompt: str = ""
-
-
-@dataclass
-class _ProviderTimeoutState:
-    restore_error: CodexOAuthImageProviderError | None = None
-
-
-def _provider_timeout_lock(provider: Any) -> asyncio.Lock:
-    weak_lock = None
-    uses_weak_lock = True
-    try:
-        weak_lock = _PROVIDER_TIMEOUT_LOCKS.get(provider)
-        if weak_lock is None:
-            weak_lock = asyncio.Lock()
-            _PROVIDER_TIMEOUT_LOCKS[provider] = weak_lock
-    except Exception:
-        uses_weak_lock = False
-
-    if uses_weak_lock:
-        return weak_lock
-
-    attached_lock = None
-    attachment_error = None
-    try:
-        provider_state = object.__getattribute__(provider, "__dict__")
-        attached_lock = provider_state.get(_INSTANCE_LOCK_ATTR)
-        if attached_lock is None:
-            attached_lock = asyncio.Lock()
-            provider_state[_INSTANCE_LOCK_ATTR] = attached_lock
-        elif not isinstance(attached_lock, asyncio.Lock):
-            attachment_error = CodexOAuthImageConfigError(
-                "Codex OAuth 图片 Provider 并发锁配置无效。"
-            )
-    except Exception:
-        attachment_error = CodexOAuthImageConfigError(
-            "Codex OAuth 图片 Provider 无法保存并发锁。"
-        )
-
-    if attachment_error is not None:
-        raise attachment_error
-    return attached_lock
-
-
-@asynccontextmanager
-async def _temporary_provider_timeout(provider: Any, timeout: float):
-    async with _provider_timeout_lock(provider):
-        missing_timeout = object()
-        previous_timeout = missing_timeout
-        previous_timeout_known = False
-        state = _ProviderTimeoutState()
-        setup_error = None
-        try:
-            previous_timeout = getattr(provider, "timeout", missing_timeout)
-            previous_timeout_known = True
-        except Exception:
-            setup_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 超时访问失败。"
-            )
-
-        if setup_error is None:
-            try:
-                setattr(provider, "timeout", timeout)
-            except Exception:
-                setup_error = CodexOAuthImageProviderError(
-                    "Codex OAuth 图片 Provider 超时访问失败。"
-                )
-
-        if setup_error is not None and previous_timeout_known:
-            setup_restore_error = None
-            try:
-                if previous_timeout is missing_timeout:
-                    delattr(provider, "timeout")
-                else:
-                    setattr(provider, "timeout", previous_timeout)
-            except Exception:
-                setup_restore_error = CodexOAuthImageProviderError(
-                    "Codex OAuth 图片 Provider 超时恢复失败。"
-                )
-            state.restore_error = setup_restore_error
-
-        if setup_error is not None:
-            raise setup_error
-
-        try:
-            yield state
-        finally:
-            restore_error = None
-            try:
-                if previous_timeout is missing_timeout:
-                    delattr(provider, "timeout")
-                else:
-                    setattr(provider, "timeout", previous_timeout)
-            except Exception:
-                restore_error = CodexOAuthImageProviderError(
-                    "Codex OAuth 图片 Provider 超时恢复失败。"
-                )
-            state.restore_error = restore_error
 
 
 class CodexOAuthImageService:
@@ -181,7 +78,7 @@ class CodexOAuthImageService:
                 "Codex OAuth 图片文件检查失败。"
             )
         if source_error is not None:
-            raise source_error
+            raise source_error from None
         if not source_is_file:
             raise CodexOAuthImageUserError("未找到可用于编辑的图片。")
         return await self._execute(
@@ -208,7 +105,7 @@ class CodexOAuthImageService:
         except Exception:
             timeout_error = CodexOAuthImageConfigError("Codex OAuth 超时配置无效。")
         if timeout_error is not None:
-            raise timeout_error
+            raise timeout_error from None
         if not math.isfinite(timeout) or not 30 <= timeout <= 900:
             raise CodexOAuthImageConfigError("Codex OAuth 超时必须在 30 至 900 秒之间。")
         return timeout
@@ -218,22 +115,26 @@ class CodexOAuthImageService:
             self.config.get("codex_oauth_image_provider_id")
             or DEFAULT_CODEX_PROVIDER_ID
         ).strip()
-        provider = None
+        selected_provider = None
         getter_is_callable = False
         lookup_error = None
         try:
-            getter = getattr(self.context, "get_provider_by_id", None)
+            getter = getattr(self.context, "get_all_providers", None)
             getter_is_callable = callable(getter)
-            provider = getter(provider_id) if getter_is_callable else None
+            providers = getter() if getter_is_callable else []
+            for provider in providers or []:
+                if provider.meta().id == provider_id:
+                    selected_provider = provider
+                    break
         except Exception:
             lookup_error = CodexOAuthImageProviderError(
                 "Codex OAuth 图片 Provider 查询失败。"
             )
         if lookup_error is not None:
-            raise lookup_error
+            raise lookup_error from None
         if not getter_is_callable:
             raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 查询接口不存在。")
-        if provider is None:
+        if selected_provider is None:
             raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 不存在。")
 
         can_generate = False
@@ -241,24 +142,24 @@ class CodexOAuthImageService:
         generate_image = None
         metadata_error = None
         try:
-            capabilities = getattr(provider, "capabilities", {})
+            capabilities = getattr(selected_provider, "capabilities", {})
             if isinstance(capabilities, dict):
                 can_generate = bool(capabilities.get("image_generate"))
                 can_edit = bool(capabilities.get("image_edit"))
-            generate_image = getattr(provider, "generate_image", None)
+            generate_image = getattr(selected_provider, "generate_image", None)
         except Exception:
             metadata_error = CodexOAuthImageProviderError(
                 "Codex OAuth 图片 Provider 元数据读取失败。"
             )
         if metadata_error is not None:
-            raise metadata_error
+            raise metadata_error from None
         if not can_generate:
             raise CodexOAuthImageConfigError("图片 Provider 缺少 image_generate 能力。")
         if needs_edit and not can_edit:
             raise CodexOAuthImageConfigError("图片 Provider 缺少 image_edit 能力。")
         if not callable(generate_image):
             raise CodexOAuthImageConfigError("图片 Provider 缺少 generate_image 方法。")
-        return provider, generate_image
+        return selected_provider, generate_image
 
     async def _execute(
         self,
@@ -269,7 +170,7 @@ class CodexOAuthImageService:
         action: str,
     ) -> CodexOAuthImageResult:
         clean_prompt = self._validate_prompt(prompt)
-        provider, generate_image = self._resolve_provider(
+        _provider, generate_image = self._resolve_provider(
             needs_edit=bool(reference_images)
         )
         resolved_size = self.normalize_size(
@@ -281,42 +182,31 @@ class CodexOAuthImageService:
             self.config.get("codex_oauth_image_model") or DEFAULT_CODEX_MODEL
         ).strip()
         timeout = self._resolve_timeout()
+
         generated = None
-        service_error = None
-        provider_error = None
         provider_call_error = None
-        timeout_state = None
         try:
-            async with _temporary_provider_timeout(provider, timeout) as timeout_state:
-                try:
-                    generated = await generate_image(
-                        prompt=clean_prompt,
-                        model=model,
-                        size=resolved_size,
-                        n=1,
-                        reference_images=reference_images or None,
-                        action=action,
-                    )
-                except Exception:
-                    provider_call_error = CodexOAuthImageProviderError(
-                        "Codex OAuth 图片 Provider 调用失败。"
-                    )
-        except CodexOAuthImageProviderError as error:
-            provider_error = error
-        except (CodexOAuthImageUserError, CodexOAuthImageConfigError) as error:
-            service_error = error
+            generated = await asyncio.wait_for(
+                generate_image(
+                    prompt=clean_prompt,
+                    model=model,
+                    size=resolved_size,
+                    n=1,
+                    reference_images=reference_images or None,
+                    action=action,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            provider_call_error = CodexOAuthImageProviderError(
+                "Codex OAuth 图片 Provider 调用超时。"
+            )
         except Exception:
-            provider_error = CodexOAuthImageProviderError(
+            provider_call_error = CodexOAuthImageProviderError(
                 "Codex OAuth 图片 Provider 调用失败。"
             )
         if provider_call_error is not None:
-            raise provider_call_error
-        if service_error is not None:
-            raise service_error
-        if provider_error is not None:
-            raise provider_error
-        if timeout_state is not None and timeout_state.restore_error is not None:
-            raise timeout_state.restore_error
+            raise provider_call_error from None
 
         results = None
         result_path = None
@@ -329,9 +219,7 @@ class CodexOAuthImageService:
             if results:
                 first = results[0]
                 result_path = Path(str(getattr(first, "path", "") or ""))
-                media_type = str(
-                    getattr(first, "mime_type", "") or "image/png"
-                )
+                media_type = str(getattr(first, "mime_type", "") or "image/png")
                 revised_prompt = str(getattr(first, "revised_prompt", "") or "")
                 result_is_file = result_path.is_file()
         except Exception:
@@ -339,11 +227,15 @@ class CodexOAuthImageService:
                 "Codex OAuth 图片结果读取失败。"
             )
         if result_error is not None:
-            raise result_error
+            raise result_error from None
         if not results:
-            raise CodexOAuthImageProviderError("Codex OAuth 图片调用未返回结果。")
+            raise CodexOAuthImageProviderError(
+                "Codex OAuth 图片调用未返回结果。"
+            ) from None
         if not result_is_file:
-            raise CodexOAuthImageProviderError("Codex OAuth 图片结果文件不可用。")
+            raise CodexOAuthImageProviderError(
+                "Codex OAuth 图片结果文件不可用。"
+            ) from None
         return CodexOAuthImageResult(
             path=str(result_path),
             mode=action,

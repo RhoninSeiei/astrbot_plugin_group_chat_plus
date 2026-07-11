@@ -163,7 +163,7 @@
 
 #### 群聊图片后端配置
 
-新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`，默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`。旧配置如果缺少 `image_tool_backend`，运行时会继续使用 StepFun，直到通过 AstrBot 配置面板保存新字段或显式迁移配置。需要切回 StepFun 时，设置 `image_tool_backend=stepfun`。
+新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`，默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`。`image_tool_backend_config_version` 是内部兼容标记，schema 默认值为 `0`。插件首次构造时，标记为 `0` 且 `config.first_deploy=True` 的新安装保留 `codex_oauth`；标记为 `0` 的现有旧配置会选择 `stepfun`，避免 AstrBot 自动补齐 schema 默认值后改变原有行为。迁移选择会立即写入配置，并把标记更新为 `1`；保存失败时当前运行期仍使用本次选定的后端。需要切回 StepFun 时，设置 `image_tool_backend=stepfun`。
 
 Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。文生图需要 Provider 声明 `image_generate`，修图额外需要 `image_edit`。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。
 

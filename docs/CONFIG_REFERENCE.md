@@ -126,6 +126,7 @@
 | `max_images_per_message` | int | `10` | 单条消息最大处理图片数量（1-50） |
 | `enable_step_image_tools` | bool | `false` | 启用群聊生图与修图工具。仅在启用本插件的群聊正式回复阶段可用 |
 | `image_tool_backend` | string | `"codex_oauth"` | 图片工具后端，可选 `codex_oauth` 或 `stepfun`。新安装默认使用 Codex OAuth |
+| `image_tool_backend_config_version` | int | `0` | 内部兼容标记。`0` 表示首次构造时执行迁移，迁移完成后写为 `1`；无需手动修改 |
 | `codex_oauth_image_provider_id` | string | `"openai_oauth/gpt-5.6-sol"` | Codex OAuth 图片 Provider ID。文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit` |
 | `codex_oauth_image_model` | string | `"gpt-5.6-sol"` | 传给 Provider 的 Codex 主模型 |
 | `codex_oauth_image_default_size` | string | `"1024x1024"` | Codex OAuth 默认尺寸，采用 `width x height`（宽x高）；可选 `1024x1024`、`1536x1024`、`1024x1536` |
@@ -148,7 +149,7 @@
 | `platform_image_caption_fast_check_count` | int | `10` | 快速检查次数 |
 | `probability_filter_cache_delay` | int | `10000` | 概率过滤缓存延迟（毫秒） |
 
-新安装会从 schema 取得 `image_tool_backend=codex_oauth`。旧配置缺少 `image_tool_backend` 时，运行时继续使用 StepFun，直到通过配置面板保存新字段或显式迁移；设置 `image_tool_backend=stepfun` 可以切换回 StepFun。
+新安装会从 schema 取得 `image_tool_backend=codex_oauth`。内部字段 `image_tool_backend_config_version` 默认值为 `0`：首次构造时，`config.first_deploy=True` 表示新安装并保留 Codex OAuth；没有首次部署标记的现有配置选择 `stepfun`。迁移完成后写为 `1` 并立即保存，后续显式选择 Codex OAuth 或 StepFun 时均保留配置值。保存失败不会改变当前运行期选定的后端。设置 `image_tool_backend=stepfun` 可以切换回 StepFun。
 
 Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超时。Provider 负责 OAuth 凭据以及 `image_generation` 请求，插件通过公共 `generate_image()` 接口取得结果。Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 尺寸继续采用 `height x width`（高x宽）。`httpx` 只供 StepFun HTTP 请求使用，Codex OAuth 后端不会新增运行时依赖。
 

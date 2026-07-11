@@ -4,7 +4,6 @@ import sys
 import tempfile
 import traceback
 import unittest
-import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,15 +33,29 @@ CodexOAuthImageUserError = service_module.CodexOAuthImageUserError
 class FakeProvider:
     capabilities = {"image_generate": True, "image_edit": True}
 
-    def __init__(self, result_path: Path):
+    def __init__(self, result_path: Path, provider_id="openai_oauth/gpt-5.6-sol"):
         self.result_path = result_path
+        self.provider_id = provider_id
         self.calls = []
-        self.timeout = 120
-        self.timeout_during_call = None
+        self.observed_timeouts = []
+        self._timeout = 120
+        self.timeout_write_count = 0
+
+    @property
+    def timeout(self):
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value):
+        self.timeout_write_count += 1
+        self._timeout = value
+
+    def meta(self):
+        return SimpleNamespace(id=self.provider_id)
 
     async def generate_image(self, **kwargs):
         self.calls.append(kwargs)
-        self.timeout_during_call = self.timeout
+        self.observed_timeouts.append(self.timeout)
         return [
             SimpleNamespace(
                 path=str(self.result_path),
@@ -55,35 +68,17 @@ class FakeProvider:
 class FailingProvider(FakeProvider):
     async def generate_image(self, **kwargs):
         self.calls.append(kwargs)
-        self.timeout_during_call = self.timeout
         raise RuntimeError(
             "provider failed with sensitive-token-value at "
             "/private/codex/oauth-token.json"
         )
 
 
-class ClassifiedFailingProvider(FakeProvider):
-    def __init__(self, result_path: Path, error_type):
-        super().__init__(result_path)
-        self.error_type = error_type
-
-    async def generate_image(self, **kwargs):
-        self.calls.append(kwargs)
-        self.timeout_during_call = self.timeout
-        raise self.error_type(
-            "provider exposed sensitive-token-value, "
-            "openai_oauth/private-provider, and /private/codex/provider-error.json"
-        )
-
-
 class ConcurrentProvider(FakeProvider):
-    __hash__ = None
-
     def __init__(self, result_path: Path):
         super().__init__(result_path)
         self.active_calls = 0
         self.max_active_calls = 0
-        self.observed_timeouts = []
 
     async def generate_image(self, **kwargs):
         self.calls.append(kwargs)
@@ -92,120 +87,22 @@ class ConcurrentProvider(FakeProvider):
         self.observed_timeouts.append(self.timeout)
         try:
             await asyncio.sleep(0.02)
-            return [
-                SimpleNamespace(
-                    path=str(self.result_path),
-                    mime_type="image/png",
-                    revised_prompt="",
-                )
-            ]
+            return [SimpleNamespace(path=str(self.result_path))]
         finally:
             self.active_calls -= 1
 
 
-class TimeoutAccessProvider:
-    capabilities = {"image_generate": True, "image_edit": True}
-
-    def __init__(
-        self,
-        result_path: Path,
-        *,
-        error_type,
-        fail_stage: str,
-        fail_call: bool = False,
-        write_before_initial_error: bool = False,
-        fail_setup_rollback: bool = False,
-    ):
-        self.result_path = result_path
-        self.error_type = error_type
-        self.fail_stage = fail_stage
-        self.fail_call = fail_call
-        self.write_before_initial_error = write_before_initial_error
-        self.fail_setup_rollback = fail_setup_rollback
-        self.setup_rollback_attempted = False
-        self.calls = []
-        self._timeout = 120
-
-    def _raise_sensitive(self, stage: str):
-        raise self.error_type(
-            f"{stage} exposed sensitive-token-value, "
-            "openai_oauth/private-provider, and /private/codex/timeout-access.json"
-        )
-
-    @property
-    def timeout(self):
-        if self.fail_stage == "getter":
-            self._raise_sensitive("timeout getter")
-        return self._timeout
-
-    @timeout.setter
-    def timeout(self, value):
-        if self.fail_stage == "initial_setter" and value == 300.0:
-            if self.write_before_initial_error:
-                self._timeout = value
-            self._raise_sensitive("timeout initial setter")
-        if self.fail_setup_rollback and value == 120 and self._timeout == 300.0:
-            self.setup_rollback_attempted = True
-            self._raise_sensitive("timeout setup rollback")
-        if self.fail_stage == "restore_setter" and value == 120:
-            self._raise_sensitive("timeout restore setter")
-        self._timeout = value
+class SlowProvider(FakeProvider):
+    def __init__(self, result_path: Path):
+        super().__init__(result_path)
+        self.cancelled = False
 
     async def generate_image(self, **kwargs):
         self.calls.append(kwargs)
-        if self.fail_call:
-            raise RuntimeError(
-                "call exposed sensitive-token-value, "
-                "openai_oauth/private-provider, and /private/codex/call.json"
-            )
-        return [
-            SimpleNamespace(
-                path=str(self.result_path),
-                mime_type="image/png",
-                revised_prompt="",
-            )
-        ]
-
-
-class MissingTimeoutDeleteProvider:
-    capabilities = {"image_generate": True, "image_edit": True}
-
-    def __init__(self, result_path: Path, error_type):
-        self.result_path = result_path
-        self.error_type = error_type
-        self.calls = []
-        self._has_timeout = False
-
-    @property
-    def timeout(self):
-        if not self._has_timeout:
-            raise AttributeError("timeout is absent")
-        return self._timeout
-
-    @timeout.setter
-    def timeout(self, value):
-        self._timeout = value
-        self._has_timeout = True
-
-    @timeout.deleter
-    def timeout(self):
-        if self._has_timeout:
-            del self._timeout
-            self._has_timeout = False
-        raise self.error_type(
-            "timeout delete exposed sensitive-token-value, "
-            "openai_oauth/private-provider, and /private/codex/timeout-delete.json"
-        )
-
-    async def generate_image(self, **kwargs):
-        self.calls.append(kwargs)
-        return [
-            SimpleNamespace(
-                path=str(self.result_path),
-                mime_type="image/png",
-                revised_prompt="",
-            )
-        ]
+        try:
+            await asyncio.sleep(60)
+        finally:
+            self.cancelled = True
 
 
 class ExplodingIterable:
@@ -231,21 +128,28 @@ class ExplodingFloat:
 
 
 class FakeContext:
-    def __init__(self, provider):
-        self.provider = provider
+    def __init__(self, *providers):
+        self.providers = list(providers)
+        self.get_all_calls = 0
+
+    def get_all_providers(self):
+        self.get_all_calls += 1
+        return list(self.providers)
 
     def get_provider_by_id(self, provider_id):
-        if provider_id == "openai_oauth/gpt-5.6-sol":
-            return self.provider
-        return None
+        raise AssertionError("图片适配器不得调用 get_provider_by_id")
 
 
 class CodexOAuthImageServiceTest(unittest.TestCase):
-    def make_service(self, provider, *, timeout=300, context=None):
+    def make_service(self, provider=None, *, timeout=300, context=None, provider_id=None):
+        if context is None:
+            context = FakeContext(provider) if provider is not None else FakeContext()
         return CodexOAuthImageService(
-            context=context or FakeContext(provider),
+            context=context,
             config={
-                "codex_oauth_image_provider_id": "openai_oauth/gpt-5.6-sol",
+                "codex_oauth_image_provider_id": (
+                    provider_id or "openai_oauth/gpt-5.6-sol"
+                ),
                 "codex_oauth_image_model": "gpt-5.6-sol",
                 "codex_oauth_image_default_size": "1024x1024",
                 "codex_oauth_image_timeout": timeout,
@@ -268,15 +172,20 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
 
-    def test_generate_calls_public_provider_api_and_restores_timeout(self):
+    def test_generate_uses_public_provider_list_without_mutating_timeout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "result.png"
             result_path.write_bytes(b"png")
+            unrelated = FakeProvider(result_path, "other/provider")
             provider = FakeProvider(result_path)
+            context = FakeContext(unrelated, provider)
             result = asyncio.run(
-                self.make_service(provider).generate(prompt="orange cat", size="16:9")
+                self.make_service(context=context).generate(
+                    prompt="orange cat", size="16:9"
+                )
             )
 
+        self.assertEqual(context.get_all_calls, 1)
         self.assertEqual(provider.calls, [{
             "prompt": "orange cat",
             "model": "gpt-5.6-sol",
@@ -285,10 +194,23 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
             "reference_images": None,
             "action": "generate",
         }])
-        self.assertEqual(provider.timeout_during_call, 300.0)
+        self.assertEqual(provider.observed_timeouts, [120])
         self.assertEqual(provider.timeout, 120)
+        self.assertEqual(provider.timeout_write_count, 0)
         self.assertEqual(result.backend, "codex_oauth")
         self.assertEqual(result.revised_prompt, "revised")
+
+    def test_adapter_source_uses_only_public_lookup_and_wait_for(self):
+        source = (REPO_ROOT / "utils" / "codex_oauth_image_service.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("get_all_providers", source)
+        self.assertIn("provider.meta()", source)
+        self.assertIn("asyncio.wait_for", source)
+        self.assertNotIn("get_provider_by_id", source)
+        self.assertNotIn("_temporary_provider_timeout", source)
+        self.assertNotIn("_provider_timeout_lock", source)
+        self.assertNotIn("provider.timeout", source)
 
     def test_edit_passes_reference_path_and_edit_action(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -305,11 +227,16 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
 
         self.assertEqual(provider.calls[0]["reference_images"], [str(source)])
         self.assertEqual(provider.calls[0]["action"], "edit")
+        self.assertEqual(provider.timeout_write_count, 0)
 
     def test_size_aliases_are_width_by_height(self):
         self.assertEqual(CodexOAuthImageService.normalize_size("1:1"), "1024x1024")
-        self.assertEqual(CodexOAuthImageService.normalize_size("1920x1080"), "1536x1024")
-        self.assertEqual(CodexOAuthImageService.normalize_size("1080x1920"), "1024x1536")
+        self.assertEqual(
+            CodexOAuthImageService.normalize_size("1920x1080"), "1536x1024"
+        )
+        self.assertEqual(
+            CodexOAuthImageService.normalize_size("1080x1920"), "1024x1536"
+        )
         with self.assertRaises(CodexOAuthImageUserError):
             CodexOAuthImageService.normalize_size("768x1360")
 
@@ -318,48 +245,33 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
             provider = FakeProvider(Path(tmpdir) / "missing.png")
             provider.capabilities = {"image_generate": False, "image_edit": False}
             with self.assertRaises(CodexOAuthImageConfigError):
-                asyncio.run(self.make_service(provider).generate(prompt="cat", size="1:1"))
+                asyncio.run(
+                    self.make_service(provider).generate(prompt="cat", size="1:1")
+                )
 
             provider.capabilities = {"image_generate": True, "image_edit": True}
-            with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                asyncio.run(self.make_service(provider).generate(prompt="cat", size="1:1"))
-
-        message = str(caught.exception)
-        self.assertNotIn(str(provider.result_path), message)
-        self.assertNotIn("openai_oauth/gpt-5.6-sol", message)
-
-    def test_provider_error_drops_sensitive_exception_chain_and_restores_timeout(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            provider = FailingProvider(Path(tmpdir) / "unused.png")
             with self.assertRaises(CodexOAuthImageProviderError) as caught:
                 asyncio.run(
                     self.make_service(provider).generate(prompt="cat", size="1:1")
                 )
 
-        self.assertEqual(provider.timeout_during_call, 300.0)
-        self.assertEqual(provider.timeout, 120)
+        self.assertNotIn(str(provider.result_path), str(caught.exception))
+        self.assertNotIn("openai_oauth/gpt-5.6-sol", str(caught.exception))
+
+    def test_provider_error_is_fixed_and_drops_sensitive_exception_chain(self):
+        provider = FailingProvider(Path("unused.png"))
+        with self.assertRaises(CodexOAuthImageProviderError) as caught:
+            asyncio.run(
+                self.make_service(provider).generate(prompt="cat", size="1:1")
+            )
+
+        self.assertEqual(
+            str(caught.exception), "Codex OAuth 图片 Provider 调用失败。"
+        )
+        self.assertEqual(provider.timeout_write_count, 0)
         self.assert_sanitized_error(caught.exception)
 
-    def test_provider_classified_errors_are_always_sanitized_as_provider_errors(self):
-        for error_type in (
-            CodexOAuthImageUserError,
-            CodexOAuthImageConfigError,
-        ):
-            with self.subTest(error_type=error_type.__name__):
-                provider = ClassifiedFailingProvider(Path("unused.png"), error_type)
-                with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                    asyncio.run(
-                        self.make_service(provider).generate(prompt="cat", size="1:1")
-                    )
-
-                self.assertEqual(provider.timeout_during_call, 300.0)
-                self.assertEqual(provider.timeout, 120)
-                self.assert_sanitized_error(caught.exception)
-                rendered = "".join(traceback.format_exception(caught.exception))
-                self.assertNotIn("openai_oauth/private-provider", rendered)
-                self.assertNotIn("openai_oauth/private-provider", str(caught.exception))
-
-    def test_same_provider_calls_are_serialized_with_isolated_timeouts(self):
+    def test_concurrent_calls_do_not_serialize_or_mutate_provider_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "result.png"
             result_path.write_bytes(b"result")
@@ -375,167 +287,83 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
 
             asyncio.run(run_concurrently())
 
-        self.assertEqual(provider.max_active_calls, 1)
-        self.assertEqual(provider.observed_timeouts, [111.0, 222.0])
+        self.assertEqual(provider.max_active_calls, 2)
+        self.assertEqual(provider.observed_timeouts, [120, 120])
+        self.assertEqual(provider.timeout_write_count, 0)
         self.assertEqual(provider.timeout, 120)
-        self.assertIsInstance(
-            service_module._PROVIDER_TIMEOUT_LOCKS,
-            weakref.WeakKeyDictionary,
-        )
-        self.assertIn("_codex_oauth_image_timeout_lock", provider.__dict__)
+        self.assertNotIn("_codex_oauth_image_timeout_lock", provider.__dict__)
 
-    def test_timeout_access_errors_are_sanitized(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result_path = Path(tmpdir) / "result.png"
-            result_path.write_bytes(b"result")
-            for stage in ("getter", "initial_setter", "restore_setter"):
-                for error_type in (
-                    CodexOAuthImageUserError,
-                    CodexOAuthImageConfigError,
-                ):
-                    with self.subTest(stage=stage, error_type=error_type.__name__):
-                        provider = TimeoutAccessProvider(
-                            result_path,
-                            error_type=error_type,
-                            fail_stage=stage,
-                        )
-                        with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                            asyncio.run(
-                                self.make_service(provider).generate(
-                                    prompt="cat", size="1:1"
-                                )
-                            )
-                        self.assert_sanitized_error(caught.exception)
+    def test_timeout_cancels_provider_and_maps_to_fixed_error(self):
+        provider = SlowProvider(Path("unused.png"))
+        service = self.make_service(provider)
+        service._resolve_timeout = lambda: 0.01
 
-    def test_provider_call_error_wins_when_timeout_restore_also_fails(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            provider = TimeoutAccessProvider(
-                Path(tmpdir) / "unused.png",
-                error_type=CodexOAuthImageConfigError,
-                fail_stage="restore_setter",
-                fail_call=True,
-            )
-            with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                asyncio.run(
-                    self.make_service(provider).generate(prompt="cat", size="1:1")
+        with self.assertRaises(CodexOAuthImageProviderError) as caught:
+            asyncio.run(service.generate(prompt="cat", size="1:1"))
+
+        self.assertEqual(str(caught.exception), "Codex OAuth 图片 Provider 调用超时。")
+        self.assertTrue(provider.cancelled)
+        self.assertEqual(provider.timeout_write_count, 0)
+        self.assert_sanitized_error(caught.exception)
+
+    def test_provider_lookup_failures_do_not_expose_configured_id(self):
+        sensitive_id = "openai_oauth/private-provider"
+
+        class ExplodingContext:
+            def get_all_providers(self):
+                raise RuntimeError(
+                    "lookup exposed sensitive-token-value at /private/codex/provider.json"
                 )
 
-        self.assertEqual(
-            str(caught.exception),
-            "Codex OAuth 图片 Provider 调用失败。",
-        )
-        self.assert_sanitized_error(caught.exception)
-
-    def test_initial_timeout_setter_failure_rolls_back_changed_value(self):
-        provider = TimeoutAccessProvider(
-            Path("unused.png"),
-            error_type=CodexOAuthImageConfigError,
-            fail_stage="initial_setter",
-            write_before_initial_error=True,
-        )
-        with self.assertRaises(CodexOAuthImageProviderError) as caught:
-            asyncio.run(
-                self.make_service(provider).generate(prompt="cat", size="1:1")
-            )
-
-        self.assertEqual(provider.timeout, 120)
-        self.assertEqual(
-            str(caught.exception),
-            "Codex OAuth 图片 Provider 超时访问失败。",
-        )
-        self.assert_sanitized_error(caught.exception)
-
-    def test_setup_error_wins_when_setup_rollback_also_fails(self):
-        provider = TimeoutAccessProvider(
-            Path("unused.png"),
-            error_type=CodexOAuthImageUserError,
-            fail_stage="initial_setter",
-            write_before_initial_error=True,
-            fail_setup_rollback=True,
-        )
-        with self.assertRaises(CodexOAuthImageProviderError) as caught:
-            asyncio.run(
-                self.make_service(provider).generate(prompt="cat", size="1:1")
-            )
-
-        self.assertEqual(
-            str(caught.exception),
-            "Codex OAuth 图片 Provider 超时访问失败。",
-        )
-        self.assertTrue(provider.setup_rollback_attempted)
-        self.assert_sanitized_error(caught.exception)
-
-    def test_missing_timeout_delete_failure_is_sanitized_after_attribute_removed(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result_path = Path(tmpdir) / "result.png"
-            result_path.write_bytes(b"result")
-            provider = MissingTimeoutDeleteProvider(
-                result_path,
-                CodexOAuthImageConfigError,
-            )
-            self.assertFalse(hasattr(provider, "timeout"))
-
-            with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                asyncio.run(
-                    self.make_service(provider).generate(prompt="cat", size="1:1")
+        class ExplodingMetaProvider(FakeProvider):
+            def meta(self):
+                raise RuntimeError(
+                    "meta exposed sensitive-token-value at /private/codex/meta.json"
                 )
 
-        self.assertFalse(hasattr(provider, "timeout"))
-        self.assertEqual(
-            str(caught.exception),
-            "Codex OAuth 图片 Provider 超时恢复失败。",
+        cases = (
+            self.make_service(context=ExplodingContext(), provider_id=sensitive_id),
+            self.make_service(
+                context=FakeContext(ExplodingMetaProvider(Path("unused.png"))),
+                provider_id=sensitive_id,
+            ),
         )
-        self.assert_sanitized_error(caught.exception)
+        for service in cases:
+            with self.subTest(context=type(service.context).__name__):
+                with self.assertRaises(CodexOAuthImageProviderError) as caught:
+                    asyncio.run(service.generate(prompt="cat", size="1:1"))
+                self.assertNotIn(sensitive_id, str(caught.exception))
+                self.assert_sanitized_error(caught.exception)
 
-    def test_invalid_timeout_drops_sensitive_exception_chain(self):
-        provider = FakeProvider(Path("unused.png"))
         with self.assertRaises(CodexOAuthImageConfigError) as caught:
             asyncio.run(
-                self.make_service(provider, timeout=ExplodingFloat()).generate(
+                self.make_service(context=FakeContext(), provider_id=sensitive_id).generate(
                     prompt="cat", size="1:1"
                 )
             )
+        self.assertNotIn(sensitive_id, str(caught.exception))
 
-        self.assert_sanitized_error(caught.exception)
-
-    def test_non_finite_timeouts_are_configuration_errors(self):
+    def test_invalid_timeouts_are_sanitized_configuration_errors(self):
         provider = FakeProvider(Path("unused.png"))
-        for timeout in (float("nan"), float("inf"), float("-inf")):
-            with self.subTest(timeout=timeout):
+        for timeout in (
+            ExplodingFloat(),
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ):
+            with self.subTest(timeout=type(timeout).__name__):
                 with self.assertRaises(CodexOAuthImageConfigError) as caught:
                     asyncio.run(
                         self.make_service(provider, timeout=timeout).generate(
                             prompt="cat", size="1:1"
                         )
                     )
-                self.assertIsNone(caught.exception.__cause__)
-                self.assertIsNone(caught.exception.__context__)
+                self.assert_sanitized_error(caught.exception)
 
-    def test_external_provider_interactions_are_sanitized(self):
+    def test_result_parsing_and_file_checks_are_sanitized(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "result.png"
             result_path.write_bytes(b"result")
-
-            class ExplodingContext:
-                def get_provider_by_id(self, provider_id):
-                    raise RuntimeError(
-                        "lookup exposed sensitive-token-value at /private/codex/provider.json"
-                    )
-
-            class ExplodingCapabilitiesProvider(FakeProvider):
-                @property
-                def capabilities(self):
-                    raise RuntimeError(
-                        "capabilities exposed sensitive-token-value at /private/codex/capabilities.json"
-                    )
-
-            class ExplodingMethodProvider(FakeProvider):
-                @property
-                def generate_image(self):
-                    raise RuntimeError(
-                        "method exposed sensitive-token-value at /private/codex/method.json"
-                    )
-
             iterable_provider = FakeProvider(result_path)
 
             async def return_exploding_iterable(**kwargs):
@@ -549,21 +377,14 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
 
             result_provider.generate_image = return_exploding_result
 
-            cases = (
-                self.make_service(
-                    FakeProvider(result_path),
-                    context=ExplodingContext(),
-                ),
-                self.make_service(ExplodingCapabilitiesProvider(result_path)),
-                self.make_service(ExplodingMethodProvider(result_path)),
-                self.make_service(iterable_provider),
-                self.make_service(result_provider),
-            )
-
-            for service in cases:
-                with self.subTest(service=type(service.context).__name__):
+            for provider in (iterable_provider, result_provider):
+                with self.subTest(provider=type(provider).__name__):
                     with self.assertRaises(CodexOAuthImageProviderError) as caught:
-                        asyncio.run(service.generate(prompt="cat", size="1:1"))
+                        asyncio.run(
+                            self.make_service(provider).generate(
+                                prompt="cat", size="1:1"
+                            )
+                        )
                     self.assert_sanitized_error(caught.exception)
 
             provider = FakeProvider(result_path)
@@ -579,3 +400,7 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
                         self.make_service(provider).generate(prompt="cat", size="1:1")
                     )
             self.assert_sanitized_error(caught.exception)
+
+
+if __name__ == "__main__":
+    unittest.main()

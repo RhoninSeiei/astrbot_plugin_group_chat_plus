@@ -289,8 +289,14 @@
         "description": "🖼️ 群聊图片后端",
         "type": "string",
         "options": ["codex_oauth", "stepfun"],
-        "hint": "新配置默认使用 Codex OAuth 图像生成；旧配置缺少该字段时继续使用 StepFun。",
+        "hint": "新安装默认使用 Codex OAuth 图像生成；旧配置通过内部迁移标记继续使用 StepFun。",
         "default": "codex_oauth"
+    },
+    "image_tool_backend_config_version": {
+        "description": "⚙️ 群聊图片后端内部兼容标记",
+        "type": "int",
+        "hint": "插件内部迁移字段，请勿手动修改。0 表示等待迁移，1 表示迁移完成。",
+        "default": 0
     },
     "codex_oauth_image_provider_id": {
         "description": "🖼️ Codex OAuth 图片 Provider",

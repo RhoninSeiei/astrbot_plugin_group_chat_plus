@@ -179,7 +179,11 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
     def test_group_image_backend_documentation_contract(self):
         for marker in (
             "新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`",
-            "旧配置如果缺少 `image_tool_backend`，运行时会继续使用 StepFun",
+            "`image_tool_backend_config_version` 是内部兼容标记",
+            "`config.first_deploy=True`",
+            "现有旧配置会选择 `stepfun`",
+            "迁移选择会立即写入配置",
+            "保存失败时当前运行期仍使用本次选定的后端",
             "设置 `image_tool_backend=stepfun`",
             "Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求",
             "Codex OAuth 尺寸采用 `width x height`（宽x高）",
@@ -191,7 +195,12 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
 
         for marker in (
             "新安装会从 schema 取得 `image_tool_backend=codex_oauth`",
-            "旧配置缺少 `image_tool_backend` 时，运行时继续使用 StepFun",
+            "`image_tool_backend_config_version`",
+            "默认值为 `0`",
+            "`config.first_deploy=True`",
+            "现有配置选择 `stepfun`",
+            "迁移完成后写为 `1` 并立即保存",
+            "保存失败不会改变当前运行期选定的后端",
             "设置 `image_tool_backend=stepfun` 可以切换回 StepFun",
             "文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit`",
             "Provider 负责 OAuth 凭据以及 `image_generation` 请求",
@@ -206,6 +215,13 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
             "必须选择声明 `image_generate` 与 `image_edit` 能力的 Provider",
             self.config_reference_source,
         )
+
+        for source in (
+            self.message_workflow_source,
+            self.project_structure_source,
+            self.changelog_source,
+        ):
+            self.assertIn("image_tool_backend_config_version", source)
 
     def test_group_image_history_documentation_contract(self):
         for source in (

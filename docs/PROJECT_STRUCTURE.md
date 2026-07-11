@@ -81,7 +81,7 @@ astrbot_plugin_group_chat_plus/
   - `_process_message()` — 消息主处理管线，执行预筛、读空气判断、主模型最终判断和正式回复阶段工具循环
   - `on_llm_request()` — LLM 请求钩子（优先级 -1），负责上下文注入和历史处理
   - `after_message_sent()` — 消息发送后的统计和状态更新
-- **群聊图片工具** — 注册内部兼容工具 `gcp_step_image_generate` 与 `gcp_step_image_edit`，通过 `GroupImageService` 选择 Codex OAuth 或 StepFun 后端，负责进度提示和单次图片结果发送
+- **群聊图片工具** — 注册内部兼容工具 `gcp_step_image_generate` 与 `gcp_step_image_edit`，通过 `image_tool_backend_config_version` 区分新安装与现有配置，再由 `GroupImageService` 选择 Codex OAuth 或 StepFun 后端，负责进度提示和单次图片结果发送
 - **主动对话** — 定时任务，独立于消息流程运行
 
 ### metadata.yaml — 插件元数据
