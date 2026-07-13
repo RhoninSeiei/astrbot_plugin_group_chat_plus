@@ -167,9 +167,9 @@ def make_compatible_matoi_module():
     )
 
 
-def load_matoi_module():
+def load_live_matoi_module():
     if not MATOI_MODULE_PATH.is_file():
-        return make_compatible_matoi_module()
+        return None
     spec = importlib.util.spec_from_file_location(
         "matoi_tool_timeout_override_test_module",
         MATOI_MODULE_PATH,
@@ -179,6 +179,13 @@ def load_matoi_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def iter_matoi_modules():
+    yield "bundled", make_compatible_matoi_module()
+    live_module = load_live_matoi_module()
+    if live_module is not None:
+        yield "live", live_module
 
 
 def make_executor():
@@ -370,38 +377,44 @@ class GroupImageToolTimeoutTest(unittest.TestCase):
         self.assertIs(executor.__dict__["_execute_local"], original)
 
     def test_gcp_inner_matoi_outer_restore_eagerly(self):
-        module = load_module()
-        matoi_module = load_matoi_module()
-        executor = make_executor()
-        original = executor.__dict__["_execute_local"]
+        for implementation, matoi_module in iter_matoi_modules():
+            with self.subTest(implementation=implementation):
+                module = load_module()
+                executor = make_executor()
+                original = executor.__dict__["_execute_local"]
 
-        gcp_handle = module.install_group_image_tool_timeout_override(
-            300, executor
-        )
-        matoi_handle = matoi_module.install_image_tool_timeout_override(
-            300, executor
-        )
-        module.remove_group_image_tool_timeout_override(gcp_handle)
-        matoi_module.remove_image_tool_timeout_override(matoi_handle)
+                gcp_handle = module.install_group_image_tool_timeout_override(
+                    300, executor
+                )
+                matoi_handle = (
+                    matoi_module.install_image_tool_timeout_override(
+                        300, executor
+                    )
+                )
+                module.remove_group_image_tool_timeout_override(gcp_handle)
+                matoi_module.remove_image_tool_timeout_override(matoi_handle)
 
-        self.assert_timeout_override_state_removed(executor, original)
+                self.assert_timeout_override_state_removed(executor, original)
 
     def test_matoi_inner_gcp_outer_restore_eagerly(self):
-        module = load_module()
-        matoi_module = load_matoi_module()
-        executor = make_executor()
-        original = executor.__dict__["_execute_local"]
+        for implementation, matoi_module in iter_matoi_modules():
+            with self.subTest(implementation=implementation):
+                module = load_module()
+                executor = make_executor()
+                original = executor.__dict__["_execute_local"]
 
-        matoi_handle = matoi_module.install_image_tool_timeout_override(
-            300, executor
-        )
-        gcp_handle = module.install_group_image_tool_timeout_override(
-            300, executor
-        )
-        matoi_module.remove_image_tool_timeout_override(matoi_handle)
-        module.remove_group_image_tool_timeout_override(gcp_handle)
+                matoi_handle = (
+                    matoi_module.install_image_tool_timeout_override(
+                        300, executor
+                    )
+                )
+                gcp_handle = module.install_group_image_tool_timeout_override(
+                    300, executor
+                )
+                matoi_module.remove_image_tool_timeout_override(matoi_handle)
+                module.remove_group_image_tool_timeout_override(gcp_handle)
 
-        self.assert_timeout_override_state_removed(executor, original)
+                self.assert_timeout_override_state_removed(executor, original)
 
     def test_separate_module_instances_share_hot_reload_state(self):
         first_module = load_module("gcp_timeout_module_before_reload")
