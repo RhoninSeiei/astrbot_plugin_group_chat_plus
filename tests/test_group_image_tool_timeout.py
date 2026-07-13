@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 from pathlib import Path
 import sys
+from threading import RLock
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,16 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "utils" / "tool_timeout_override.py"
+MATOI_MODULE_PATH = (
+    REPO_ROOT.parent
+    / "astrbot_plugin_pso2_matoi_cc"
+    / "utils"
+    / "tool_timeout_override.py"
+)
+GCP_STATE_ATTR = "_gcp_image_tool_timeout_override_state"
+GCP_LOCK_ATTR = "_gcp_image_tool_timeout_override_lock"
+MATOI_STATE_ATTR = "_matoi_image_tool_timeout_override_state"
+MATOI_LOCK_ATTR = "_matoi_image_tool_timeout_override_lock"
 
 
 def load_module(module_name="gcp_tool_timeout_override_test_module"):
@@ -16,6 +27,152 @@ def load_module(module_name="gcp_tool_timeout_override_test_module"):
         raise AssertionError("utils/tool_timeout_override.py is missing")
     spec = importlib.util.spec_from_file_location(
         module_name, MODULE_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_compatible_matoi_module():
+    image_tool_names = frozenset(
+        {"matoi_step_image_generate", "matoi_step_image_edit"}
+    )
+
+    def install_image_tool_timeout_override(timeout_seconds, executor_cls):
+        timeout = float(timeout_seconds)
+        if timeout <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        normalized_timeout = int(timeout) if timeout.is_integer() else timeout
+        token = object()
+
+        lock = executor_cls.__dict__.get(MATOI_LOCK_ATTR)
+        if lock is None:
+            lock = RLock()
+            setattr(executor_cls, MATOI_LOCK_ATTR, lock)
+
+        with lock:
+            state = executor_cls.__dict__.get(MATOI_STATE_ATTR)
+            if state is None:
+                original_descriptor = executor_cls.__dict__.get(
+                    "_execute_local"
+                )
+                if not isinstance(original_descriptor, classmethod):
+                    raise TypeError(
+                        "executor _execute_local must be a classmethod"
+                    )
+                state = {
+                    "original_descriptor": original_descriptor,
+                    "wrapper_descriptor": None,
+                    "timeouts": {},
+                    "lock": lock,
+                }
+
+                async def execute_local_with_image_timeout(
+                    cls,
+                    tool,
+                    run_context,
+                    *,
+                    tool_call_timeout=None,
+                    **tool_args,
+                ):
+                    effective_timeout = tool_call_timeout
+                    current_state = cls.__dict__.get(MATOI_STATE_ATTR)
+                    registered_timeout = None
+                    if isinstance(current_state, dict):
+                        state_lock = current_state["lock"]
+                        with state_lock:
+                            if (
+                                getattr(tool, "name", None)
+                                in image_tool_names
+                            ):
+                                registered_timeout = max(
+                                    current_state["timeouts"].values(),
+                                    default=None,
+                                )
+                            if (
+                                registered_timeout is None
+                                and not current_state["timeouts"]
+                                and cls.__dict__.get("_execute_local")
+                                is current_state["wrapper_descriptor"]
+                            ):
+                                setattr(
+                                    cls,
+                                    "_execute_local",
+                                    current_state["original_descriptor"],
+                                )
+                                delattr(cls, MATOI_STATE_ATTR)
+                                if (
+                                    cls.__dict__.get(MATOI_LOCK_ATTR)
+                                    is state_lock
+                                ):
+                                    delattr(cls, MATOI_LOCK_ATTR)
+
+                    if registered_timeout is not None:
+                        effective_timeout = (
+                            registered_timeout
+                            if tool_call_timeout is None
+                            else max(tool_call_timeout, registered_timeout)
+                        )
+                    original_method = original_descriptor.__get__(None, cls)
+                    async for result in original_method(
+                        tool,
+                        run_context,
+                        tool_call_timeout=effective_timeout,
+                        **tool_args,
+                    ):
+                        yield result
+
+                wrapper_descriptor = classmethod(
+                    execute_local_with_image_timeout
+                )
+                state["wrapper_descriptor"] = wrapper_descriptor
+                setattr(executor_cls, MATOI_STATE_ATTR, state)
+                setattr(executor_cls, "_execute_local", wrapper_descriptor)
+
+            state["timeouts"][token] = normalized_timeout
+
+        return SimpleNamespace(executor_cls=executor_cls, token=token)
+
+    def remove_image_tool_timeout_override(handle):
+        lock = handle.executor_cls.__dict__.get(MATOI_LOCK_ATTR)
+        if lock is None:
+            return
+        with lock:
+            state = handle.executor_cls.__dict__.get(MATOI_STATE_ATTR)
+            if not isinstance(state, dict):
+                return
+            state["timeouts"].pop(handle.token, None)
+            if state["timeouts"]:
+                return
+            if (
+                handle.executor_cls.__dict__.get("_execute_local")
+                is state["wrapper_descriptor"]
+            ):
+                setattr(
+                    handle.executor_cls,
+                    "_execute_local",
+                    state["original_descriptor"],
+                )
+                delattr(handle.executor_cls, MATOI_STATE_ATTR)
+                if handle.executor_cls.__dict__.get(MATOI_LOCK_ATTR) is lock:
+                    delattr(handle.executor_cls, MATOI_LOCK_ATTR)
+
+    return SimpleNamespace(
+        install_image_tool_timeout_override=(
+            install_image_tool_timeout_override
+        ),
+        remove_image_tool_timeout_override=remove_image_tool_timeout_override,
+    )
+
+
+def load_matoi_module():
+    if not MATOI_MODULE_PATH.is_file():
+        return make_compatible_matoi_module()
+    spec = importlib.util.spec_from_file_location(
+        "matoi_tool_timeout_override_test_module",
+        MATOI_MODULE_PATH,
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -61,6 +218,16 @@ async def collect_timeout(
 
 
 class GroupImageToolTimeoutTest(unittest.TestCase):
+    def assert_timeout_override_state_removed(self, executor, original):
+        self.assertIs(executor.__dict__["_execute_local"], original)
+        for attribute_name in (
+            GCP_STATE_ATTR,
+            GCP_LOCK_ATTR,
+            MATOI_STATE_ATTR,
+            MATOI_LOCK_ATTR,
+        ):
+            self.assertNotIn(attribute_name, executor.__dict__)
+
     def test_group_image_tools_receive_registered_timeout(self):
         module = load_module()
         executor = make_executor()
@@ -201,6 +368,40 @@ class GroupImageToolTimeoutTest(unittest.TestCase):
         setattr(executor, "_execute_local", second_timeout_descriptor)
         module.remove_group_image_tool_timeout_override(second_handle)
         self.assertIs(executor.__dict__["_execute_local"], original)
+
+    def test_gcp_inner_matoi_outer_restore_eagerly(self):
+        module = load_module()
+        matoi_module = load_matoi_module()
+        executor = make_executor()
+        original = executor.__dict__["_execute_local"]
+
+        gcp_handle = module.install_group_image_tool_timeout_override(
+            300, executor
+        )
+        matoi_handle = matoi_module.install_image_tool_timeout_override(
+            300, executor
+        )
+        module.remove_group_image_tool_timeout_override(gcp_handle)
+        matoi_module.remove_image_tool_timeout_override(matoi_handle)
+
+        self.assert_timeout_override_state_removed(executor, original)
+
+    def test_matoi_inner_gcp_outer_restore_eagerly(self):
+        module = load_module()
+        matoi_module = load_matoi_module()
+        executor = make_executor()
+        original = executor.__dict__["_execute_local"]
+
+        matoi_handle = matoi_module.install_image_tool_timeout_override(
+            300, executor
+        )
+        gcp_handle = module.install_group_image_tool_timeout_override(
+            300, executor
+        )
+        matoi_module.remove_image_tool_timeout_override(matoi_handle)
+        module.remove_group_image_tool_timeout_override(gcp_handle)
+
+        self.assert_timeout_override_state_removed(executor, original)
 
     def test_separate_module_instances_share_hot_reload_state(self):
         first_module = load_module("gcp_timeout_module_before_reload")

@@ -12,12 +12,112 @@ GROUP_IMAGE_TOOL_NAMES = frozenset(
 )
 _STATE_ATTR = "_gcp_image_tool_timeout_override_state"
 _LOCK_ATTR = "_gcp_image_tool_timeout_override_lock"
+_TIMEOUT_STATE_KEYS = frozenset(
+    {"original_descriptor", "wrapper_descriptor", "timeouts", "lock"}
+)
 
 
 @dataclass(frozen=True)
 class ToolTimeoutOverrideHandle:
     executor_cls: type
     token: object
+
+
+def _compatible_timeout_states(
+    executor_cls: type,
+    excluded_state: dict[str, Any] | None = None,
+):
+    for attribute_name, candidate in tuple(executor_cls.__dict__.items()):
+        if candidate is excluded_state or not isinstance(candidate, dict):
+            continue
+        if _TIMEOUT_STATE_KEYS.issubset(candidate):
+            yield attribute_name, candidate
+
+
+def _state_for_wrapper(
+    executor_cls: type,
+    wrapper_descriptor: Any,
+    excluded_state: dict[str, Any],
+):
+    for attribute_name, state in _compatible_timeout_states(
+        executor_cls, excluded_state
+    ):
+        if state["wrapper_descriptor"] is wrapper_descriptor:
+            return attribute_name, state
+    return None
+
+
+def _delete_timeout_state(
+    executor_cls: type,
+    state_attribute: str,
+    state: dict[str, Any],
+) -> None:
+    if executor_cls.__dict__.get(state_attribute) is not state:
+        return
+    delattr(executor_cls, state_attribute)
+    state_lock = state["lock"]
+    if any(
+        candidate["lock"] is state_lock
+        for _, candidate in _compatible_timeout_states(executor_cls)
+    ):
+        return
+    for attribute_name, value in tuple(executor_cls.__dict__.items()):
+        if attribute_name.endswith("_lock") and value is state_lock:
+            delattr(executor_cls, attribute_name)
+
+
+def _skip_empty_timeout_wrappers(
+    executor_cls: type,
+    descriptor: Any,
+    excluded_state: dict[str, Any],
+):
+    seen = set()
+    while id(descriptor) not in seen:
+        seen.add(id(descriptor))
+        match = _state_for_wrapper(
+            executor_cls, descriptor, excluded_state
+        )
+        if match is None:
+            break
+        state_attribute, state = match
+        state_lock = state["lock"]
+        with state_lock:
+            if executor_cls.__dict__.get(state_attribute) is not state:
+                continue
+            if state["timeouts"]:
+                break
+            descriptor = state["original_descriptor"]
+            _delete_timeout_state(executor_cls, state_attribute, state)
+    return descriptor
+
+
+def _rewire_outer_timeout_wrapper(
+    executor_cls: type,
+    current_descriptor: Any,
+    removed_descriptor: Any,
+    replacement_descriptor: Any,
+    excluded_state: dict[str, Any],
+) -> bool:
+    descriptor = current_descriptor
+    seen = set()
+    while id(descriptor) not in seen:
+        seen.add(id(descriptor))
+        match = _state_for_wrapper(
+            executor_cls, descriptor, excluded_state
+        )
+        if match is None:
+            return False
+        state_attribute, state = match
+        state_lock = state["lock"]
+        with state_lock:
+            if executor_cls.__dict__.get(state_attribute) is not state:
+                continue
+            original_descriptor = state["original_descriptor"]
+            if original_descriptor is removed_descriptor:
+                state["original_descriptor"] = replacement_descriptor
+                return True
+        descriptor = original_descriptor
+    return False
 
 
 def resolve_group_image_tool_timeout(config: Mapping[str, Any]) -> int | float:
@@ -159,15 +259,48 @@ def remove_group_image_tool_timeout_override(
         state["timeouts"].pop(handle.token, None)
         if state["timeouts"]:
             return
-        if (
-            handle.executor_cls.__dict__.get("_execute_local")
-            is state["wrapper_descriptor"]
-        ):
+
+        replacement_descriptor = _skip_empty_timeout_wrappers(
+            handle.executor_cls,
+            state["original_descriptor"],
+            state,
+        )
+        current_descriptor = handle.executor_cls.__dict__.get(
+            "_execute_local"
+        )
+        collapsed_current = _skip_empty_timeout_wrappers(
+            handle.executor_cls,
+            current_descriptor,
+            state,
+        )
+        if collapsed_current is not current_descriptor:
+            if (
+                handle.executor_cls.__dict__.get("_execute_local")
+                is current_descriptor
+            ):
+                setattr(
+                    handle.executor_cls,
+                    "_execute_local",
+                    collapsed_current,
+                )
+            current_descriptor = handle.executor_cls.__dict__.get(
+                "_execute_local"
+            )
+
+        if current_descriptor is state["wrapper_descriptor"]:
             setattr(
                 handle.executor_cls,
                 "_execute_local",
-                state["original_descriptor"],
+                replacement_descriptor,
             )
-            delattr(handle.executor_cls, _STATE_ATTR)
-            if handle.executor_cls.__dict__.get(_LOCK_ATTR) is lock:
-                delattr(handle.executor_cls, _LOCK_ATTR)
+            _delete_timeout_state(handle.executor_cls, _STATE_ATTR, state)
+            return
+
+        if _rewire_outer_timeout_wrapper(
+            handle.executor_cls,
+            current_descriptor,
+            state["wrapper_descriptor"],
+            replacement_descriptor,
+            state,
+        ):
+            _delete_timeout_state(handle.executor_cls, _STATE_ATTR, state)
