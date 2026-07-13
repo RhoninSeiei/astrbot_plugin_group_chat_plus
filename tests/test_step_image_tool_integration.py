@@ -144,11 +144,11 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         exec(compile(module, "main.py", "exec"), namespace)
         return namespace[name]
 
-    def _compile_unbound_method(self, name):
+    def _compile_unbound_method(self, name, namespace=None):
         method_node = self._method_node(name)
         module = ast.Module(body=[method_node], type_ignores=[])
         ast.fix_missing_locations(module)
-        namespace = {"Optional": Optional}
+        namespace = {"Optional": Optional, **dict(namespace or {})}
         exec(compile(module, "main.py", "exec"), namespace)
         return namespace[name]
 
@@ -260,6 +260,125 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("self._is_step_image_enabled_for_event(event)", self.main_source)
         self.assertIn("await self._send_step_image_progress", self.main_source)
         self.assertIn("await self._send_step_image_image_result", self.main_source)
+
+    def test_group_image_tool_timeout_override_is_lifecycle_scoped(self):
+        initialize_source = self._method_source("initialize")
+        terminate_source = self._method_source("terminate")
+        self.assertIn("resolve_group_image_tool_timeout", initialize_source)
+        self.assertIn(
+            "install_group_image_tool_timeout_override", initialize_source
+        )
+        self.assertIn(
+            "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_INSTALLED", initialize_source
+        )
+        self.assertIn(
+            "remove_group_image_tool_timeout_override", terminate_source
+        )
+        self.assertIn(
+            "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED", terminate_source
+        )
+
+    def test_timeout_override_install_failure_does_not_block_initialize(self):
+        order = []
+        logger = RecordingLogger()
+        dashboard_session = object()
+
+        class FakeProactiveChatManager:
+            @staticmethod
+            async def start_background_task(context, config, plugin):
+                order.append("background")
+
+        def install_timeout_override(timeout):
+            order.append("install")
+            raise RuntimeError("sensitive-provider-config")
+
+        initialize = self._compile_unbound_method(
+            "initialize",
+            {
+                "aiohttp": SimpleNamespace(
+                    ClientSession=lambda: dashboard_session
+                ),
+                "GroupImageService": SimpleNamespace(
+                    is_enabled=lambda config: True
+                ),
+                "resolve_group_image_tool_timeout": lambda config: 300,
+                "install_group_image_tool_timeout_override": (
+                    install_timeout_override
+                ),
+                "ProactiveChatManager": FakeProactiveChatManager,
+                "logger": logger,
+            },
+        )
+        plugin = SimpleNamespace(
+            context=object(),
+            enable_group_chat=True,
+            proactive_enabled=True,
+            step_image_config={"image_tool_backend": "codex_oauth"},
+            _group_image_tool_timeout_override_handle=None,
+            _compute_session_integrity=lambda seed: "session-sig",
+            _emit_session_metadata=lambda: None,
+            _build_proactive_config=lambda: {},
+        )
+
+        asyncio.run(initialize(plugin))
+
+        self.assertEqual(order, ["install", "background"])
+        self.assertIs(plugin.dashboard_http_session, dashboard_session)
+        self.assertIsNone(plugin._group_image_tool_timeout_override_handle)
+        rendered_logs = repr(logger.records)
+        self.assertIn(
+            "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_INSTALL_FAILED", rendered_logs
+        )
+        self.assertIn("RuntimeError", rendered_logs)
+        self.assertNotIn("sensitive-provider-config", rendered_logs)
+
+    def test_timeout_override_remove_failure_clears_handle(self):
+        logger = RecordingLogger()
+        timeout_override_handle = object()
+
+        class FakeSession:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        session = FakeSession()
+
+        def remove_timeout_override(handle):
+            self.assertIs(handle, timeout_override_handle)
+            raise RuntimeError("sensitive-provider-config")
+
+        terminate = self._compile_unbound_method(
+            "terminate",
+            {
+                "remove_group_image_tool_timeout_override": (
+                    remove_timeout_override
+                ),
+                "logger": logger,
+            },
+        )
+        plugin = SimpleNamespace(
+            proactive_enabled=False,
+            dashboard_http_session=session,
+            _group_image_tool_timeout_override_handle=(
+                timeout_override_handle
+            ),
+            _idle_flush_tasks={},
+            _idle_flush_meta={"group-1": object()},
+        )
+
+        asyncio.run(terminate(plugin))
+
+        self.assertIsNone(plugin._group_image_tool_timeout_override_handle)
+        self.assertTrue(session.closed)
+        self.assertEqual(plugin._idle_flush_meta, {})
+        rendered_logs = repr(logger.records)
+        self.assertIn(
+            "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED", rendered_logs
+        )
+        self.assertIn("RuntimeError", rendered_logs)
+        self.assertNotIn("sensitive-provider-config", rendered_logs)
 
     def test_successful_step_image_tools_return_model_facing_result(self):
         for method_name in ("gcp_step_image_generate", "gcp_step_image_edit"):

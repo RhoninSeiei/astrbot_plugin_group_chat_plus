@@ -159,6 +159,11 @@ from .utils.group_image_service import (
 )
 from .utils.step_image_service import DEFAULT_GENERATION_SIZE
 from .utils.system_prompt_rewriter import SystemPromptRewriter
+from .utils.tool_timeout_override import (
+    install_group_image_tool_timeout_override,
+    remove_group_image_tool_timeout_override,
+    resolve_group_image_tool_timeout,
+)
 from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
@@ -730,6 +735,7 @@ class ChatPlus(Star):
             "step_image_seed": config.get("step_image_seed", ""),
             "step_image_text_mode": config.get("step_image_text_mode", True),
         }
+        self._group_image_tool_timeout_override_handle = None
         self.step_image_default_size = config.get(
             "step_image_default_size", DEFAULT_GENERATION_SIZE
         )
@@ -2542,6 +2548,28 @@ class ChatPlus(Star):
 
         启动主动对话功能的后台任务
         """
+        if (
+            self.enable_group_chat
+            and GroupImageService.is_enabled(self.step_image_config)
+            and self._group_image_tool_timeout_override_handle is None
+        ):
+            try:
+                image_tool_timeout = resolve_group_image_tool_timeout(
+                    self.step_image_config
+                )
+                self._group_image_tool_timeout_override_handle = (
+                    install_group_image_tool_timeout_override(image_tool_timeout)
+                )
+                logger.info(
+                    "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_INSTALLED timeout=%s",
+                    image_tool_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_INSTALL_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
+
         self.dashboard_http_session = aiohttp.ClientSession()
         # 生成运行时签名，用于追踪插件实例状态
         self._session_sig = self._compute_session_integrity("init")
@@ -2569,6 +2597,20 @@ class ChatPlus(Star):
 
         停止主动对话功能的后台任务并保存状态
         """
+        timeout_override_handle = getattr(
+            self, "_group_image_tool_timeout_override_handle", None
+        )
+        if timeout_override_handle is not None:
+            try:
+                remove_group_image_tool_timeout_override(timeout_override_handle)
+            except Exception as exc:
+                logger.warning(
+                    "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
+            finally:
+                self._group_image_tool_timeout_override_handle = None
+
         if self.proactive_enabled:
             try:
                 await ProactiveChatManager.stop_background_task()
