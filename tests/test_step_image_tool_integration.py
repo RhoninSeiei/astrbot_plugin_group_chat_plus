@@ -152,6 +152,96 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         exec(compile(module, "main.py", "exec"), namespace)
         return namespace[name]
 
+    def _make_initialize_harness(
+        self,
+        *,
+        enable_group_chat=True,
+        image_service_enabled=True,
+        proactive_enabled=False,
+        install_error=None,
+        early_error_stage=None,
+    ):
+        events = []
+        install_calls = []
+        installed_handle = object()
+        dashboard_session = object()
+        logger = RecordingLogger()
+
+        def raise_early(stage):
+            if early_error_stage == stage:
+                raise RuntimeError(f"{stage}-failed")
+
+        def create_dashboard_session():
+            events.append("session")
+            raise_early("session")
+            return dashboard_session
+
+        def resolve_timeout(config):
+            events.append("resolve-timeout")
+            return 300
+
+        def install_timeout_override(timeout):
+            events.append("install-timeout")
+            install_calls.append(timeout)
+            if install_error is not None:
+                raise install_error
+            return installed_handle
+
+        class FakeGroupImageService:
+            @staticmethod
+            def is_enabled(config):
+                events.append("image-enabled-check")
+                return image_service_enabled
+
+        class FakeProactiveChatManager:
+            @staticmethod
+            async def start_background_task(context, config, plugin):
+                events.append("background")
+
+        initialize = self._compile_unbound_method(
+            "initialize",
+            {
+                "aiohttp": SimpleNamespace(
+                    ClientSession=create_dashboard_session
+                ),
+                "GroupImageService": FakeGroupImageService,
+                "resolve_group_image_tool_timeout": resolve_timeout,
+                "install_group_image_tool_timeout_override": (
+                    install_timeout_override
+                ),
+                "ProactiveChatManager": FakeProactiveChatManager,
+                "logger": logger,
+            },
+        )
+
+        def compute_session_integrity(seed):
+            events.append("fingerprint")
+            raise_early("fingerprint")
+            return "session-sig"
+
+        def emit_session_metadata():
+            events.append("metadata")
+            raise_early("metadata")
+
+        plugin = SimpleNamespace(
+            context=object(),
+            enable_group_chat=enable_group_chat,
+            proactive_enabled=proactive_enabled,
+            step_image_config={"image_tool_backend": "codex_oauth"},
+            _group_image_tool_timeout_override_handle=None,
+            _compute_session_integrity=compute_session_integrity,
+            _emit_session_metadata=emit_session_metadata,
+            _build_proactive_config=lambda: {},
+        )
+        state = SimpleNamespace(
+            events=events,
+            install_calls=install_calls,
+            installed_handle=installed_handle,
+            dashboard_session=dashboard_session,
+            logger=logger,
+        )
+        return initialize, plugin, state
+
     def _compile_tool_methods(self):
         method_names = (
             "_mark_step_image_progress_sent",
@@ -278,6 +368,75 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED", terminate_source
         )
 
+    def test_timeout_override_success_is_installed_last_and_saved(self):
+        initialize, plugin, state = self._make_initialize_harness(
+            proactive_enabled=True
+        )
+
+        asyncio.run(initialize(plugin))
+
+        self.assertEqual(
+            state.events,
+            [
+                "session",
+                "fingerprint",
+                "metadata",
+                "background",
+                "image-enabled-check",
+                "resolve-timeout",
+                "install-timeout",
+            ],
+        )
+        self.assertIs(plugin.dashboard_http_session, state.dashboard_session)
+        self.assertIs(
+            plugin._group_image_tool_timeout_override_handle,
+            state.installed_handle,
+        )
+        self.assertEqual(state.install_calls, [300])
+
+    def test_timeout_override_skips_disabled_group_or_image_service(self):
+        cases = (
+            {"enable_group_chat": False, "image_service_enabled": True},
+            {"enable_group_chat": True, "image_service_enabled": False},
+        )
+        for case in cases:
+            with self.subTest(**case):
+                initialize, plugin, state = self._make_initialize_harness(**case)
+
+                asyncio.run(initialize(plugin))
+
+                self.assertEqual(state.install_calls, [])
+                self.assertIsNone(
+                    plugin._group_image_tool_timeout_override_handle
+                )
+
+    def test_timeout_override_repeated_initialize_installs_once(self):
+        initialize, plugin, state = self._make_initialize_harness()
+
+        asyncio.run(initialize(plugin))
+        asyncio.run(initialize(plugin))
+
+        self.assertEqual(state.install_calls, [300])
+        self.assertIs(
+            plugin._group_image_tool_timeout_override_handle,
+            state.installed_handle,
+        )
+
+    def test_early_initialize_failures_do_not_install_timeout_override(self):
+        for stage in ("session", "fingerprint", "metadata"):
+            with self.subTest(stage=stage):
+                initialize, plugin, state = self._make_initialize_harness(
+                    early_error_stage=stage
+                )
+
+                with self.assertRaisesRegex(RuntimeError, f"{stage}-failed"):
+                    asyncio.run(initialize(plugin))
+
+                self.assertEqual(state.install_calls, [])
+                self.assertIsNone(
+                    plugin._group_image_tool_timeout_override_handle
+                )
+
     def test_timeout_override_install_failure_does_not_block_initialize(self):
         order = []
         logger = RecordingLogger()
@@ -322,7 +481,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
         asyncio.run(initialize(plugin))
 
-        self.assertEqual(order, ["install", "background"])
+        self.assertEqual(order, ["background", "install"])
         self.assertIs(plugin.dashboard_http_session, dashboard_session)
         self.assertIsNone(plugin._group_image_tool_timeout_override_handle)
         rendered_logs = repr(logger.records)

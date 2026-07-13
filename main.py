@@ -2548,6 +2548,27 @@ class ChatPlus(Star):
 
         启动主动对话功能的后台任务
         """
+        self.dashboard_http_session = aiohttp.ClientSession()
+        # 生成运行时签名，用于追踪插件实例状态
+        self._session_sig = self._compute_session_integrity("init")
+        self._emit_session_metadata()
+        # 🔘 仅当群聊功能总开关开启时，才启动主动对话后台任务
+        if self.enable_group_chat and self.proactive_enabled:
+            try:
+                # 构建主动对话配置字典（使用已提取的实例变量）
+                proactive_config = self._build_proactive_config()
+                # 启动主动对话后台任务
+                await ProactiveChatManager.start_background_task(
+                    self.context,
+                    proactive_config,  # 传递配置字典
+                    self,  # 传递插件实例（用于发送消息等）
+                )
+                logger.info("✅ [主动对话] 后台任务已启动")
+            except Exception as e:
+                logger.error(f"[主动对话] 启动后台任务失败: {e}", exc_info=True)
+        elif not self.enable_group_chat and self.proactive_enabled:
+            logger.info("⏸️ [主动对话] 群聊功能总开关已关闭，跳过启动主动对话后台任务")
+
         if (
             self.enable_group_chat
             and GroupImageService.is_enabled(self.step_image_config)
@@ -2569,27 +2590,6 @@ class ChatPlus(Star):
                     "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_INSTALL_FAILED error_type=%s",
                     exc.__class__.__name__,
                 )
-
-        self.dashboard_http_session = aiohttp.ClientSession()
-        # 生成运行时签名，用于追踪插件实例状态
-        self._session_sig = self._compute_session_integrity("init")
-        self._emit_session_metadata()
-        # 🔘 仅当群聊功能总开关开启时，才启动主动对话后台任务
-        if self.enable_group_chat and self.proactive_enabled:
-            try:
-                # 构建主动对话配置字典（使用已提取的实例变量）
-                proactive_config = self._build_proactive_config()
-                # 启动主动对话后台任务
-                await ProactiveChatManager.start_background_task(
-                    self.context,
-                    proactive_config,  # 传递配置字典
-                    self,  # 传递插件实例（用于发送消息等）
-                )
-                logger.info("✅ [主动对话] 后台任务已启动")
-            except Exception as e:
-                logger.error(f"[主动对话] 启动后台任务失败: {e}", exc_info=True)
-        elif not self.enable_group_chat and self.proactive_enabled:
-            logger.info("⏸️ [主动对话] 群聊功能总开关已关闭，跳过启动主动对话后台任务")
 
     async def terminate(self):
         """
