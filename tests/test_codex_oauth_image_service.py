@@ -35,9 +35,17 @@ CodexOAuthImageUserError = service_module.CodexOAuthImageUserError
 class FakeProvider:
     capabilities = {"image_generate": True, "image_edit": True}
 
-    def __init__(self, result_path: Path, provider_id="openai_oauth/gpt-5.6-sol"):
+    def __init__(
+        self,
+        result_path: Path,
+        provider_id="openai_oauth/gpt-5.6-sol",
+        adapter_type="openai_oauth_chat_completion",
+        auth_mode="openai_oauth",
+    ):
         self.result_path = result_path
         self.provider_id = provider_id
+        self.adapter_type = adapter_type
+        self.provider_config = {"auth_mode": auth_mode}
         self.calls = []
         self.observed_timeouts = []
         self._timeout = 120
@@ -53,7 +61,7 @@ class FakeProvider:
         self._timeout = value
 
     def meta(self):
-        return SimpleNamespace(id=self.provider_id)
+        return SimpleNamespace(id=self.provider_id, type=self.adapter_type)
 
     async def generate_image(self, **kwargs):
         self.calls.append(kwargs)
@@ -416,6 +424,15 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
 
         self.assertNotIn(str(provider.result_path), str(caught.exception))
         self.assertNotIn("openai_oauth/gpt-5.6-sol", str(caught.exception))
+
+    def test_rejects_non_core_oauth_provider_with_image_capability(self):
+        provider = FakeProvider(
+            Path("unused.png"),
+            adapter_type="oauth_plug_openai_codex_chat_completion",
+        )
+
+        with self.assertRaises(CodexOAuthImageConfigError):
+            asyncio.run(self.make_service(provider).generate(prompt="cat", size="1:1"))
 
     def test_provider_error_is_fixed_and_drops_sensitive_exception_chain(self):
         provider = FailingProvider(Path("unused.png"))

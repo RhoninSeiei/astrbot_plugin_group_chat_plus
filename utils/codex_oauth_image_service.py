@@ -136,6 +136,7 @@ class CodexOAuthImageService:
             or DEFAULT_CODEX_PROVIDER_ID
         ).strip()
         selected_provider = None
+        selected_metadata = None
         lookup_error = None
         try:
             getter = getattr(self.context, "get_all_providers", None)
@@ -164,6 +165,7 @@ class CodexOAuthImageService:
                     continue
                 if candidate_id == provider_id:
                     selected_provider = provider
+                    selected_metadata = metadata
                     break
         except Exception:
             lookup_error = CodexOAuthImageProviderError(
@@ -173,6 +175,21 @@ class CodexOAuthImageService:
             raise lookup_error from None
         if selected_provider is None:
             raise CodexOAuthImageConfigError("Codex OAuth 图片 Provider 不存在。")
+
+        adapter_type = getattr(selected_metadata, "type", "")
+        provider_config = getattr(selected_provider, "provider_config", {})
+        auth_mode = (
+            provider_config.get("auth_mode", "")
+            if isinstance(provider_config, dict)
+            else ""
+        )
+        if (
+            adapter_type != "openai_oauth_chat_completion"
+            or auth_mode != "openai_oauth"
+        ):
+            raise CodexOAuthImageConfigError(
+                "Codex OAuth 图片 Provider 必须使用 AstrBot Core OAuth Source。"
+            )
 
         can_generate = False
         can_edit = False
