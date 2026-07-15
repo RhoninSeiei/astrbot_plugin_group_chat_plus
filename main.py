@@ -165,6 +165,14 @@ from .utils.tool_timeout_override import (
     resolve_group_image_tool_timeout,
 )
 from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
+from .utils.llm_runtime_guard import (
+    DEFAULT_PERSONA_FAILURE_REPLY,
+    build_persona_failure_prompt,
+    classify_raw_llm_failure,
+    sanitize_llm_request_images,
+    sanitize_persona_failure_reply,
+)
+from .utils.session_preferences import get_session_provider, resolve_session_persona
 from .utils.reply_handler import (
     PLUGIN_DIRECT_REPLY_MODE,
     PLUGIN_FALLBACK_PAYLOAD,
@@ -8972,6 +8980,53 @@ class ChatPlus(Star):
                 message=message,
             )
 
+    def _group_llm_runtime_guard_enabled(self, event: AstrMessageEvent) -> bool:
+        try:
+            return bool(
+                getattr(self, "enable_group_chat", False)
+                and not event.is_private_chat()
+                and self._is_enabled(event)
+            )
+        except Exception as exc:
+            logger.warning(
+                "LLM_RUNTIME_GUARD_SCOPE_CHECK_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
+            return False
+
+    def _sanitize_llm_request_images(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        *,
+        stage: str,
+    ) -> None:
+        if not self._group_llm_runtime_guard_enabled(event):
+            return
+
+        sanitized = sanitize_llm_request_images(
+            getattr(req, "contexts", None),
+            getattr(req, "image_urls", None),
+        )
+        removed_total = (
+            sanitized.removed_context_parts + sanitized.removed_image_urls
+        )
+        if removed_total <= 0:
+            return
+
+        req.contexts = sanitized.contexts
+        req.image_urls = sanitized.image_urls
+        logger.warning(
+            "LLM_REQUEST_IMAGE_SANITIZED stage=%s group_id=%s "
+            "removed_context_parts=%s removed_image_urls=%s "
+            "removed_empty_messages=%s",
+            stage,
+            event.get_group_id(),
+            sanitized.removed_context_parts,
+            sanitized.removed_image_urls,
+            sanitized.removed_empty_messages,
+        )
+
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """
@@ -8999,6 +9054,8 @@ class ChatPlus(Star):
             PLUGIN_VISIBLE_TOOL_NAMES,
             PLUGIN_ORIGINAL_PLUGINS_NAME,
         )
+
+        self._sanitize_llm_request_images(event, req, stage="incoming")
 
         # 检查是否是来自本插件的请求
         is_plugin_request = event.get_extra(PLUGIN_REQUEST_MARKER, False)
@@ -9058,6 +9115,7 @@ class ChatPlus(Star):
         #    向量检索正常工作，不会触发 token 超限截断警告。
         req.prompt = plugin_prompt
         req.image_urls = plugin_image_urls
+        self._sanitize_llm_request_images(event, req, stage="plugin_restored")
 
         def _get_compatible_tools(tool_container):
             if not tool_container:
@@ -9261,6 +9319,127 @@ class ChatPlus(Star):
         except Exception as e:
             logger.error(f"[on_llm_response] 处理失败: {e}", exc_info=True)
 
+    @staticmethod
+    def _replace_llm_result_text(result, new_text: str) -> bool:
+        first_text_component = True
+        found_text_component = False
+        for component in getattr(result, "chain", None) or []:
+            if not hasattr(component, "text"):
+                continue
+            found_text_component = True
+            if first_text_component:
+                component.text = new_text
+                first_text_component = False
+            else:
+                component.text = ""
+        return found_text_component
+
+    def _resolve_persona_failure_provider_id(
+        self,
+        event: AstrMessageEvent,
+    ) -> str:
+        configured_provider_id = str(
+            getattr(self, "decision_ai_provider_id", "") or ""
+        ).strip()
+        provider_getter = getattr(self.context, "get_provider_by_id", None)
+        if configured_provider_id:
+            if not callable(provider_getter):
+                return configured_provider_id
+            try:
+                if provider_getter(configured_provider_id):
+                    return configured_provider_id
+            except Exception:
+                pass
+
+        try:
+            provider = get_session_provider(self.context, event=event)
+        except Exception:
+            provider = None
+        if provider is None:
+            return ""
+
+        provider_config = getattr(provider, "provider_config", None)
+        if isinstance(provider_config, dict):
+            provider_id = str(provider_config.get("id") or "").strip()
+            if provider_id:
+                return provider_id
+
+        metadata_getter = getattr(provider, "meta", None)
+        if callable(metadata_getter):
+            try:
+                return str(getattr(metadata_getter(), "id", "") or "").strip()
+            except Exception:
+                return ""
+        return ""
+
+    async def _build_persona_llm_failure_reply(
+        self,
+        event: AstrMessageEvent,
+        reason_code: str,
+    ) -> str:
+        provider_id = self._resolve_persona_failure_provider_id(event)
+        if not provider_id:
+            logger.warning(
+                "LLM_RUNTIME_FAILURE_PERSONA status=fallback reason=%s "
+                "cause=no_provider",
+                reason_code,
+            )
+            return DEFAULT_PERSONA_FAILURE_REPLY
+
+        try:
+            persona = await resolve_session_persona(self.context, event=event)
+            system_prompt = str(persona.get("prompt") or "")
+        except Exception as exc:
+            logger.warning(
+                "LLM_RUNTIME_FAILURE_PERSONA persona_status=unavailable "
+                "reason=%s error_type=%s",
+                reason_code,
+                exc.__class__.__name__,
+            )
+            system_prompt = ""
+
+        try:
+            timeout_value = float(getattr(self, "decision_ai_timeout", 20) or 20)
+        except (TypeError, ValueError):
+            timeout_value = 20.0
+        timeout_value = min(max(timeout_value, 5.0), 20.0)
+
+        try:
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=build_persona_failure_prompt(reason_code),
+                    contexts=[],
+                    image_urls=[],
+                    tools=None,
+                    system_prompt=system_prompt,
+                ),
+                timeout=timeout_value,
+            )
+            reply = sanitize_persona_failure_reply(
+                getattr(response, "completion_text", "") or ""
+            )
+            if not reply:
+                logger.warning(
+                    "LLM_RUNTIME_FAILURE_PERSONA status=fallback reason=%s "
+                    "cause=unsafe_or_empty_output",
+                    reason_code,
+                )
+                return DEFAULT_PERSONA_FAILURE_REPLY
+            logger.info(
+                "LLM_RUNTIME_FAILURE_PERSONA status=success reason=%s",
+                reason_code,
+            )
+            return reply
+        except Exception as exc:
+            logger.warning(
+                "LLM_RUNTIME_FAILURE_PERSONA status=fallback reason=%s "
+                "cause=provider_error error_type=%s",
+                reason_code,
+                exc.__class__.__name__,
+            )
+            return DEFAULT_PERSONA_FAILURE_REPLY
+
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """
@@ -9282,6 +9461,31 @@ class ChatPlus(Star):
 
             result = event.get_result()
             if result and self._clear_sent_step_image_direct_result(event, result):
+                return
+
+            reply_text = "".join(
+                component.text
+                for component in getattr(result, "chain", None) or []
+                if hasattr(component, "text")
+            ).strip()
+            failure_reason = classify_raw_llm_failure(reply_text)
+            if failure_reason and self._group_llm_runtime_guard_enabled(event):
+                source = (
+                    "plugin"
+                    if message_id in self.processing_sessions
+                    else "astrbot_default"
+                )
+                logger.warning(
+                    "LLM_RUNTIME_FAILURE_DETECTED reason=%s source=%s group_id=%s",
+                    failure_reason,
+                    source,
+                    chat_id,
+                )
+                safe_reply = await self._build_persona_llm_failure_reply(
+                    event,
+                    failure_reason,
+                )
+                self._replace_llm_result_text(result, safe_reply)
                 return
 
             # 仅处理由本插件触发的消息
@@ -9317,14 +9521,7 @@ class ChatPlus(Star):
                     return
 
             def _replace_result_text(new_text: str) -> None:
-                first_text_comp = True
-                for comp in result.chain:
-                    if hasattr(comp, "text"):
-                        if first_text_comp:
-                            comp.text = new_text
-                            first_text_comp = False
-                        else:
-                            comp.text = ""
+                self._replace_llm_result_text(result, new_text)
 
             if ReplyHandler._is_final_gate_decline(reply_text):
                 logger.warning("[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送")
