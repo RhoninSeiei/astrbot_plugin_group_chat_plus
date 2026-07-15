@@ -108,6 +108,62 @@ class LLMRequestImageSanitizationTest(unittest.TestCase):
         self.assertEqual(result.removed_image_urls, 0)
         self.assertEqual(result.removed_empty_messages, 0)
 
+    def test_noop_preserves_container_and_member_identity(self):
+        contexts = [
+            {"role": "system", "content": "人格提示词"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "问题"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/valid.jpg"},
+                    },
+                ],
+            },
+        ]
+        image_urls = [
+            "https://example.com/current.jpg",
+            "data:image/png;base64,AAAA",
+        ]
+
+        result = self.guard.sanitize_llm_request_images(contexts, image_urls)
+
+        self.assertIs(result.contexts, contexts)
+        self.assertIs(result.image_urls, image_urls)
+        self.assertIs(result.contexts[0], contexts[0])
+        self.assertIs(result.contexts[1], contexts[1])
+
+    def test_copy_on_write_replaces_only_affected_message(self):
+        missing_path = "/AstrBot/data/temp/missing-copy-on-write-image.jpg"
+        unaffected_before = {"role": "system", "content": "人格提示词"}
+        kept_text_part = {"type": "text", "text": "保留文字"}
+        affected = {
+            "role": "user",
+            "content": [
+                kept_text_part,
+                {
+                    "type": "image_url",
+                    "image_url": {"url": missing_path},
+                },
+            ],
+        }
+        unaffected_after = {"role": "assistant", "content": "正常回复"}
+        contexts = [unaffected_before, affected, unaffected_after]
+        image_urls = ["https://example.com/current.jpg"]
+        original = copy.deepcopy(contexts)
+
+        result = self.guard.sanitize_llm_request_images(contexts, image_urls)
+
+        self.assertEqual(contexts, original)
+        self.assertIsNot(result.contexts, contexts)
+        self.assertIs(result.contexts[0], unaffected_before)
+        self.assertIsNot(result.contexts[1], affected)
+        self.assertIs(result.contexts[1]["content"][0], kept_text_part)
+        self.assertIs(result.contexts[2], unaffected_after)
+        self.assertIs(result.image_urls, image_urls)
+        self.assertEqual(result.removed_context_parts, 1)
+
 
 class RawLLMFailureClassificationTest(unittest.TestCase):
     @classmethod

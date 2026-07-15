@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 import re
 from typing import NamedTuple
@@ -87,51 +86,77 @@ def sanitize_llm_request_images(
     contexts,
     image_urls,
 ) -> LLMRequestImageSanitizationResult:
-    sanitized_contexts = []
+    source_contexts = contexts if isinstance(contexts, list) else list(contexts or [])
+    sanitized_contexts = None
     removed_context_parts = 0
     removed_empty_messages = 0
 
-    for original_message in contexts or []:
+    for message_index, original_message in enumerate(source_contexts):
         if not isinstance(original_message, dict):
-            sanitized_contexts.append(copy.deepcopy(original_message))
+            if sanitized_contexts is not None:
+                sanitized_contexts.append(original_message)
             continue
 
-        message = copy.deepcopy(original_message)
         content = original_message.get("content")
         if not isinstance(content, list):
-            sanitized_contexts.append(message)
+            if sanitized_contexts is not None:
+                sanitized_contexts.append(original_message)
             continue
 
-        sanitized_parts = []
+        sanitized_parts = None
         contained_image_part = False
-        for part in content:
+        for part_index, part in enumerate(content):
             is_image_part, reference = _extract_image_reference(part)
             if not is_image_part:
-                sanitized_parts.append(copy.deepcopy(part))
+                if sanitized_parts is not None:
+                    sanitized_parts.append(part)
                 continue
             contained_image_part = True
             if _is_valid_image_reference(reference):
-                sanitized_parts.append(copy.deepcopy(part))
-            else:
-                removed_context_parts += 1
+                if sanitized_parts is not None:
+                    sanitized_parts.append(part)
+                continue
+
+            if sanitized_parts is None:
+                sanitized_parts = list(content[:part_index])
+            removed_context_parts += 1
+
+        if sanitized_parts is None:
+            if sanitized_contexts is not None:
+                sanitized_contexts.append(original_message)
+            continue
+
+        if sanitized_contexts is None:
+            sanitized_contexts = list(source_contexts[:message_index])
 
         if contained_image_part and not sanitized_parts:
             removed_empty_messages += 1
             continue
+
+        message = original_message.copy()
         message["content"] = sanitized_parts
         sanitized_contexts.append(message)
 
-    sanitized_image_urls = []
+    source_image_urls = (
+        image_urls if isinstance(image_urls, list) else list(image_urls or [])
+    )
+    sanitized_image_urls = None
     removed_image_urls = 0
-    for reference in image_urls or []:
+    for reference_index, reference in enumerate(source_image_urls):
         if _is_valid_image_reference(reference):
-            sanitized_image_urls.append(str(reference))
-        else:
-            removed_image_urls += 1
+            if sanitized_image_urls is not None:
+                sanitized_image_urls.append(reference)
+            continue
+
+        if sanitized_image_urls is None:
+            sanitized_image_urls = list(source_image_urls[:reference_index])
+        removed_image_urls += 1
 
     return LLMRequestImageSanitizationResult(
-        sanitized_contexts,
-        sanitized_image_urls,
+        sanitized_contexts if sanitized_contexts is not None else source_contexts,
+        sanitized_image_urls
+        if sanitized_image_urls is not None
+        else source_image_urls,
         removed_context_parts,
         removed_image_urls,
         removed_empty_messages,
