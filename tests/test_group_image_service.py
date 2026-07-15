@@ -332,6 +332,53 @@ class GroupImageServiceTest(unittest.TestCase):
 
                 self.assert_safe_mapping(caught, expected_message)
 
+    def test_codex_provider_reason_code_and_backend_are_preserved(self):
+        source_error = service_module.CodexOAuthImageProviderError(
+            SENSITIVE_ERROR,
+            reason_code="provider_timeout",
+        )
+        backend = FailingBackend(source_error)
+        service = self.make_service(
+            config={"image_tool_backend": "codex_oauth"},
+            codex=backend,
+        )
+
+        with self.assertRaises(GroupImageProviderError) as caught:
+            asyncio.run(service.generate(prompt="cat"))
+
+        self.assertEqual(str(caught.exception), "图片服务调用失败。")
+        self.assertEqual(caught.exception.reason_code, "provider_timeout")
+        self.assertEqual(caught.exception.backend, "codex_oauth")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assert_safe_mapping(caught, "图片服务调用失败。")
+
+    def test_stepfun_provider_error_uses_safe_default_reason_code(self):
+        backend = FailingBackend(service_module.StepImageProviderError(SENSITIVE_ERROR))
+        service = self.make_service(
+            config={"image_tool_backend": "stepfun"},
+            stepfun=backend,
+        )
+
+        with self.assertRaises(GroupImageProviderError) as caught:
+            asyncio.run(service.generate(prompt="cat"))
+
+        self.assertEqual(caught.exception.reason_code, "provider_call_failed")
+        self.assertEqual(caught.exception.backend, "stepfun")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assert_safe_mapping(caught, "图片服务调用失败。")
+
+    def test_provider_error_rejects_untrusted_classification_values(self):
+        error = GroupImageProviderError(
+            "safe message",
+            reason_code="sensitive-token-value",
+            backend="private-provider",
+        )
+
+        self.assertEqual(error.reason_code, "provider_call_failed")
+        self.assertEqual(error.backend, "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

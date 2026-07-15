@@ -28,7 +28,29 @@ class GroupImageConfigError(Exception):
 
 
 class GroupImageProviderError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "provider_call_failed",
+        backend: str = "unknown",
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = (
+            reason_code
+            if reason_code in {
+                "provider_call_failed",
+                "provider_timeout",
+                "provider_lookup_failed",
+                "provider_metadata_failed",
+                "source_file_check_failed",
+                "result_read_failed",
+                "empty_result",
+                "result_file_missing",
+            }
+            else "provider_call_failed"
+        )
+        self.backend = backend if backend in {"stepfun", "codex_oauth"} else "unknown"
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,7 @@ class GroupImageService:
         )
 
     async def generate(self, *, prompt: str, size: str = "") -> GroupImageResult:
+        provider_error = None
         try:
             backend = self._backend()
             result = await backend.generate(
@@ -116,11 +139,23 @@ class GroupImageService:
             raise GroupImageUserError(str(exc)) from None
         except (StepImageConfigError, CodexOAuthImageConfigError):
             raise GroupImageConfigError("图片工具配置不可用。") from None
-        except (StepImageProviderError, CodexOAuthImageProviderError):
-            raise GroupImageProviderError("图片服务调用失败。") from None
+        except StepImageProviderError:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。",
+                backend=self.BACKEND_STEPFUN,
+            )
+        except CodexOAuthImageProviderError as exc:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。",
+                reason_code=exc.reason_code,
+                backend=self.BACKEND_CODEX_OAUTH,
+            )
+        if provider_error is not None:
+            raise provider_error from None
         return self._convert_result(result)
 
     async def edit(self, *, prompt: str, image_path: str) -> GroupImageResult:
+        provider_error = None
         try:
             backend = self._backend()
             result = await backend.edit(prompt=prompt, image_path=image_path)
@@ -128,6 +163,17 @@ class GroupImageService:
             raise GroupImageUserError(str(exc)) from None
         except (StepImageConfigError, CodexOAuthImageConfigError):
             raise GroupImageConfigError("图片工具配置不可用。") from None
-        except (StepImageProviderError, CodexOAuthImageProviderError):
-            raise GroupImageProviderError("图片服务调用失败。") from None
+        except StepImageProviderError:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。",
+                backend=self.BACKEND_STEPFUN,
+            )
+        except CodexOAuthImageProviderError as exc:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。",
+                reason_code=exc.reason_code,
+                backend=self.BACKEND_CODEX_OAUTH,
+            )
+        if provider_error is not None:
+            raise provider_error from None
         return self._convert_result(result)

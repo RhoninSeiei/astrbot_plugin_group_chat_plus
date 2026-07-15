@@ -11,6 +11,19 @@ DEFAULT_CODEX_PROVIDER_ID = "openai_oauth/gpt-5.6-sol"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_SIZE = "1024x1024"
 VALID_CODEX_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+DEFAULT_PROVIDER_FAILURE_REASON = "provider_call_failed"
+SAFE_PROVIDER_FAILURE_REASONS = frozenset(
+    {
+        DEFAULT_PROVIDER_FAILURE_REASON,
+        "provider_timeout",
+        "provider_lookup_failed",
+        "provider_metadata_failed",
+        "source_file_check_failed",
+        "result_read_failed",
+        "empty_result",
+        "result_file_missing",
+    }
+)
 
 
 class CodexOAuthImageUserError(Exception):
@@ -22,7 +35,18 @@ class CodexOAuthImageConfigError(Exception):
 
 
 class CodexOAuthImageProviderError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = DEFAULT_PROVIDER_FAILURE_REASON,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = (
+            reason_code
+            if reason_code in SAFE_PROVIDER_FAILURE_REASONS
+            else DEFAULT_PROVIDER_FAILURE_REASON
+        )
 
 
 @dataclass(frozen=True)
@@ -40,6 +64,22 @@ class CodexOAuthImageService:
     def __init__(self, *, context: Any, config: dict) -> None:
         self.context = context
         self.config = dict(config or {})
+
+    @staticmethod
+    def _provider_failure_reason(error: BaseException) -> str:
+        if isinstance(error, asyncio.TimeoutError):
+            return "provider_timeout"
+        for error_type in type(error).__mro__:
+            module_name = str(getattr(error_type, "__module__", "") or "")
+            type_name = str(getattr(error_type, "__name__", "") or "").lower()
+            if (
+                module_name == "httpx"
+                or module_name.startswith("httpx.")
+                or module_name == "httpcore"
+                or module_name.startswith("httpcore.")
+            ) and "timeout" in type_name:
+                return "provider_timeout"
+        return DEFAULT_PROVIDER_FAILURE_REASON
 
     @staticmethod
     def normalize_size(value: Any) -> str:
@@ -76,7 +116,8 @@ class CodexOAuthImageService:
             source_is_file = source.is_file()
         except Exception:
             source_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片文件检查失败。"
+                "Codex OAuth 图片文件检查失败。",
+                reason_code="source_file_check_failed",
             )
         if source_error is not None:
             raise source_error from None
@@ -142,7 +183,8 @@ class CodexOAuthImageService:
             getter = getattr(self.context, "get_all_providers", None)
         except Exception:
             lookup_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 查询失败。"
+                "Codex OAuth 图片 Provider 查询失败。",
+                reason_code="provider_lookup_failed",
             )
         if lookup_error is not None:
             raise lookup_error from None
@@ -152,7 +194,8 @@ class CodexOAuthImageService:
             providers = getter()
         except Exception:
             lookup_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 查询失败。"
+                "Codex OAuth 图片 Provider 查询失败。",
+                reason_code="provider_lookup_failed",
             )
         if lookup_error is not None:
             raise lookup_error from None
@@ -169,7 +212,8 @@ class CodexOAuthImageService:
                     break
         except Exception:
             lookup_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 查询失败。"
+                "Codex OAuth 图片 Provider 查询失败。",
+                reason_code="provider_lookup_failed",
             )
         if lookup_error is not None:
             raise lookup_error from None
@@ -203,7 +247,8 @@ class CodexOAuthImageService:
             generate_image = getattr(selected_provider, "generate_image", None)
         except Exception:
             metadata_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 元数据读取失败。"
+                "Codex OAuth 图片 Provider 元数据读取失败。",
+                reason_code="provider_metadata_failed",
             )
         if metadata_error is not None:
             raise metadata_error from None
@@ -256,11 +301,18 @@ class CodexOAuthImageService:
             )
         except asyncio.TimeoutError:
             provider_call_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 调用超时。"
+                "Codex OAuth 图片 Provider 调用超时。",
+                reason_code="provider_timeout",
             )
-        except Exception:
+        except Exception as exc:
+            reason_code = self._provider_failure_reason(exc)
             provider_call_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片 Provider 调用失败。"
+                (
+                    "Codex OAuth 图片 Provider 调用超时。"
+                    if reason_code == "provider_timeout"
+                    else "Codex OAuth 图片 Provider 调用失败。"
+                ),
+                reason_code=reason_code,
             )
         if provider_call_error is not None:
             raise provider_call_error from None
@@ -281,17 +333,20 @@ class CodexOAuthImageService:
                 result_is_file = result_path.is_file()
         except Exception:
             result_error = CodexOAuthImageProviderError(
-                "Codex OAuth 图片结果读取失败。"
+                "Codex OAuth 图片结果读取失败。",
+                reason_code="result_read_failed",
             )
         if result_error is not None:
             raise result_error from None
         if not results:
             raise CodexOAuthImageProviderError(
-                "Codex OAuth 图片调用未返回结果。"
+                "Codex OAuth 图片调用未返回结果。",
+                reason_code="empty_result",
             ) from None
         if not result_is_file:
             raise CodexOAuthImageProviderError(
-                "Codex OAuth 图片结果文件不可用。"
+                "Codex OAuth 图片结果文件不可用。",
+                reason_code="result_file_missing",
             ) from None
         return CodexOAuthImageResult(
             path=str(result_path),

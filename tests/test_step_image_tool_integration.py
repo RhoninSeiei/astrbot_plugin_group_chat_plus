@@ -20,7 +20,16 @@ class GroupImageConfigError(Exception):
 
 
 class GroupImageProviderError(Exception):
-    pass
+    def __init__(
+        self,
+        message,
+        *,
+        reason_code="provider_call_failed",
+        backend="unknown",
+    ):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.backend = backend
 
 
 class RecordingLogger:
@@ -977,6 +986,38 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     [f"群聊图片工具 图片编辑失败：{expected_message}"],
                 )
                 self.assertNotIn("sensitive-token-value", repr(logger.records))
+
+    def test_provider_failure_logs_safe_backend_and_reason_code(self):
+        error = GroupImageProviderError(
+            "provider exposed sensitive-token-value at /private/provider.json",
+            reason_code="provider_timeout",
+            backend="codex_oauth",
+        )
+
+        for operation in ("generate", "edit"):
+            with self.subTest(operation=operation):
+                order = []
+                facade = RecordingFacade(order, error=error)
+                harness, logger = self._make_tool_harness(facade)
+                event = FakeEvent(order)
+
+                if operation == "generate":
+                    self._collect_tool_results(
+                        harness.gcp_step_image_generate(
+                            event, prompt="cat", size=""
+                        )
+                    )
+                else:
+                    self._collect_tool_results(
+                        harness.gcp_step_image_edit(event, prompt="change")
+                    )
+
+                rendered = repr(logger.records)
+                self.assertIn("backend=%s reason_code=%s error_type=%s", rendered)
+                self.assertIn("codex_oauth", rendered)
+                self.assertIn("provider_timeout", rendered)
+                self.assertNotIn("sensitive-token-value", rendered)
+                self.assertNotIn("private", rendered.lower())
 
     def test_guard_and_missing_edit_image_fail_before_any_send(self):
         order = []

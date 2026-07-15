@@ -84,6 +84,30 @@ class FailingProvider(FakeProvider):
         )
 
 
+class ReadTimeout(Exception):
+    pass
+
+
+ReadTimeout.__module__ = "httpx"
+
+
+class HttpcoreReadTimeout(Exception):
+    pass
+
+
+HttpcoreReadTimeout.__module__ = "httpcore"
+
+
+class TimeoutFailingProvider(FakeProvider):
+    error_type = ReadTimeout
+
+    async def generate_image(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.error_type(
+            "read timeout exposed sensitive-token-value at /private/codex/stream"
+        )
+
+
 class ConcurrentProvider(FakeProvider):
     def __init__(self, result_path: Path):
         super().__init__(result_path)
@@ -444,8 +468,45 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertEqual(
             str(caught.exception), "Codex OAuth 图片 Provider 调用失败。"
         )
+        self.assertEqual(caught.exception.reason_code, "provider_call_failed")
         self.assertEqual(provider.timeout_write_count, 0)
         self.assert_sanitized_error(caught.exception)
+
+    def test_httpx_timeout_keeps_safe_reason_code(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "source.png"
+            source.write_bytes(b"source")
+            for error_type in (ReadTimeout, HttpcoreReadTimeout):
+                for operation in ("generate", "edit"):
+                    with self.subTest(
+                        error_type=error_type.__module__, operation=operation
+                    ):
+                        provider = TimeoutFailingProvider(Path("unused.png"))
+                        provider.error_type = error_type
+                        with self.assertRaises(
+                            CodexOAuthImageProviderError
+                        ) as caught:
+                            if operation == "generate":
+                                asyncio.run(
+                                    self.make_service(provider).generate(
+                                        prompt="cat", size="1:1"
+                                    )
+                                )
+                            else:
+                                asyncio.run(
+                                    self.make_service(provider).edit(
+                                        prompt="change", image_path=str(source)
+                                    )
+                                )
+
+                        self.assertEqual(
+                            str(caught.exception),
+                            "Codex OAuth 图片 Provider 调用超时。",
+                        )
+                        self.assertEqual(
+                            caught.exception.reason_code, "provider_timeout"
+                        )
+                        self.assert_sanitized_error(caught.exception)
 
     def test_concurrent_calls_do_not_serialize_or_mutate_provider_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -478,6 +539,7 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
             asyncio.run(service.generate(prompt="cat", size="1:1"))
 
         self.assertEqual(str(caught.exception), "Codex OAuth 图片 Provider 调用超时。")
+        self.assertEqual(caught.exception.reason_code, "provider_timeout")
         self.assertTrue(provider.cancelled)
         self.assertEqual(provider.timeout_write_count, 0)
         self.assert_sanitized_error(caught.exception)
@@ -611,6 +673,7 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
                             )
                         )
                     self.assert_sanitized_error(caught.exception)
+                    self.assertEqual(caught.exception.reason_code, "result_read_failed")
 
             provider = FakeProvider(result_path)
             with patch.object(
@@ -625,6 +688,32 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
                         self.make_service(provider).generate(prompt="cat", size="1:1")
                     )
             self.assert_sanitized_error(caught.exception)
+            self.assertEqual(caught.exception.reason_code, "result_read_failed")
+
+    def test_empty_result_and_missing_file_keep_distinct_reason_codes(self):
+        empty_provider = FakeProvider(Path("unused.png"))
+
+        async def return_empty(**kwargs):
+            return []
+
+        empty_provider.generate_image = return_empty
+        with self.assertRaises(CodexOAuthImageProviderError) as empty_caught:
+            asyncio.run(
+                self.make_service(empty_provider).generate(prompt="cat", size="1:1")
+            )
+
+        missing_provider = FakeProvider(Path("missing.png"))
+        with self.assertRaises(CodexOAuthImageProviderError) as missing_caught:
+            asyncio.run(
+                self.make_service(missing_provider).generate(
+                    prompt="cat", size="1:1"
+                )
+            )
+
+        self.assertEqual(empty_caught.exception.reason_code, "empty_result")
+        self.assertEqual(missing_caught.exception.reason_code, "result_file_missing")
+        self.assert_sanitized_error(empty_caught.exception)
+        self.assert_sanitized_error(missing_caught.exception)
 
 
 if __name__ == "__main__":

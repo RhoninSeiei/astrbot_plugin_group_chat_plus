@@ -8801,7 +8801,10 @@ class ChatPlus(Star):
             )
         except GroupImageProviderError as exc:
             logger.warning(
-                "STEP_IMAGE_GENERATE_PROVIDER_FAILED error_type=%s",
+                "STEP_IMAGE_GENERATE_PROVIDER_FAILED "
+                "backend=%s reason_code=%s error_type=%s",
+                exc.backend,
+                exc.reason_code,
                 exc.__class__.__name__,
             )
             message = "图片生成失败，稍后再试。"
@@ -8933,7 +8936,10 @@ class ChatPlus(Star):
             )
         except GroupImageProviderError as exc:
             logger.warning(
-                "STEP_IMAGE_EDIT_PROVIDER_FAILED error_type=%s",
+                "STEP_IMAGE_EDIT_PROVIDER_FAILED "
+                "backend=%s reason_code=%s error_type=%s",
+                exc.backend,
+                exc.reason_code,
                 exc.__class__.__name__,
             )
             message = "图片编辑失败，稍后再试。"
