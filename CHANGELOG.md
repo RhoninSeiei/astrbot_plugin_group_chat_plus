@@ -9,6 +9,7 @@
 - 增加内部迁移标记 `image_tool_backend_config_version`：结合 `config.first_deploy` 区分新安装和 AstrBot schema 自动补齐后的旧配置，选定后立即保存；保存失败时本次运行仍采用选定后端
 - Codex OAuth 默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`，配置只保存 Provider ID、Codex 主模型、尺寸和超时；Provider 负责 OAuth 凭据与 `image_generation` 请求
 - Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 继续采用 `height x width`（高x宽）
+- Codex OAuth 图片提示词上限调整为 2048 字符，StepFun 保持 512 字符；统一图片服务和 LLM 工具说明按当前后端分别校验
 
 **兼容与消息行为**:
 - 旧配置首次加载时由迁移标记选择 StepFun，迁移后的显式后端配置保持不变

@@ -167,6 +167,8 @@
 
 Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。文生图需要 Provider 声明 `image_generate`，修图额外需要 `image_edit`。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。
 
+图片提示词上限随后端分别校验：Codex OAuth 最多 2048 个字符，StepFun 最多 512 个字符。
+
 调用前会检查 `generate_image()` 签名。支持可选 `timeout` 参数或 `**kwargs` 的 Provider 会收到与外层等待保护相同的单次超时值。旧 Provider 只受插件外层最大等待限制，实际请求仍可能受 Provider 自身 HTTP 超时约束；无法读取签名时按旧 Provider 处理，不会通过失败调用重试。生产 Codex OAuth Provider 已支持单次超时参数。
 
 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`，后端切换不会改变工具协议。群聊只显示随后端变化的进度文本、一次图片结果和主模型按当前人格生成的自然语言收尾；工具协议、参数、Provider ID、文件路径与凭据不会进入群聊内容。

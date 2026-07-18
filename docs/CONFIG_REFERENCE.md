@@ -153,6 +153,8 @@
 
 Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超时。Provider 负责 OAuth 凭据以及 `image_generation` 请求，插件通过公共 `generate_image()` 接口取得结果。Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 尺寸继续采用 `height x width`（高x宽）。`httpx` 只供 StepFun HTTP 请求使用，Codex OAuth 后端不会新增运行时依赖。
 
+图片提示词上限随后端分别校验：Codex OAuth 最多 2048 个字符，StepFun 最多 512 个字符。
+
 插件调用前检查 `generate_image()` 签名。支持可选 `timeout` 参数或 `**kwargs` 的 Provider 会收到与 `codex_oauth_image_timeout` 相同的单次超时值，外层 `asyncio.wait_for` 继续提供相同数值的最大等待保护。旧 Provider 不接收该关键字，仅受插件外层最大等待限制，实际请求仍可能受 Provider 自身 HTTP 超时约束。签名读取异常时按旧 Provider 处理，调用只执行一次。
 
 内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`。工具只在启用本插件的群聊正式回复阶段开放：文生图使用主模型整理后的图像提示词和尺寸参数；修图要求图片与编辑指令位于同一条消息。命中工具后，插件发送随当前后端变化的自然语言进度文本和一次图片结果，随后主模型根据安全摘要与当前群人格生成自然语言收尾。群聊内容不会包含工具协议、参数、Provider ID、文件路径或凭据。
