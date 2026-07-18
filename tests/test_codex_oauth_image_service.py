@@ -252,6 +252,32 @@ class CodexOAuthImageServiceTest(unittest.TestCase):
         self.assertIsNone(error.__cause__)
         self.assertIsNone(error.__context__)
 
+    def test_generate_accepts_prompt_with_exactly_2048_characters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "result.png"
+            result_path.write_bytes(b"result")
+            provider = FakeProvider(result_path)
+            prompt = "a" * 2048
+
+            asyncio.run(
+                self.make_service(provider).generate(prompt=prompt, size="1:1")
+            )
+
+        self.assertEqual(provider.calls[0]["prompt"], prompt)
+
+    def test_generate_rejects_prompt_with_2049_characters(self):
+        provider = FakeProvider(Path("unused.png"))
+
+        with self.assertRaisesRegex(CodexOAuthImageUserError, "2048"):
+            asyncio.run(
+                self.make_service(provider).generate(
+                    prompt="a" * 2049,
+                    size="1:1",
+                )
+            )
+
+        self.assertEqual(provider.calls, [])
+
     def test_generate_uses_public_provider_list_without_mutating_timeout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result_path = Path(tmpdir) / "result.png"

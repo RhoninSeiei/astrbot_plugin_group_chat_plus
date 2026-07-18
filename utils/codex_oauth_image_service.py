@@ -59,7 +59,7 @@ class CodexOAuthImageResult:
 
 
 class CodexOAuthImageService:
-    MAX_PROMPT_CHARS = 512
+    MAX_PROMPT_CHARS = 2048
 
     def __init__(self, *, context: Any, config: dict) -> None:
         self.context = context
@@ -135,7 +135,9 @@ class CodexOAuthImageService:
         if not clean_prompt:
             raise CodexOAuthImageUserError("图片提示词不能为空。")
         if len(clean_prompt) > self.MAX_PROMPT_CHARS:
-            raise CodexOAuthImageUserError("图片提示词最多 512 个字符。")
+            raise CodexOAuthImageUserError(
+                f"图片提示词最多 {self.MAX_PROMPT_CHARS} 个字符。"
+            )
         return clean_prompt
 
     def _resolve_timeout(self) -> float:
