@@ -97,6 +97,21 @@ class GroupImageService:
             return "OpenAI Codex 图像生成服务"
         return "阶跃星辰 Step Image Edit 2"
 
+    def max_prompt_chars(self) -> int:
+        if self.backend_name() == self.BACKEND_CODEX_OAUTH:
+            return CodexOAuthImageService.MAX_PROMPT_CHARS
+        return StepImageService.MAX_PROMPT_CHARS
+
+    def _validate_prompt(self, prompt: str) -> None:
+        clean_prompt = str(prompt or "").strip()
+        if not clean_prompt:
+            raise GroupImageUserError("图片提示词不能为空。")
+        max_prompt_chars = self.max_prompt_chars()
+        if len(clean_prompt) > max_prompt_chars:
+            raise GroupImageUserError(
+                f"图片提示词最多 {max_prompt_chars} 个字符。"
+            )
+
     def _backend(self) -> Any:
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
             return self._codex_factory(context=self.context, config=self.config)
@@ -128,6 +143,7 @@ class GroupImageService:
         )
 
     async def generate(self, *, prompt: str, size: str = "") -> GroupImageResult:
+        self._validate_prompt(prompt)
         provider_error = None
         try:
             backend = self._backend()
@@ -155,6 +171,7 @@ class GroupImageService:
         return self._convert_result(result)
 
     async def edit(self, *, prompt: str, image_path: str) -> GroupImageResult:
+        self._validate_prompt(prompt)
         provider_error = None
         try:
             backend = self._backend()

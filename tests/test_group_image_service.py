@@ -105,6 +105,50 @@ class GroupImageServiceTest(unittest.TestCase):
             or (lambda **_: codex or RecordingBackend("codex_oauth")),
         )
 
+    def test_max_prompt_chars_uses_active_backend_adapter_limit(self):
+        codex = self.make_service(config={"image_tool_backend": "codex_oauth"})
+        stepfun = self.make_service(config={"image_tool_backend": "stepfun"})
+
+        self.assertEqual(codex.max_prompt_chars(), 2048)
+        self.assertEqual(stepfun.max_prompt_chars(), 512)
+
+    def test_codex_generate_accepts_2048_characters(self):
+        backend = RecordingBackend("codex_oauth")
+        service = self.make_service(
+            config={"image_tool_backend": "codex_oauth"},
+            codex=backend,
+        )
+
+        asyncio.run(service.generate(prompt="a" * 2048, size="1:1"))
+
+        self.assertEqual(backend.calls[0][1]["prompt"], "a" * 2048)
+
+    def test_codex_generate_rejects_2049_characters_before_backend_call(self):
+        backend = RecordingBackend("codex_oauth")
+        service = self.make_service(
+            config={"image_tool_backend": "codex_oauth"},
+            codex=backend,
+        )
+
+        with self.assertRaisesRegex(GroupImageUserError, "2048"):
+            asyncio.run(service.generate(prompt="a" * 2049, size="1:1"))
+
+        self.assertEqual(backend.calls, [])
+
+    def test_stepfun_edit_rejects_513_characters_before_backend_call(self):
+        backend = RecordingBackend("stepfun")
+        service = self.make_service(
+            config={"image_tool_backend": "stepfun"},
+            stepfun=backend,
+        )
+
+        with self.assertRaisesRegex(GroupImageUserError, "512"):
+            asyncio.run(
+                service.edit(prompt="a" * 513, image_path="input.png")
+            )
+
+        self.assertEqual(backend.calls, [])
+
     def test_old_config_without_backend_uses_stepfun(self):
         stepfun = RecordingBackend("stepfun")
         codex = RecordingBackend("codex_oauth")

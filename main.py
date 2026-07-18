@@ -8738,7 +8738,7 @@ class ChatPlus(Star):
         系统提示等元信息。
 
         Args:
-            prompt(string): 正式回复模型整理后的图像提示词，不超过 512 个字符。
+            prompt(string): 正式回复模型整理后的图像提示词，用于生成图片。Codex OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。
             size(string): 图片尺寸或比例，可使用 1080p、16:9、9:16、1:1 等别名。精确尺寸由当前后端校验；留空使用当前后端的默认尺寸。
         """
         guard_message = self._step_image_guard(event)
@@ -8858,7 +8858,7 @@ class ChatPlus(Star):
         工具来源和系统提示等元信息。
 
         Args:
-            prompt(string): 正式回复模型整理后的图像编辑提示词，不超过 512 个字符。
+            prompt(string): 正式回复模型整理后的图像提示词，用于编辑图片。Codex OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。
         """
         guard_message = self._step_image_guard(event)
         if guard_message:

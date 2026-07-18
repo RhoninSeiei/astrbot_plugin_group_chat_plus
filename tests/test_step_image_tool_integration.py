@@ -1113,6 +1113,12 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
     def test_tool_description_requires_model_refined_prompt(self):
         self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
+        self.assertEqual(
+            self.main_source.count("Codex OAuth 后端最多 2048 个字符"), 2
+        )
+        self.assertEqual(
+            self.main_source.count("StepFun 后端最多 512 个字符"), 2
+        )
         self.assertIn("1080p", self.main_source)
         self.assertIn("16:9", self.main_source)
         self.assertIn("工具返回结果后", self.main_source)
