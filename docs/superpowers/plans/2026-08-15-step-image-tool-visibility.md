@@ -15,7 +15,7 @@
 3. Authorized group requests retain the original tool container and both StepImage tools.
 4. Private chats, unauthorized groups, disabled group chat, and disabled image service exclude both StepImage tools before model inference.
 5. Keep `_step_image_guard()` as execution-time verification.
-6. Do not expose prompts, Provider configuration, access tokens, or keys in logs.
+6. Visibility-filter logs contain only platform, private-chat state, and removed tool names; do not expose UMO, group IDs, prompts, Provider configuration, access tokens, or keys.
 7. Leave `docs/superpowers/plans/2026-04-17-matoi-guardian-ep5-plugin.md` untouched.
 
 ---
@@ -244,12 +244,9 @@ req.func_tool, removed_step_image_tools = (
 )
 if removed_step_image_tools:
     logger.info(
-        "GCP_TOOL_VISIBILITY_FILTERED platform=%s umo=%s private=%s "
-        "group_id=%s removed=%s",
+        "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
         event.get_platform_name(),
-        getattr(event, "unified_msg_origin", ""),
         event.is_private_chat(),
-        self._get_step_image_group_id(event),
         removed_step_image_tools,
     )
 ```

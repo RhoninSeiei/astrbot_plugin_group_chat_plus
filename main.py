@@ -9077,12 +9077,9 @@ class ChatPlus(Star):
         )
         if removed_step_image_tools:
             logger.info(
-                "GCP_TOOL_VISIBILITY_FILTERED platform=%s umo=%s private=%s "
-                "group_id=%s removed=%s",
+                "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
                 event.get_platform_name(),
-                getattr(event, "unified_msg_origin", ""),
                 event.is_private_chat(),
-                self._get_step_image_group_id(event),
                 removed_step_image_tools,
             )
 
