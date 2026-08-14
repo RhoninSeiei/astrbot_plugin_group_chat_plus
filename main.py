@@ -148,6 +148,7 @@ from .utils import (
 from .utils.image_description_cache import (
     ImageDescriptionCache,
 )  # 🆕 v1.2.0: 图片描述缓存
+from .utils.image_handler import PLUGIN_REFERENCE_IMAGE_URLS
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
@@ -6730,6 +6731,17 @@ class ChatPlus(Star):
         else:  # blacklist
             return sender_id not in user_list
 
+    @staticmethod
+    def _merge_reference_image_urls(*collections) -> list:
+        merged = []
+        seen = set()
+        for values in collections:
+            for value in values or []:
+                if value and value not in seen:
+                    seen.add(value)
+                    merged.append(value)
+        return merged
+
     async def _maybe_intercept_for_wait_window(
         self,
         event: AstrMessageEvent,
@@ -6877,7 +6889,21 @@ class ChatPlus(Star):
             # 让出控制权，让平台 LTM 有机会开始处理图片
             await asyncio.sleep(0)
 
-            has_image = PlatformLTMHelper.has_image_in_message(event)
+            resolved_images = await ImageHandler.collect_message_images(
+                event,
+                event.get_messages(),
+                self.max_images_per_message,
+            )
+            resolved_image_urls = [item.url for item in resolved_images]
+            has_image = bool(
+                resolved_image_urls
+            ) or PlatformLTMHelper.has_image_in_message(event)
+            cached_image_urls = []
+            cached_reference_image_urls = resolved_image_urls
+            event.set_extra(
+                PLUGIN_REFERENCE_IMAGE_URLS,
+                cached_reference_image_urls,
+            )
             if has_image and self.probability_filter_cache_delay > 0:
                 await asyncio.sleep(self.probability_filter_cache_delay / 1000.0)
 
@@ -6886,7 +6912,15 @@ class ChatPlus(Star):
             should_cache = True
             success = False
 
-            if has_image:
+            if has_image and not self.image_to_text_provider_id:
+                processed_text = original_message_text
+                cached_image_urls = resolved_image_urls
+                success = bool(cached_image_urls)
+                should_cache = bool(
+                    (processed_text and processed_text.strip())
+                    or cached_image_urls
+                )
+            elif has_image:
                 # 尝试从平台获取图片描述
                 (
                     success,
@@ -6916,8 +6950,27 @@ class ChatPlus(Star):
                             True  # 标记图片信息已保留（影响后续 image_retained 判断）
                         )
                         logger.info(
-                            f"💰 [省钱回退-等待窗口] 从缓存恢复图片描述: {cache_fallback_text[:80]}..."
+                            "[图片缓存-等待窗口] 已恢复图片描述"
                         )
+                    elif resolved_images:
+                        processed_text = await ImageHandler._convert_images_to_text(
+                            event.get_messages(),
+                            self.context,
+                            self.image_to_text_provider_id,
+                            self.image_to_text_prompt,
+                            resolved_images,
+                            self.image_to_text_timeout,
+                            self.image_description_cache,
+                        )
+                        success = bool(processed_text)
+                        if not success and is_pure_image:
+                            should_cache = False
+                        elif not success:
+                            should_cache, processed_text = (
+                                MessageCleaner.process_cached_message_images(
+                                    original_message_text
+                                )
+                            )
                     elif is_pure_image:
                         should_cache = False  # 纯图片且无描述，丢弃
                     else:
@@ -6946,7 +6999,11 @@ class ChatPlus(Star):
                         except Exception:
                             pass
 
-                image_retained = (has_image and success) or (not has_image)
+                image_retained = (
+                    bool(cached_image_urls)
+                    or (has_image and success)
+                    or (not has_image)
+                )
                 if is_emoji_message and self.enable_emoji_filter and image_retained:
                     processed_text = EmojiDetector.add_emoji_marker(processed_text)
                     if self.debug_mode:
@@ -6974,7 +7031,8 @@ class ChatPlus(Star):
                     "wait_window_intercepted": True,  # 标记为等待窗口拦截的消息
                     "window_buffered": True,  # 标记为窗口缓冲消息，用于上下文分离
                     "gww_token": current_window_token,
-                    "image_urls": [],
+                    "image_urls": cached_image_urls,
+                    "reference_image_urls": cached_reference_image_urls,
                 }
                 self.cache_manager.add_to_cache(
                     chat_id, cached_message, source="等待窗口"
@@ -7626,8 +7684,25 @@ class ChatPlus(Star):
                             _seen_urls.add(_u)
                             _dedup_urls.append(_u)
                     merged_image_urls = _dedup_urls
-        except Exception as e:
-            logger.warning(f"[图片缓存] 合并图片URL失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_URL_MERGE_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
+
+        pending_reference_image_urls = [
+            cached.get("reference_image_urls") or []
+            for cached in self.pending_messages_cache.get(chat_id, [])
+            if isinstance(cached, dict)
+        ]
+        merged_reference_image_urls = self._merge_reference_image_urls(
+            event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []),
+            *pending_reference_image_urls,
+        )
+        event.set_extra(
+            PLUGIN_REFERENCE_IMAGE_URLS,
+            merged_reference_image_urls,
+        )
 
         # 🔧 修复并发竞争：在AI决策判断之前就提取缓存副本
         # 避免在决策AI判断期间（可能耗时6-8秒），缓存被其他并发消息清空
@@ -7743,6 +7818,18 @@ class ChatPlus(Star):
                         for _url in _smart_msg.get("image_urls") or []:
                             if _url and _url not in merged_image_urls:
                                 merged_image_urls.append(_url)
+                    merged_reference_image_urls = self._merge_reference_image_urls(
+                        merged_reference_image_urls,
+                        *[
+                            smart_message.get("reference_image_urls") or []
+                            for smart_message in smart_batch_messages
+                            if isinstance(smart_message, dict)
+                        ],
+                    )
+                    event.set_extra(
+                        PLUGIN_REFERENCE_IMAGE_URLS,
+                        merged_reference_image_urls,
+                    )
                     if self.enable_smart_batch_reply_hint:
                         sender_name = event.get_sender_name() or "当前发送者"
                         summary_lines = []
@@ -8012,6 +8099,10 @@ class ChatPlus(Star):
             elif not has_image_info and self.debug_mode:
                 logger.info("【回退路径】🎭 表情包图片信息已被过滤，跳过添加标记")
 
+        event.set_extra(
+            PLUGIN_REFERENCE_IMAGE_URLS,
+            merged_reference_image_urls,
+        )
         async for result in self._generate_and_send_reply(
             event,
             formatted_context,
@@ -8490,6 +8581,8 @@ class ChatPlus(Star):
 
     def _has_current_image_component(self, event: AstrMessageEvent) -> bool:
         try:
+            if event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+                return True
             message_chain = getattr(getattr(event, "message_obj", None), "message", [])
             return any(isinstance(component, Image) for component in message_chain)
         except Exception:
@@ -8759,6 +8852,20 @@ class ChatPlus(Star):
     async def _extract_first_current_image_path(
         self, event: AstrMessageEvent
     ) -> Optional[str]:
+        for reference in event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+            value = str(reference or "").strip()
+            if not value:
+                continue
+            try:
+                image_path = await Image(file=value).convert_to_file_path()
+                if image_path:
+                    return image_path
+            except Exception as exc:
+                logger.warning(
+                    "STEP_IMAGE_REFERENCE_EXTRACT_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
+
         if not hasattr(event, "message_obj") or not hasattr(
             event.message_obj, "message"
         ):

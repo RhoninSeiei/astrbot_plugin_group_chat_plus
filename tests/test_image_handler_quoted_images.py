@@ -50,6 +50,37 @@ class FakePlain:
 class FakeEvent:
     def __init__(self, chain):
         self.message_obj = types.SimpleNamespace(message=list(chain))
+        self.extras = {}
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+    def get_message_outline(self):
+        return "outline"
+
+
+class FakeProvider:
+    def __init__(self, failures=None):
+        self.calls = []
+        self.failures = set(failures or [])
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        image = kwargs["image_urls"][0]
+        if image in self.failures:
+            raise RuntimeError("vision unavailable")
+        return types.SimpleNamespace(completion_text=f"desc:{image}")
+
+
+class FakeContext:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def get_provider_by_id(self, provider_id):
+        return self.provider if provider_id == "vision" else None
 
 
 async def extract_quoted_message_images(event, reply_component):
@@ -114,6 +145,7 @@ def _load_image_handler_module():
 image_handler_module = _load_image_handler_module()
 ImageHandler = image_handler_module.ImageHandler
 ResolvedMessageImage = image_handler_module.ResolvedMessageImage
+PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
 
 
 class ImageHandlerQuotedImagesTest(unittest.TestCase):
@@ -215,6 +247,91 @@ class ImageHandlerQuotedImagesTest(unittest.TestCase):
             [ResolvedMessageImage("quoted-a", "quoted_embedded", 0)],
         )
         self.assertEqual(quoted_calls, ["r1"])
+
+    def test_multimodal_mode_returns_quoted_image_url(self):
+        chain = [
+            FakeReply("r1", [FakeImage("quoted-a")], message_str=""),
+            FakePlain("问题正文"),
+        ]
+        event = FakeEvent(chain)
+
+        result = asyncio.run(
+            ImageHandler.process_message_images(
+                event,
+                FakeContext(None),
+                True,
+                "all",
+                "",
+                "describe",
+                True,
+                False,
+            )
+        )
+
+        self.assertEqual(result[2], ["quoted-a"])
+        self.assertTrue(result[3])
+
+    def test_image_to_text_places_quote_description_after_reply_marker(self):
+        provider = FakeProvider()
+        chain = [
+            FakeReply("r1", [FakeImage("quoted-a")], message_str=""),
+            FakePlain("问题正文"),
+        ]
+        event = FakeEvent(chain)
+
+        result = asyncio.run(
+            ImageHandler.process_message_images(
+                event,
+                FakeContext(provider),
+                True,
+                "all",
+                "vision",
+                "describe",
+                True,
+                False,
+            )
+        )
+
+        self.assertIn(
+            "[引用消息][引用图片内容: desc:quoted-a]问题正文",
+            result[1],
+        )
+        self.assertEqual(provider.calls[0]["image_urls"], ["quoted-a"])
+        self.assertEqual(result[2], [])
+        self.assertTrue(result[3])
+        self.assertEqual(
+            event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS),
+            ["quoted-a"],
+        )
+
+    def test_image_to_text_preserves_success_when_another_image_fails(self):
+        provider = FakeProvider(failures={"quoted-a"})
+        chain = [
+            FakeReply("r1", [FakeImage("quoted-a")], message_str=""),
+            FakePlain("问题正文"),
+            FakeImage("top-b"),
+        ]
+        event = FakeEvent(chain)
+
+        result = asyncio.run(
+            ImageHandler.process_message_images(
+                event,
+                FakeContext(provider),
+                True,
+                "all",
+                "vision",
+                "describe",
+                True,
+                False,
+            )
+        )
+
+        self.assertIn("[引用图片]", result[1])
+        self.assertIn("desc:top-b", result[1])
+        self.assertEqual(
+            [call["image_urls"] for call in provider.calls],
+            [["quoted-a"], ["top-b"]],
+        )
 
 
 if __name__ == "__main__":

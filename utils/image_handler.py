@@ -25,6 +25,9 @@ class ResolvedMessageImage:
     component_index: int
 
 
+PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
+
+
 class ImageHandler:
     """
     图片处理器
@@ -200,8 +203,16 @@ class ImageHandler:
             message_chain = event.message_obj.message
 
             # 检查消息中是否有图片
-            has_image, has_text, image_components = ImageHandler._analyze_message(
-                message_chain, max_images_per_message
+            resolved_images = await ImageHandler.collect_message_images(
+                event,
+                message_chain,
+                max_images_per_message,
+            )
+            has_image = bool(resolved_images)
+            has_text = ImageHandler._has_text_content(message_chain)
+            event.set_extra(
+                PLUGIN_REFERENCE_IMAGE_URLS,
+                [item.url for item in resolved_images],
             )
 
             # 如果没有图片，从消息链提取完整文本（含引用内容），不使用 get_message_outline()
@@ -215,7 +226,7 @@ class ImageHandler:
 
             if DEBUG_MODE:
                 logger.info(
-                    f"检测到消息包含 {len(image_components)} 张图片, 是否有文字: {has_text}"
+                    f"检测到消息包含 {len(resolved_images)} 张图片, 是否有文字: {has_text}"
                 )
 
             # === 第一步：检查图片处理开关 ===
@@ -292,14 +303,14 @@ class ImageHandler:
                 if DEBUG_MODE:
                     logger.info("未配置图片转文字提供商ID,提取图片URL传递给多模态AI")
                 # 提取图片URL
-                image_urls = await ImageHandler._extract_image_urls(image_components)
+                image_urls = [item.url for item in resolved_images]
                 # 提取文本内容（不包含图片）
                 text_content = ImageHandler._extract_text_only(message_chain)
                 if DEBUG_MODE:
                     logger.info(
                         f"🟢 [多模态模式] 提取到 {len(image_urls)} 张图片，文本内容: {text_content[:100] if text_content else '(无文本)'}"
                     )
-                return True, text_content, image_urls, True  # 多模态: 图片保留为URL
+                return True, text_content, image_urls, bool(image_urls)
 
             # === 第四步：配置了图片转文字提供商ID，尝试转换图片 ===
             if DEBUG_MODE:
@@ -311,7 +322,7 @@ class ImageHandler:
                 context,
                 image_to_text_provider_id,
                 image_to_text_prompt,
-                image_components,
+                resolved_images,
                 timeout,
                 image_description_cache,
             )
@@ -354,8 +365,11 @@ class ImageHandler:
                 True,
             )  # 图片转文字成功: 图片信息保留为文字描述
 
-        except Exception as e:
-            logger.error(f"处理消息图片时发生错误: {e}")
+        except Exception as exc:
+            logger.error(
+                "IMAGE_PROCESSING_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             # 发生错误时,返回原消息文本
             return True, event.get_message_outline(), [], False
 
@@ -399,6 +413,17 @@ class ImageHandler:
             image_components = image_components[:max_images]
 
         return has_image, has_text, image_components
+
+    @staticmethod
+    def _has_text_content(message_chain: List[BaseMessageComponent]) -> bool:
+        return any(
+            isinstance(component, Reply)
+            or (
+                isinstance(component, Plain)
+                and bool(str(getattr(component, "text", "") or "").strip())
+            )
+            for component in message_chain
+        )
 
     @staticmethod
     def _format_special_component(component: BaseMessageComponent) -> str:
@@ -493,11 +518,21 @@ class ImageHandler:
                 if image_path:
                     image_urls.append(image_path)
                     if DEBUG_MODE:
-                        logger.info(f"提取到图片 {idx}: {image_path}")
+                        logger.info(
+                            "IMAGE_URL_EXTRACTED index=%s source=top_level",
+                            idx,
+                        )
                 else:
-                    logger.warning(f"无法提取图片 {idx} 的路径")
-            except Exception as e:
-                logger.error(f"提取图片 {idx} 的URL时发生错误: {e}")
+                    logger.warning(
+                        "IMAGE_URL_EXTRACT_FAILED index=%s error_type=empty_result",
+                        idx,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "IMAGE_URL_EXTRACT_FAILED index=%s error_type=%s",
+                    idx,
+                    exc.__class__.__name__,
+                )
                 continue
 
         return image_urls
@@ -508,7 +543,7 @@ class ImageHandler:
         context: Context,
         provider_id: str,
         prompt: str,
-        image_components: List[Image],
+        resolved_images: List[ResolvedMessageImage],
         timeout: int = 60,
         image_description_cache: Optional[ImageDescriptionCache] = None,
     ) -> Optional[str]:
@@ -520,7 +555,7 @@ class ImageHandler:
             context: Context对象
             provider_id: AI提供商ID
             prompt: 转换提示词
-            image_components: 图片组件列表
+            resolved_images: 已解析图片记录列表
             timeout: 超时时间（秒）
             image_description_cache: 图片描述缓存实例（可选）
 
@@ -534,27 +569,18 @@ class ImageHandler:
                 logger.error(f"无法找到提供商: {provider_id}")
                 return None
 
-            # 建立message_chain中Image组件位置到image_components索引的映射
-            # 这样可以避免使用id()，更稳定可靠
-            image_chain_to_idx = {}
-            img_count = 0
-            for chain_idx, component in enumerate(message_chain):
-                if isinstance(component, Image):
-                    image_chain_to_idx[chain_idx] = img_count
-                    img_count += 1
-
             # 对每张图片进行转文字
             image_descriptions = {}
-            for idx, img_component in enumerate(image_components):
+            for idx, resolved_image in enumerate(resolved_images):
                 try:
-                    # 获取图片URL或路径
-                    image_path = await img_component.convert_to_file_path()
-                    if not image_path:
-                        logger.warning(f"无法获取图片 {idx} 的路径")
-                        continue
+                    image_path = resolved_image.url
 
                     if DEBUG_MODE:
-                        logger.info(f"正在转换图片 {idx}: {image_path}")
+                        logger.info(
+                            "IMAGE_DESCRIPTION_CONVERTING index=%s source=%s",
+                            idx,
+                            resolved_image.source,
+                        )
 
                     # 🆕 v1.2.0: 先检查本地缓存，命中则跳过AI调用
                     if image_description_cache and image_description_cache.enabled:
@@ -562,7 +588,9 @@ class ImageHandler:
                         if cached_desc:
                             image_descriptions[idx] = cached_desc
                             logger.info(
-                                f"[图片缓存] 图片 {idx} 命中缓存，跳过AI调用 (省钱!)"
+                                "IMAGE_DESCRIPTION_CACHE_HIT index=%s source=%s",
+                                idx,
+                                resolved_image.source,
                             )
                             continue
 
@@ -585,7 +613,11 @@ class ImageHandler:
                     if description:
                         image_descriptions[idx] = description
                         if DEBUG_MODE:
-                            logger.info(f"图片 {idx} 转换成功: {description[:50]}...")
+                            logger.info(
+                                "IMAGE_DESCRIPTION_CONVERTED index=%s source=%s",
+                                idx,
+                                resolved_image.source,
+                            )
 
                         # 🆕 v1.2.0: AI转换成功后，保存到本地缓存
                         # 🔧 防御性编程：保存前再次检查缓存中是否已存在
@@ -596,11 +628,19 @@ class ImageHandler:
 
                 except asyncio.TimeoutError:
                     logger.warning(
-                        f"图片 {idx} 转文字超时（超过 {timeout} 秒），可在配置中调整 image_to_text_timeout 参数"
+                        "IMAGE_DESCRIPTION_TIMEOUT index=%s source=%s timeout=%s",
+                        idx,
+                        resolved_image.source,
+                        timeout,
                     )
                     continue
-                except Exception as e:
-                    logger.error(f"转换图片 {idx} 时发生错误: {e}")
+                except Exception as exc:
+                    logger.error(
+                        "IMAGE_DESCRIPTION_FAILED index=%s source=%s error_type=%s",
+                        idx,
+                        resolved_image.source,
+                        exc.__class__.__name__,
+                    )
                     continue
 
             # 如果没有成功转换任何图片,返回None
@@ -608,24 +648,39 @@ class ImageHandler:
                 logger.warning("没有成功转换任何图片")
                 return None
 
+            rendered_by_component = {}
+            for idx, resolved_image in enumerate(resolved_images):
+                description = image_descriptions.get(idx)
+                is_quoted = resolved_image.source.startswith("quoted_")
+                if description:
+                    rendered = (
+                        f"[引用图片内容: {description}]"
+                        if is_quoted
+                        else f"[图片内容: {description}]"
+                    )
+                else:
+                    rendered = "[引用图片]" if is_quoted else "[图片]"
+                rendered_by_component.setdefault(
+                    resolved_image.component_index,
+                    [],
+                ).append(rendered)
+
             # 构建新的消息文本,将图片替换为描述
             result_parts = []
             for chain_idx, component in enumerate(message_chain):
                 if isinstance(component, Plain):
                     result_parts.append(component.text)
                 elif isinstance(component, Image):
-                    # 如果这张图片有描述,使用描述替换
-                    # 通过chain_idx找到对应的image_components索引
-                    if chain_idx in image_chain_to_idx:
-                        img_idx = image_chain_to_idx[chain_idx]
-                        if img_idx in image_descriptions:
-                            result_parts.append(
-                                f"[图片内容: {image_descriptions[img_idx]}]"
-                            )
-                        else:
-                            result_parts.append("[图片]")
+                    rendered = rendered_by_component.get(chain_idx)
+                    if rendered:
+                        result_parts.extend(rendered)
                     else:
                         result_parts.append("[图片]")
+                elif isinstance(component, Reply):
+                    formatted = ImageHandler._format_special_component(component)
+                    if formatted:
+                        result_parts.append(formatted)
+                    result_parts.extend(rendered_by_component.get(chain_idx, []))
                 else:
                     # 其他组件使用统一的格式化方法
                     formatted = ImageHandler._format_special_component(component)
@@ -637,6 +692,9 @@ class ImageHandler:
                 logger.info(f"图片转文字完成,处理后的消息: {result_text[:100]}...")
             return result_text
 
-        except Exception as e:
-            logger.error(f"图片转文字过程发生错误: {e}")
+        except Exception as exc:
+            logger.error(
+                "IMAGE_DESCRIPTION_PROCESS_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             return None
