@@ -5082,7 +5082,7 @@ class ChatPlus(Star):
             "has_trigger_keyword": has_trigger_keyword,
             # 🆕 v1.0.9: 保存戳一戳信息（如果存在）
             "poke_info": poke_info,
-            "image_urls": image_urls or [],
+            "image_urls": list(image_urls or []),
             "reference_image_urls": list(
                 event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []
             ),
@@ -6147,7 +6147,10 @@ class ChatPlus(Star):
                 raw_content = last_cached["content"]
 
                 if self.debug_mode:
-                    logger.info(f"【步骤14-读缓存】内容: {raw_content[:100]}")
+                    logger.info(
+                        "FORMAL_SAVE_CACHE_READ content_length=%s",
+                        len(str(raw_content or "")),
+                    )
                 else:
                     logger.info("🟢 读取缓存中")
 
@@ -6189,7 +6192,10 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
                 if self.debug_mode:
-                    logger.info(f"【步骤14-加元数据后】内容: {message_to_save[:150]}")
+                    logger.info(
+                        "FORMAL_SAVE_METADATA_APPLIED content_length=%s",
+                        len(str(message_to_save or "")),
+                    )
 
             # 如果从缓存获取失败，使用当前处理后的消息并添加元数据
             if not message_to_save:
@@ -6221,15 +6227,21 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
             if self.debug_mode:
-                logger.info(f"  准备保存的完整消息: {message_to_save[:300]}...")
+                logger.info(
+                    "FORMAL_SAVE_READY content_length=%s",
+                    len(str(message_to_save or "")),
+                )
 
             await ContextManager.save_user_message(event, message_to_save, self.context)
             if self.debug_mode:
                 logger.info(
                     f"  ✅ 用户消息已保存到自定义存储: {len(message_to_save)} 字符"
                 )
-        except Exception as e:
-            logger.error(f"保存用户消息时发生错误: {e}")
+        except Exception as exc:
+            logger.error(
+                "CUSTOM_USER_SAVE_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
         # 🆕 发送前过滤检查：防止直接转发用户消息和重复发送相同回复
         # 提取回复文本（仅当为字符串类型时；LLM请求结果在装饰阶段处理）
@@ -6250,16 +6262,10 @@ class ChatPlus(Star):
 
             if reply_text == user_message_clean:
                 logger.info("[消息过滤]回复与用户消息相同，已过滤")
-                if self.debug_mode:
-                    logger.warning(
-                        f"🚫 [消息过滤] 检测到回复与用户消息相同，跳过发送\n"
-                        f"  用户消息: {user_message_clean[:100]}...\n"
-                        f"  AI回复: {reply_text[:100]}..."
-                    )
-                else:
-                    # 非debug模式下也显示部分信息
-                    logger.info(f"  用户消息: {user_message_clean[:50]}...")
-                    logger.info(f"  AI回复: {reply_text[:50]}...")
+                logger.info(
+                    "DUPLICATE_USER_REPLY_FILTERED content_length=%s",
+                    len(reply_text),
+                )
 
                 # 🔧 重要修复：设置标记，防止平台兜底处理@消息
                 if event.is_at_or_wake_command:
@@ -6285,15 +6291,12 @@ class ChatPlus(Star):
                 logger.info(
                     f"[消息过滤]回复与最近发送的回复{reason_label}，已拦截发送（后续流程继续执行）"
                 )
-                if self.debug_mode:
-                    logger.warning(
-                        f"🚫 [消息过滤] 检测到回复与最近发送的回复{reason_label}，跳过发送\n"
-                        f"  最近回复: {recent_content[:100]}...\n"
-                        f"  当前回复: {reply_text[:100]}..."
-                    )
-                else:
-                    logger.info(f"  最近回复: {recent_content[:50]}...")
-                    logger.info(f"  当前回复: {reply_text[:50]}...")
+                logger.info(
+                    "RECENT_REPLY_MATCH_CANDIDATE previous_length=%s "
+                    "current_length=%s",
+                    len(str(recent_content or "")),
+                    len(reply_text),
+                )
                 is_duplicate_blocked = True
 
         # 发送回复
@@ -6798,6 +6801,7 @@ class ChatPlus(Star):
         force_complete_after_buffer = False
 
         # 有活跃窗口 —— 处理 @消息特殊情况
+        empty_merged_at_candidate = False
         if is_at_message:
             at_mode = self.group_wait_window_at_mode
             if at_mode == "bypass":
@@ -6837,28 +6841,19 @@ class ChatPlus(Star):
                 # 4. 判断剥离后是否有实际内容（文字或图片）
                 remaining_text = event.message_str
                 has_remaining_image = PlatformLTMHelper.has_image_in_message(event)
-                if not remaining_text and not has_remaining_image:
-                    if at_mode in ("immediate", "force_close"):
-                        await _force_complete_window("空@机器人消息")
-                    if self.debug_mode:
-                        logger.info(
-                            f"[等待窗口] 用户{sender_id}在窗口期内发送空@消息，"
-                            f"已剥离@组件，不缓存"
-                        )
-                    return True  # 拦截，我们插件不再处理
+                empty_merged_at_candidate = (
+                    not remaining_text and not has_remaining_image
+                )
                 # 有内容（文字和/或图片）：fall through 到下方普通消息缓存分支
                 if at_mode in ("immediate", "force_close"):
                     count_after_buffer = False
                     force_complete_after_buffer = True
                 if self.debug_mode:
-                    _content_desc = []
-                    if remaining_text:
-                        _content_desc.append(f"文字: {remaining_text[:60]}...")
-                    if has_remaining_image:
-                        _content_desc.append("图片")
                     logger.info(
-                        f"[等待窗口] 用户{sender_id}在窗口期内发送@消息，"
-                        f"已剥离@组件，作为普通消息缓存 ({', '.join(_content_desc)})"
+                        "WAIT_WINDOW_MERGED_AT_STRIPPED has_text=%s "
+                        "has_top_level_image=%s",
+                        bool(remaining_text),
+                        bool(has_remaining_image),
                     )
             else:
                 # 原有逻辑：@他人 / 未开启合并 / 不在名单内 → force_complete
@@ -6906,6 +6901,12 @@ class ChatPlus(Star):
             has_image = bool(
                 resolved_image_urls
             ) or PlatformLTMHelper.has_image_in_message(event)
+            if empty_merged_at_candidate and not has_image:
+                if at_mode in ("immediate", "force_close"):
+                    await _force_complete_window("空@机器人消息")
+                if self.debug_mode:
+                    logger.info("WAIT_WINDOW_MERGED_AT_EMPTY skipped=true")
+                return True
             cached_image_urls = []
             cached_reference_image_urls = resolved_image_urls
             event.set_extra(
@@ -7688,7 +7689,7 @@ class ChatPlus(Star):
             emoji_marker_applied,  # 🆕 v1.2.0: 表情包标记是否已添加
         ) = result
 
-        merged_image_urls = image_urls or []
+        merged_image_urls = list(image_urls or [])
         try:
             if (
                 self.enable_image_processing
@@ -7743,10 +7744,17 @@ class ChatPlus(Star):
                 )
                 if self.debug_mode:
                     logger.info(
-                        f"🔒 [并发保护] 已保存当前消息缓存副本: {current_message_cache.get('content', '')[:100]}..."
+                        "MESSAGE_CACHE_SNAPSHOT_SAVED content_length=%s "
+                        "image_count=%s reference_image_count=%s",
+                        len(str(current_message_cache.get("content", "") or "")),
+                        len(current_message_cache.get("image_urls") or []),
+                        len(current_message_cache.get("reference_image_urls") or []),
                     )
-        except Exception as e:
-            logger.warning(f"[并发保护] 保存缓存副本失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "MESSAGE_CACHE_SNAPSHOT_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
         smart_batch_messages = []
         if self.concurrent_mode == "smart" and current_message_cache:
@@ -10215,11 +10223,16 @@ class ChatPlus(Star):
                 raw_content = last_cached["content"]
 
                 # 强制日志：从缓存读取的内容
-                logger.info(f"🟡 [官方保存-读缓存] 内容: {raw_content[:100]}")
+                logger.info(
+                    "OFFICIAL_SAVE_CACHE_READ content_length=%s image_count=%s",
+                    len(str(raw_content or "")),
+                    len(user_image_urls),
+                )
 
                 if self.debug_mode:
                     logger.info(
-                        f"[消息发送后] 从缓存副本读取内容: {raw_content[:200]}..."
+                        "OFFICIAL_SAVE_CACHE_SNAPSHOT_USED content_length=%s",
+                        len(str(raw_content or "")),
                     )
 
                 # 使用缓存中的发送者信息添加元数据
@@ -10260,7 +10273,10 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
                 # 强制日志：添加元数据后的内容
-                logger.info(f"🟡 [官方保存-加元数据后] 内容: {message_to_save[:150]}")
+                logger.info(
+                    "OFFICIAL_SAVE_METADATA_APPLIED content_length=%s",
+                    len(str(message_to_save or "")),
+                )
 
             # 如果缓存中没有，尝试从当前消息提取
             if not message_to_save:
@@ -10282,7 +10298,8 @@ class ChatPlus(Star):
                     # 清理系统提示（保存前过滤）
                     message_to_save = MessageCleaner.clean_message(message_to_save)
                     logger.info(
-                        f"[消息发送后] 从event提取的消息: {message_to_save[:200]}..."
+                        "OFFICIAL_SAVE_EVENT_FALLBACK content_length=%s",
+                        len(str(message_to_save or "")),
                     )
 
             if not message_to_save:
@@ -10291,7 +10308,9 @@ class ChatPlus(Star):
 
             if self.debug_mode:
                 logger.info(
-                    f"[消息发送后] 准备保存到官方系统的消息: {message_to_save[:300]}..."
+                    "OFFICIAL_SAVE_READY content_length=%s image_count=%s",
+                    len(str(message_to_save or "")),
+                    len(user_image_urls),
                 )
 
             # 准备需要转正的缓存消息（包含那些之前未回复的消息）

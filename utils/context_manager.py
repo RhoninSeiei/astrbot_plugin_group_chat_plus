@@ -3053,30 +3053,27 @@ class ContextManager:
                                         "[工具调用记录清理] 缓存消息仅包含工具审计文本，跳过转正"
                                     )
                                     continue
-                            hashable_content = make_content_hashable(
-                                cached_content
+                            cached_image_urls = cached_msg.get("image_urls", [])
+                            final_content = (
+                                ContextManager.build_user_history_content(
+                                    cached_content,
+                                    cached_image_urls,
+                                )
+                                if cached_image_urls
+                                else cached_content
                             )
+                            hashable_content = make_content_hashable(final_content)
                             if hashable_content not in existing_contents:
-                                # 🔧 修复：支持多模态消息格式（包含图片URL）
-                                # 检查是否有图片URL需要保存
-                                cached_image_urls = cached_msg.get("image_urls", [])
-
                                 if cached_image_urls:
-                                    multimodal_content = (
-                                        ContextManager.build_user_history_content(
-                                            cached_content,
-                                            cached_image_urls,
-                                        )
-                                    )
                                     history_list.append(
                                         {
                                             "role": role,
-                                            "content": multimodal_content,
+                                            "content": final_content,
                                         }
                                     )
                                     clean_image_count = sum(
                                         1
-                                        for item in multimodal_content
+                                        for item in final_content
                                         if isinstance(item, dict)
                                         and item.get("type") == "image_url"
                                     )
@@ -3091,7 +3088,7 @@ class ContextManager:
                                     history_list.append(
                                         {
                                             "role": role,
-                                            "content": cached_content,
+                                            "content": final_content,
                                         }
                                     )
 

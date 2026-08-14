@@ -252,41 +252,33 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         )
 
     def test_current_and_buffered_images_reach_restored_provider_request(self):
-        current_images = self.main_source.index(
-            "merged_image_urls = image_urls or []"
+        harness, _logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(["normal_search"]),
+            system_prompt="platform system prompt",
+            contexts=["platform context"],
+            prompt="short retrieval prompt",
+            image_urls=["platform-image"],
         )
-        wait_window_images = self.main_source.index(
-            '_urls = _cached.get("image_urls") or []',
-            current_images,
+        event = FakeRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": ["plugin context"],
+                "plugin_system_prompt": "plugin system prompt",
+                "plugin_prompt": "formal prompt",
+                "plugin_image_urls": ["current-a", "wait-a", "smart-a"],
+                "plugin_func_tool": None,
+            }
         )
-        smart_images = self.main_source.index(
-            '_smart_msg.get("image_urls") or []',
-            wait_window_images,
-        )
-        formal_reply = self.main_source.index(
-            "async for result in self._generate_and_send_reply(",
-            smart_images,
-        )
-        formal_reply_block = self.main_source[
-            formal_reply : formal_reply + 1800
-        ]
 
-        self.assertLess(current_images, wait_window_images)
-        self.assertLess(wait_window_images, smart_images)
-        self.assertLess(smart_images, formal_reply)
-        self.assertIn("merged_image_urls", formal_reply_block)
-        self.assertIn(
-            "event.set_extra(PLUGIN_IMAGE_URLS, image_urls)",
-            self.reply_source,
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(request.prompt, "formal prompt")
+        self.assertEqual(request.contexts, ["plugin context"])
+        self.assertEqual(
+            request.image_urls,
+            ["current-a", "wait-a", "smart-a"],
         )
-        restore_read = self.main_source.index(
-            "plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])"
-        )
-        restore_write = self.main_source.index(
-            "req.image_urls = plugin_image_urls",
-            restore_read,
-        )
-        self.assertLess(restore_read, restore_write)
 
     def test_formal_reply_clones_legacy_tool_manager_before_filtering(self):
         self.assertIn("from .tool_policy import ToolPolicy", self.reply_source)

@@ -8,6 +8,13 @@ import types
 from typing import Optional
 import unittest
 
+from tests.test_image_handler_quoted_images import (
+    FakeImage,
+    FakePlain,
+    FakeReply,
+    ImageHandler as ProductionImageHandler,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
@@ -47,18 +54,36 @@ class FakeContext:
         return self.provider if provider_id == "vision" else None
 
 
+class FakeAt:
+    def __init__(self, qq):
+        self.qq = qq
+
+
 class FakeEvent:
-    def __init__(self, raw_text="引用探针"):
+    def __init__(self, raw_text="引用探针", chain=None):
         self.raw_text = raw_text
         self.extras = {}
         self.message_str = raw_text
-        self.message_obj = SimpleNamespace(message=[], timestamp=123)
+        self.message_obj = SimpleNamespace(
+            message=list(
+                chain
+                if chain is not None
+                else [
+                    FakeReply("r1", [FakeImage("quoted-a")], message_str=""),
+                    FakePlain(raw_text),
+                ]
+            ),
+            timestamp=123,
+        )
 
     def get_sender_id(self):
         return "sender-1"
 
     def get_sender_name(self):
         return "sender"
+
+    def get_self_id(self):
+        return "bot-1"
 
     def get_messages(self):
         return self.message_obj.message
@@ -77,7 +102,11 @@ class FakeImageHandler:
     async def collect_message_images(event, message_chain, max_images):
         if FakeImageHandler.collect_error is not None:
             raise FakeImageHandler.collect_error
-        return [SimpleNamespace(url="quoted-a", source="quoted_embedded", component_index=0)]
+        return await ProductionImageHandler.collect_message_images(
+            event,
+            message_chain,
+            max_images,
+        )
 
     @staticmethod
     async def _convert_images_to_text(
@@ -89,18 +118,14 @@ class FakeImageHandler:
         timeout,
         image_description_cache,
     ):
-        provider = context.get_provider_by_id(provider_id)
-        response = await provider.text_chat(
-            prompt=prompt,
-            contexts=[],
-            image_urls=[resolved_images[0].url],
-            func_tool=None,
-            system_prompt="",
-        )
-        return (
-            "[引用消息]"
-            f"[引用图片内容: {response.completion_text}]"
-            "问题正文"
+        return await ProductionImageHandler._convert_images_to_text(
+            message_chain,
+            context,
+            provider_id,
+            prompt,
+            resolved_images,
+            timeout,
+            image_description_cache,
         )
 
 
@@ -161,8 +186,8 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
         namespace = {
             "AstrMessageEvent": object,
             "Optional": Optional,
-            "At": type("At", (), {}),
-            "Plain": type("Plain", (), {}),
+            "At": FakeAt,
+            "Plain": FakePlain,
             "asyncio": asyncio,
             "time": SimpleNamespace(time=lambda: 1000.0),
             "MessageCleaner": FakeMessageCleaner,
@@ -205,6 +230,7 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
             group_wait_window_timeout_ms=1000,
             _group_wait_window_max_extra=3,
             _get_message_id=lambda event: "message-1",
+            _should_merge_at_for_user=lambda _sender_id: True,
             _save_platform_descriptions_to_cache=lambda *args: None,
             _try_cache_fallback_for_images=lambda *args: None,
         )
@@ -219,15 +245,22 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
         harness._save_platform_descriptions_to_cache = no_save
         return harness, cache_manager
 
-    def _run(self, provider_id, raw_text="引用探针"):
+    def _run(
+        self,
+        provider_id,
+        raw_text="引用探针",
+        *,
+        chain=None,
+        is_at_message=False,
+    ):
         harness, cache_manager = self._make_harness(provider_id)
-        event = FakeEvent(raw_text)
+        event = FakeEvent(raw_text, chain=chain)
         intercepted = asyncio.run(
             type(self).intercept(
                 harness,
                 event,
                 "chat-1",
-                False,
+                is_at_message,
                 False,
                 None,
                 "aiocqhttp",
@@ -236,6 +269,36 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
         self.assertTrue(intercepted)
         self.assertEqual(len(cache_manager.messages), 1)
         return cache_manager.messages[0][1], event, harness
+
+    def test_merged_at_with_only_embedded_reply_image_uses_real_collector(self):
+        for provider_id in ("", "vision"):
+            with self.subTest(provider_id=provider_id or "multimodal"):
+                cached_message, event, harness = self._run(
+                    provider_id,
+                    raw_text="",
+                    chain=[
+                        FakeAt("bot-1"),
+                        FakeReply(
+                            "r1",
+                            [FakeImage("quoted-a")],
+                            message_str="",
+                        ),
+                        FakePlain(""),
+                    ],
+                    is_at_message=True,
+                )
+
+                self.assertEqual(
+                    cached_message["reference_image_urls"],
+                    ["quoted-a"],
+                )
+                self.assertEqual(event.get_messages()[0].id, "r1")
+                if provider_id:
+                    self.assertEqual(cached_message["image_urls"], [])
+                    self.assertIn("[引用图片内容: desc:quoted-a]", cached_message["content"])
+                    self.assertEqual(len(harness.context.provider.calls), 1)
+                else:
+                    self.assertEqual(cached_message["image_urls"], ["quoted-a"])
 
     def test_multimodal_wait_window_preserves_quoted_image(self):
         cached_message, event, _harness = self._run("")

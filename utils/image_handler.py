@@ -62,7 +62,18 @@ class ImageHandler:
         return ResolvedMessageImage(value, source, component_index)
 
     @staticmethod
-    async def _collect_reply_images(event, reply, component_index):
+    async def _collect_reply_images(
+        event,
+        reply,
+        component_index,
+        max_results=None,
+        seen_urls=None,
+    ):
+        remaining = None if max_results is None else max(0, int(max_results))
+        if remaining == 0:
+            return []
+        seen_urls = set(seen_urls or ())
+        reply_seen = set()
         embedded = [
             item
             for item in (getattr(reply, "chain", None) or [])
@@ -71,6 +82,8 @@ class ImageHandler:
         embedded_results = []
         embedded_failed = False
         for image in embedded:
+            if remaining is not None and len(embedded_results) >= remaining:
+                break
             resolved = await ImageHandler._resolve_image_component(
                 image,
                 "quoted_embedded",
@@ -78,10 +91,14 @@ class ImageHandler:
             )
             if resolved is None:
                 embedded_failed = True
-            else:
+            elif resolved.url not in seen_urls and resolved.url not in reply_seen:
+                reply_seen.add(resolved.url)
                 embedded_results.append(resolved)
 
-        if embedded and not embedded_failed:
+        embedded_budget_spent = (
+            remaining is not None and len(embedded_results) >= remaining
+        )
+        if embedded and (not embedded_failed or embedded_budget_spent):
             return embedded_results
 
         reason = "missing_embedded" if not embedded else "embedded_resolve_failed"
@@ -97,22 +114,38 @@ class ImageHandler:
             )
             return embedded_results
 
-        fetched_results = [
-            ResolvedMessageImage(
-                str(value).strip(), "quoted_fetched", component_index
+        fetched_results = []
+        fetched_seen = set()
+        for value in fetched or []:
+            normalized = str(value or "").strip()
+            if (
+                not normalized
+                or normalized in seen_urls
+                or normalized in fetched_seen
+            ):
+                continue
+            fetched_seen.add(normalized)
+            fetched_results.append(
+                ResolvedMessageImage(
+                    normalized,
+                    "quoted_fetched",
+                    component_index,
+                )
             )
-            for value in fetched or []
-            if str(value or "").strip()
-        ]
+            if remaining is not None and len(fetched_results) >= remaining:
+                break
         return fetched_results or embedded_results
 
     @staticmethod
     async def collect_message_images(
         event, message_chain=None, max_images=10
     ) -> List[ResolvedMessageImage]:
-        chain = list(
-            message_chain or getattr(event.message_obj, "message", []) or []
+        chain_source = (
+            message_chain
+            if message_chain is not None
+            else getattr(event.message_obj, "message", [])
         )
+        chain = list(chain_source or [])
         limit = max(0, int(max_images))
         if limit == 0:
             return []
@@ -142,7 +175,11 @@ class ImageHandler:
                 continue
 
             items = await ImageHandler._collect_reply_images(
-                event, component, component_index
+                event,
+                component,
+                component_index,
+                limit - len(results),
+                seen,
             )
             if append_items(items):
                 break
@@ -583,7 +620,7 @@ class ImageHandler:
             # 获取指定的提供商
             provider = context.get_provider_by_id(provider_id)
             if not provider:
-                logger.error(f"无法找到提供商: {provider_id}")
+                logger.error("IMAGE_DESCRIPTION_PROVIDER_MISSING")
                 return None
 
             # 对每张图片进行转文字
@@ -599,18 +636,6 @@ class ImageHandler:
                             resolved_image.source,
                         )
 
-                    # 🆕 v1.2.0: 先检查本地缓存，命中则跳过AI调用
-                    if image_description_cache and image_description_cache.enabled:
-                        cached_desc = image_description_cache.lookup(image_path)
-                        if cached_desc:
-                            image_descriptions[idx] = cached_desc
-                            logger.info(
-                                "IMAGE_DESCRIPTION_CACHE_HIT index=%s source=%s",
-                                idx,
-                                resolved_image.source,
-                            )
-                            continue
-
                     # 调用AI进行图片转文字,添加超时控制
                     async def call_vision_ai():
                         response = await provider.text_chat(
@@ -622,10 +647,25 @@ class ImageHandler:
                         )
                         return response.completion_text
 
-                    # 使用用户配置的超时时间
-                    description = await asyncio.wait_for(
-                        call_vision_ai(), timeout=timeout
-                    )
+                    if image_description_cache and image_description_cache.enabled:
+                        was_cached = bool(image_description_cache.lookup(image_path))
+                        description = await image_description_cache.get_or_create(
+                            image_path,
+                            lambda: asyncio.wait_for(
+                                call_vision_ai(),
+                                timeout=timeout,
+                            ),
+                        )
+                        if was_cached:
+                            logger.info(
+                                "IMAGE_DESCRIPTION_CACHE_HIT index=%s source=%s",
+                                idx,
+                                resolved_image.source,
+                            )
+                    else:
+                        description = await asyncio.wait_for(
+                            call_vision_ai(), timeout=timeout
+                        )
 
                     if description:
                         image_descriptions[idx] = description
@@ -635,13 +675,6 @@ class ImageHandler:
                                 idx,
                                 resolved_image.source,
                             )
-
-                        # 🆕 v1.2.0: AI转换成功后，保存到本地缓存
-                        # 🔧 防御性编程：保存前再次检查缓存中是否已存在
-                        # 场景：并发处理两条含相同图片的消息，或平台描述已提前写入缓存
-                        if image_description_cache and image_description_cache.enabled:
-                            if not image_description_cache.lookup(image_path):
-                                image_description_cache.save(image_path, description)
 
                 except asyncio.TimeoutError:
                     logger.warning(

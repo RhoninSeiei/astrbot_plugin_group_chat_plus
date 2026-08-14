@@ -31,8 +31,10 @@ class FakeImage:
     def __init__(self, value=None, error=None):
         self.value = value
         self.error = error
+        self.convert_calls = 0
 
     async def convert_to_file_path(self):
+        self.convert_calls += 1
         if self.error:
             raise self.error
         return self.value
@@ -237,6 +239,36 @@ class ImageHandlerQuotedImagesTest(unittest.TestCase):
             [("top-a", 0), ("quoted-a", 1), ("quoted-b", 1)],
         )
 
+    def test_reply_collection_stops_resolving_when_remaining_budget_is_spent(self):
+        top = FakeImage("top-a")
+        quoted_a = FakeImage("quoted-a")
+        quoted_b = FakeImage("quoted-b")
+        quoted_c = FakeImage("quoted-c")
+        chain = [
+            top,
+            FakeReply("r1", [quoted_a, quoted_b, quoted_c]),
+        ]
+
+        result = asyncio.run(
+            ImageHandler.collect_message_images(FakeEvent(chain), chain, 2)
+        )
+
+        self.assertEqual([item.url for item in result], ["top-a", "quoted-a"])
+        self.assertEqual(top.convert_calls, 1)
+        self.assertEqual(quoted_a.convert_calls, 1)
+        self.assertEqual(quoted_b.convert_calls, 0)
+        self.assertEqual(quoted_c.convert_calls, 0)
+
+    def test_explicit_empty_chain_does_not_restore_event_images(self):
+        event = FakeEvent([FakeImage("event-image")])
+
+        result = asyncio.run(
+            ImageHandler.collect_message_images(event, [], 10)
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(event.message_obj.message[0].convert_calls, 0)
+
     def test_parser_failure_retains_successful_embedded_images(self):
         quoted_results["r1"] = RuntimeError("unavailable")
         chain = [
@@ -377,6 +409,21 @@ class ImageHandlerQuotedImagesTest(unittest.TestCase):
         self.assertNotIn("private.example", rendered)
         self.assertNotIn("SECRETPAYLOAD", rendered)
         self.assertNotIn("description ", rendered)
+
+    def test_missing_provider_log_hides_provider_configuration(self):
+        provider_id = "secret-provider-id"
+        result = asyncio.run(
+            ImageHandler._convert_images_to_text(
+                [FakePlain("问题正文")],
+                FakeContext(None),
+                provider_id,
+                "describe",
+                [ResolvedMessageImage("quoted-a", "quoted_embedded", 0)],
+            )
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn(provider_id, repr(image_handler_logger.records))
 
 
 if __name__ == "__main__":

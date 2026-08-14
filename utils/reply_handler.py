@@ -537,10 +537,10 @@ class ReplyHandler:
             # 同时通过 event.set_extra() 传递标记，让 main.py 的钩子能识别并处理上下文冲突
             if image_urls:
                 if DEBUG_MODE:
-                    logger.info(f"🟢 [多模态AI] 传递 {len(image_urls)} 张图片给LLM")
-                    if logger.level <= 10:  # DEBUG级别
-                        for i, url in enumerate(image_urls):
-                            logger.info(f"  图片 {i}: {url}")
+                    logger.info(
+                        "FORMAL_MODEL_IMAGES_ATTACHED image_count=%s",
+                        len(image_urls),
+                    )
 
             # 保存插件上下文，交给 AstrBot 正常 LLM 请求流程处理。
             # 这样可以保留其他插件的提示词注入，并允许平台工具循环执行搜索、MCP 等工具。

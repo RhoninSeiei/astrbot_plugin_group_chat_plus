@@ -141,6 +141,46 @@ class MultimodalHistoryContentTest(unittest.TestCase):
         cls.AstrBotMessage = _AstrBotMessage
         cls.MessageMember = _MessageMember
 
+    def _save_history(
+        self,
+        initial_history,
+        cached_messages,
+        user_message=None,
+        user_image_urls=None,
+    ):
+        conversation = types.SimpleNamespace(content=list(initial_history))
+
+        class FakeConversationManager:
+            def __init__(self):
+                self.updated_history = None
+
+            async def get_curr_conversation_id(self, _origin):
+                return "conversation-1"
+
+            async def get_conversation(self, *_args, **_kwargs):
+                return conversation
+
+            async def update_conversation(
+                self, _origin, *, conversation_id, history
+            ):
+                self.updated_history = history
+                conversation.content = history
+
+        manager = FakeConversationManager()
+        event = types.SimpleNamespace(unified_msg_origin="origin-1")
+        context = types.SimpleNamespace(conversation_manager=manager)
+        asyncio.run(
+            self.ContextManager.save_to_official_conversation_with_cache(
+                event,
+                cached_messages,
+                user_message,
+                None,
+                context,
+                user_image_urls=user_image_urls,
+            )
+        )
+        return manager.updated_history
+
     def test_format_context_for_ai_flattens_multimodal_history_content(self):
         msg = self.AstrBotMessage()
         msg.message_str = [
@@ -380,6 +420,60 @@ class MultimodalHistoryContentTest(unittest.TestCase):
                     {"type": "image_url", "image_url": {"url": "quoted-a"}},
                 ],
             },
+        )
+
+    def test_cached_multimodal_duplicate_matches_existing_final_content(self):
+        multimodal = [
+            {"type": "text", "text": "同一消息"},
+            {"type": "image_url", "image_url": {"url": "quoted-a"}},
+        ]
+
+        history = self._save_history(
+            [{"role": "user", "content": multimodal}],
+            [
+                {
+                    "role": "user",
+                    "content": "同一消息",
+                    "image_urls": ["quoted-a"],
+                }
+            ],
+        )
+
+        self.assertEqual(history, [{"role": "user", "content": multimodal}])
+
+    def test_cached_same_text_with_different_images_remains_distinct_and_ordered(self):
+        history = self._save_history(
+            [],
+            [
+                {
+                    "role": "user",
+                    "content": "相同正文",
+                    "image_urls": ["quoted-a"],
+                },
+                {
+                    "role": "user",
+                    "content": "相同正文",
+                    "image_urls": ["quoted-b"],
+                },
+            ],
+            user_message="当前消息",
+            user_image_urls=["current-a"],
+        )
+
+        self.assertEqual(
+            [
+                item["image_url"]["url"]
+                for message in history
+                for item in (
+                    message["content"] if isinstance(message["content"], list) else []
+                )
+                if item.get("type") == "image_url"
+            ],
+            ["quoted-a", "quoted-b", "current-a"],
+        )
+        self.assertEqual(
+            [self.ContextManager.normalize_message_content(item["content"]) for item in history],
+            ["相同正文[图片]", "相同正文[图片]", "当前消息[图片]"],
         )
 
     def test_official_save_preserves_positional_save_kind_compatibility(self):
