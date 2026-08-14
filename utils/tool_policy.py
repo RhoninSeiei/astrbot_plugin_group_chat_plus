@@ -109,6 +109,31 @@ class ToolPolicy:
         return copy.copy(tool_container)
 
     @classmethod
+    def clone_without_tool_names(
+        cls,
+        tool_container,
+        denied_names: Optional[Iterable[str]],
+    ):
+        if tool_container is None:
+            return None, []
+
+        denied_set = _normalize_names(denied_names)
+        if not denied_set:
+            return tool_container, []
+
+        cloned = cls.clone_tool_container(tool_container)
+        visible_names = {
+            str(getattr(tool, "name", "")).strip()
+            for tool in cls._get_container_tools(cloned)
+            if str(getattr(tool, "name", "")).strip() not in denied_set
+        }
+        removed_names = cls.filter_tool_container_for_visible_names(
+            cloned,
+            visible_names,
+        )
+        return cloned, removed_names
+
+    @classmethod
     def filter_tool_container_for_visible_names(
         cls,
         tool_container,

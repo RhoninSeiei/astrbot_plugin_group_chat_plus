@@ -144,6 +144,77 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertEqual([tool.name for tool in cloned.func_list], ["b"])
         self.assertEqual(removed, ["a", "c"])
 
+    def test_clone_without_tool_names_preserves_original_and_unrelated_order(self):
+        tool_policy = _load_tool_policy()
+        original = RemoveToolContainer(
+            [
+                "normal_search",
+                "gcp_step_image_generate",
+                "astrbot_plugin_imgflow_generate_image",
+                "gcp_step_image_edit",
+            ]
+        )
+
+        filtered, removed = tool_policy.clone_without_tool_names(
+            original,
+            {"gcp_step_image_generate", "gcp_step_image_edit"},
+        )
+
+        self.assertEqual(
+            [tool.name for tool in original.tools],
+            [
+                "normal_search",
+                "gcp_step_image_generate",
+                "astrbot_plugin_imgflow_generate_image",
+                "gcp_step_image_edit",
+            ],
+        )
+        self.assertEqual(
+            [tool.name for tool in filtered.tools],
+            ["normal_search", "astrbot_plugin_imgflow_generate_image"],
+        )
+        self.assertEqual(
+            removed,
+            ["gcp_step_image_generate", "gcp_step_image_edit"],
+        )
+
+    def test_clone_without_tool_names_handles_func_list_container(self):
+        tool_policy = _load_tool_policy()
+        original = FuncListContainer(
+            ["normal_search", "gcp_step_image_generate", "other_tool"]
+        )
+
+        filtered, removed = tool_policy.clone_without_tool_names(
+            original,
+            {"gcp_step_image_generate"},
+        )
+
+        self.assertEqual(
+            [tool.name for tool in original.func_list],
+            ["normal_search", "gcp_step_image_generate", "other_tool"],
+        )
+        self.assertEqual(
+            [tool.name for tool in filtered.func_list],
+            ["normal_search", "other_tool"],
+        )
+        self.assertEqual(removed, ["gcp_step_image_generate"])
+
+    def test_clone_without_tool_names_handles_none_and_empty_denied_names(self):
+        tool_policy = _load_tool_policy()
+        original = RemoveToolContainer(["normal_search"])
+
+        missing_filtered, missing_removed = tool_policy.clone_without_tool_names(
+            None,
+            {"gcp_step_image_generate"},
+        )
+        filtered, removed = tool_policy.clone_without_tool_names(original, set())
+
+        self.assertIsNone(missing_filtered)
+        self.assertEqual(missing_removed, [])
+        self.assertIs(filtered, original)
+        self.assertEqual([tool.name for tool in filtered.tools], ["normal_search"])
+        self.assertEqual(removed, [])
+
     def test_main_uses_tool_policy_for_visible_tool_filtering(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 
