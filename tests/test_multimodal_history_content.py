@@ -53,6 +53,22 @@ class _Plain:
         self.text = text
 
 
+class _At:
+    pass
+
+
+class _Image:
+    pass
+
+
+class _Reply:
+    pass
+
+
+class _Forward:
+    pass
+
+
 class _AstrMessageEvent:
     pass
 
@@ -64,6 +80,7 @@ def _load_context_manager_module():
     sys.modules[package_name] = package_module
 
     astrbot_module = types.ModuleType("astrbot")
+    astrbot_module.__path__ = []
     astrbot_api_module = types.ModuleType("astrbot.api")
     astrbot_api_module.logger = _Logger()
     astrbot_api_all_module = types.ModuleType("astrbot.api.all")
@@ -76,11 +93,27 @@ def _load_context_manager_module():
         "astrbot.api.message_components"
     )
     astrbot_message_components_module.Plain = _Plain
+    astrbot_message_components_module.At = _At
+    astrbot_message_components_module.Image = _Image
+    astrbot_message_components_module.Reply = _Reply
+    astrbot_core_module = types.ModuleType("astrbot.core")
+    astrbot_core_module.__path__ = []
+    astrbot_core_message_module = types.ModuleType("astrbot.core.message")
+    astrbot_core_message_module.__path__ = []
+    astrbot_core_message_components_module = types.ModuleType(
+        "astrbot.core.message.components"
+    )
+    astrbot_core_message_components_module.Forward = _Forward
 
     sys.modules["astrbot"] = astrbot_module
     sys.modules["astrbot.api"] = astrbot_api_module
     sys.modules["astrbot.api.all"] = astrbot_api_all_module
     sys.modules["astrbot.api.message_components"] = astrbot_message_components_module
+    sys.modules["astrbot.core"] = astrbot_core_module
+    sys.modules["astrbot.core.message"] = astrbot_core_message_module
+    sys.modules[
+        "astrbot.core.message.components"
+    ] = astrbot_core_message_components_module
 
     session_guard_spec = importlib.util.spec_from_file_location(
         f"{package_name}._session_guard",
@@ -282,6 +315,72 @@ class MultimodalHistoryContentTest(unittest.TestCase):
         )
 
         self.assertEqual(normalized, "平台文本[图片][图片]")
+
+    def test_build_user_history_content_preserves_text_and_unique_images(self):
+        content = self.ContextManager.build_user_history_content(
+            "引用探针",
+            ["quoted-a", "", "quoted-a", "quoted-b"],
+        )
+
+        self.assertEqual(
+            content,
+            [
+                {"type": "text", "text": "引用探针"},
+                {"type": "image_url", "image_url": {"url": "quoted-a"}},
+                {"type": "image_url", "image_url": {"url": "quoted-b"}},
+            ],
+        )
+
+    def test_build_user_history_content_without_images_returns_string(self):
+        self.assertEqual(
+            self.ContextManager.build_user_history_content("普通消息", []),
+            "普通消息",
+        )
+
+    def test_official_save_uses_multimodal_content_for_current_user(self):
+        conversation = types.SimpleNamespace(content=[])
+
+        class FakeConversationManager:
+            def __init__(self):
+                self.updated_history = None
+
+            async def get_curr_conversation_id(self, _origin):
+                return "conversation-1"
+
+            async def get_conversation(self, *_args, **_kwargs):
+                return conversation
+
+            async def update_conversation(
+                self, _origin, *, conversation_id, history
+            ):
+                self.updated_history = history
+                conversation.content = history
+
+        manager = FakeConversationManager()
+        event = types.SimpleNamespace(unified_msg_origin="origin-1")
+        context = types.SimpleNamespace(conversation_manager=manager)
+
+        asyncio.run(
+            self.ContextManager.save_to_official_conversation_with_cache(
+                event,
+                [{"role": "assistant", "content": "缓存回复"}],
+                "引用探针",
+                None,
+                context,
+                user_image_urls=["quoted-a"],
+            )
+        )
+
+        self.assertEqual(
+            manager.updated_history[-1],
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "引用探针"},
+                    {"type": "image_url", "image_url": {"url": "quoted-a"}},
+                ],
+            },
+        )
 
     def test_main_and_proactive_use_normalized_content(self):
         main_py = (REPO_ROOT / "main.py").read_text(encoding="utf-8")

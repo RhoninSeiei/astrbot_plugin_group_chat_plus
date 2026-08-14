@@ -10200,6 +10200,12 @@ class ChatPlus(Star):
                         "[消息发送后] ⚠️ 缓存快照和共享缓存均未找到匹配消息，将从event提取"
                     )
 
+            user_image_urls = (
+                list(last_cached.get("reference_image_urls", []) or [])
+                if last_cached
+                else []
+            )
+
             if (
                 last_cached
                 and isinstance(last_cached, dict)
@@ -10399,6 +10405,7 @@ class ChatPlus(Star):
                 message_to_save,  # 当前用户消息（已添加时间戳和发送者信息）
                 bot_to_save,  # AI回复
                 self.context,
+                user_image_urls=user_image_urls,
             )
 
             if success:
@@ -10557,6 +10564,10 @@ class ChatPlus(Star):
             if not isinstance(last_cached, dict) or "content" not in last_cached:
                 return
 
+            user_image_urls = list(
+                last_cached.get("reference_image_urls", []) or []
+            )
+
             # 获取处理后的消息内容
             raw_content = last_cached["content"]
 
@@ -10623,6 +10634,7 @@ class ChatPlus(Star):
                 message_to_save,
                 None,  # bot_message=None，不保存AI回复
                 self.context,
+                user_image_urls=user_image_urls,
             )
 
             if success:
@@ -10978,6 +10990,11 @@ class ChatPlus(Star):
             # 获取用户消息
             message_to_save = ""
             last_cached = self._message_cache_snapshots.pop(message_id, None)
+            user_image_urls = (
+                list(last_cached.get("reference_image_urls", []) or [])
+                if last_cached
+                else []
+            )
             if (
                 last_cached
                 and isinstance(last_cached, dict)
@@ -11037,6 +11054,7 @@ class ChatPlus(Star):
                     message_to_save,
                     bot_reply_to_save,
                     self.context,
+                    user_image_urls=user_image_urls,
                 )
                 if success:
                     try:
