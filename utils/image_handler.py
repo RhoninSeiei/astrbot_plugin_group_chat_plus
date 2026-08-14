@@ -243,7 +243,10 @@ class ImageHandler:
                     # 如果是图文混合,移除图片只保留文字
                     text_only = ImageHandler._extract_text_only(message_chain)
                     if DEBUG_MODE:
-                        logger.info(f"移除图片后的消息: {text_only}")
+                        logger.info(
+                            "IMAGE_FILTERED mode=disabled has_text=%s",
+                            bool(text_only),
+                        )
                     return True, text_only, [], False
 
             # === 第二步：根据应用范围(image_to_text_scope)决定是否对当前消息启用图片转文字 ===
@@ -290,7 +293,8 @@ class ImageHandler:
                     text_only = ImageHandler._extract_text_only(message_chain)
                     if DEBUG_MODE:
                         logger.info(
-                            f"非适用范围内的图文混合,移除图片保留文字: {text_only}"
+                            "IMAGE_FILTERED mode=scope has_text=%s",
+                            bool(text_only),
                         )
                     return True, text_only, [], False
 
@@ -308,7 +312,10 @@ class ImageHandler:
                 text_content = ImageHandler._extract_text_only(message_chain)
                 if DEBUG_MODE:
                     logger.info(
-                        f"🟢 [多模态模式] 提取到 {len(image_urls)} 张图片，文本内容: {text_content[:100] if text_content else '(无文本)'}"
+                        "IMAGE_PROCESSING_COMPLETE mode=multimodal "
+                        "image_count=%s has_text=%s",
+                        len(image_urls),
+                        bool(text_content),
                     )
                 return True, text_content, image_urls, bool(image_urls)
 
@@ -345,19 +352,28 @@ class ImageHandler:
                         "".join(fallback_parts).strip() or "[图片（识别失败）]"
                     )
                     logger.warning(
-                        f"纯图片消息转换失败，使用占位文字替代: {fallback_text}"
+                        "IMAGE_DESCRIPTION_FALLBACK mode=pure_image "
+                        "placeholder_count=%s",
+                        len(fallback_parts),
                     )
                     return True, fallback_text, [], False
                 else:
                     # 如果是图文混合,只保留文字
                     text_only = ImageHandler._extract_text_only(message_chain)
                     if DEBUG_MODE:
-                        logger.info(f"降级处理: 移除图片,保留文字: {text_only}")
+                        logger.info(
+                            "IMAGE_DESCRIPTION_FALLBACK mode=text_only has_text=%s",
+                            bool(text_only),
+                        )
                     return True, text_only, [], False  # 图片转文字失败，图片被移除
 
             # 转换成功，返回转换后的消息（图片已转成文字描述）
             if DEBUG_MODE:
-                logger.info(f"🔴 [图片转文字成功] 结果: {processed_message[:150]}")
+                logger.info(
+                    "IMAGE_PROCESSING_COMPLETE mode=image_to_text "
+                    "reference_count=%s",
+                    len(resolved_images),
+                )
             return (
                 True,
                 processed_message,
@@ -495,7 +511,8 @@ class ImageHandler:
         result = "".join(text_parts).strip()
         if not result:
             logger.warning(
-                f"[图片处理] _extract_text_only 提取到空文本！text_parts={text_parts[:5]}"
+                "IMAGE_TEXT_EXTRACTION_EMPTY part_count=%s",
+                len(text_parts),
             )
         return result
 
@@ -689,7 +706,12 @@ class ImageHandler:
 
             result_text = "".join(result_parts)
             if DEBUG_MODE:
-                logger.info(f"图片转文字完成,处理后的消息: {result_text[:100]}...")
+                logger.info(
+                    "IMAGE_DESCRIPTION_PROCESS_COMPLETE "
+                    "resolved_count=%s described_count=%s",
+                    len(resolved_images),
+                    len(image_descriptions),
+                )
             return result_text
 
         except Exception as exc:

@@ -2,7 +2,9 @@ import ast
 import asyncio
 import copy
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+import types
 from typing import Optional
 import unittest
 
@@ -69,8 +71,12 @@ class FakeEvent:
 
 
 class FakeImageHandler:
+    collect_error = None
+
     @staticmethod
     async def collect_message_images(event, message_chain, max_images):
+        if FakeImageHandler.collect_error is not None:
+            raise FakeImageHandler.collect_error
         return [SimpleNamespace(url="quoted-a", source="quoted_embedded", component_index=0)]
 
     @staticmethod
@@ -123,11 +129,14 @@ class FakeMessageCleaner:
 
 
 class FakeLogger:
+    def __init__(self):
+        self.records = []
+
     def info(self, *_args, **_kwargs):
-        pass
+        self.records.append(("info", _args, _kwargs))
 
     def warning(self, *_args, **_kwargs):
-        pass
+        self.records.append(("warning", _args, _kwargs))
 
 
 class WaitWindowQuotedImagesTest(unittest.TestCase):
@@ -148,6 +157,7 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
         )
         module = ast.Module(body=[method], type_ignores=[])
         ast.fix_missing_locations(module)
+        cls.logger = FakeLogger()
         namespace = {
             "AstrMessageEvent": object,
             "Optional": Optional,
@@ -160,7 +170,7 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
             "ImageHandler": FakeImageHandler,
             "EmojiDetector": SimpleNamespace(),
             "PLUGIN_REFERENCE_IMAGE_URLS": PLUGIN_REFERENCE_IMAGE_URLS,
-            "logger": FakeLogger(),
+            "logger": cls.logger,
         }
         exec(compile(module, "main.py", "exec"), namespace)
         cls.intercept = namespace["_maybe_intercept_for_wait_window"]
@@ -209,9 +219,9 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
         harness._save_platform_descriptions_to_cache = no_save
         return harness, cache_manager
 
-    def _run(self, provider_id):
+    def _run(self, provider_id, raw_text="引用探针"):
         harness, cache_manager = self._make_harness(provider_id)
-        event = FakeEvent()
+        event = FakeEvent(raw_text)
         intercepted = asyncio.run(
             type(self).intercept(
                 harness,
@@ -258,6 +268,17 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
             ["quoted-a"],
         )
 
+    def test_multimodal_wait_window_caches_reference_without_text(self):
+        cached_message, event, _harness = self._run("", raw_text="")
+
+        self.assertEqual(cached_message["content"], "")
+        self.assertEqual(cached_message["image_urls"], ["quoted-a"])
+        self.assertEqual(cached_message["reference_image_urls"], ["quoted-a"])
+        self.assertEqual(
+            event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS),
+            ["quoted-a"],
+        )
+
     def test_reference_merge_preserves_current_wait_and_smart_first_occurrence(self):
         source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -289,6 +310,212 @@ class WaitWindowQuotedImagesTest(unittest.TestCase):
             merged,
             ["current-a", "shared", "wait-a", "smart-a", "smart-b"],
         )
+
+    def test_regular_follower_cache_reference_reaches_smart_merge_result(self):
+        source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        chat_plus = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ChatPlus"
+        )
+        process_method = next(
+            node
+            for node in chat_plus.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_process_message_content"
+        )
+        cached_assignment = next(
+            copy.deepcopy(node)
+            for node in ast.walk(process_method)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "cached_message"
+                for target in node.targets
+            )
+        )
+        builder = ast.FunctionDef(
+            name="_build_regular_cache",
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+            ),
+            body=[
+                cached_assignment,
+                ast.Return(value=ast.Name(id="cached_message", ctx=ast.Load())),
+            ],
+            decorator_list=[],
+        )
+        merge_method = next(
+            copy.deepcopy(node)
+            for node in chat_plus.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_merge_reference_image_urls"
+        )
+        merge_method.decorator_list = []
+        module = ast.Module(body=[builder, merge_method], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        event = FakeEvent("follower")
+        event.set_extra(PLUGIN_REFERENCE_IMAGE_URLS, ["follower-a", "shared"])
+        namespace = {
+            "time": SimpleNamespace(time=lambda: 1000.0),
+            "event": event,
+            "processed_message": "follower",
+            "current_message_id": "follower-id",
+            "mention_info": None,
+            "is_at_message": False,
+            "has_trigger_keyword": False,
+            "poke_info": None,
+            "image_urls": [],
+            "is_empty_at": False,
+            "is_at_all_message": False,
+            "persistent_poke_event_text": "",
+            "PLUGIN_REFERENCE_IMAGE_URLS": PLUGIN_REFERENCE_IMAGE_URLS,
+        }
+        exec(compile(module, "main.py", "exec"), namespace)
+
+        follower_cache = namespace["_build_regular_cache"]()
+        self.assertIn("reference_image_urls", follower_cache)
+        merged = namespace["_merge_reference_image_urls"](
+            ["current-a", "shared"],
+            follower_cache["reference_image_urls"],
+        )
+
+        self.assertEqual(
+            follower_cache["reference_image_urls"],
+            ["follower-a", "shared"],
+        )
+        self.assertEqual(
+            merged,
+            ["current-a", "shared", "follower-a"],
+        )
+
+    def test_wait_window_and_cache_helper_logs_hide_image_secrets(self):
+        secret = (
+            "exception-body https://private.example/image.png "
+            "data:image/png;base64,SECRETPAYLOAD"
+        )
+        self.logger.records.clear()
+        harness, _cache_manager = self._make_harness("")
+        event = FakeEvent("message")
+        FakeImageHandler.collect_error = RuntimeError(secret)
+        try:
+            intercepted = asyncio.run(
+                type(self).intercept(
+                    harness,
+                    event,
+                    "chat-1",
+                    False,
+                    False,
+                    None,
+                    "aiocqhttp",
+                )
+            )
+        finally:
+            FakeImageHandler.collect_error = None
+
+        self.assertFalse(intercepted)
+        rendered = repr(self.logger.records)
+        self.assertNotIn("private.example", rendered)
+        self.assertNotIn("SECRETPAYLOAD", rendered)
+        self.assertNotIn("exception-body", rendered)
+        self.assertNotIn("exc_info", rendered)
+
+    def test_cache_helper_logs_hide_image_secrets(self):
+        secret = (
+            "exception-body https://private.example/image.png "
+            "data:image/png;base64,SECRETPAYLOAD"
+        )
+        source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        chat_plus = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ChatPlus"
+        )
+        methods = [
+            copy.deepcopy(node)
+            for node in chat_plus.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name
+            in {
+                "_save_platform_descriptions_to_cache",
+                "_try_cache_fallback_for_images",
+            }
+        ]
+        module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(module)
+        helper_logger = FakeLogger()
+        namespace = {
+            "Optional": Optional,
+            "logger": helper_logger,
+        }
+        exec(compile(module, "main.py", "exec"), namespace)
+
+        class CacheImage:
+            async def convert_to_file_path(self):
+                raise RuntimeError(secret)
+
+        components_module = types.ModuleType("astrbot.api.message_components")
+        components_module.Image = CacheImage
+        components_module.Plain = type("Plain", (), {})
+        module_names = (
+            "astrbot",
+            "astrbot.api",
+            "astrbot.api.message_components",
+        )
+        previous_modules = {name: sys.modules.get(name) for name in module_names}
+        sys.modules["astrbot"] = types.ModuleType("astrbot")
+        sys.modules["astrbot.api"] = types.ModuleType("astrbot.api")
+        sys.modules["astrbot.api.message_components"] = components_module
+
+        cache = SimpleNamespace(
+            enabled=True,
+            lookup=lambda _path: None,
+            save=lambda _path, _description: None,
+        )
+        plugin = SimpleNamespace(image_description_cache=cache)
+        save_event = SimpleNamespace(
+            message_obj=SimpleNamespace(message=[CacheImage()])
+        )
+
+        class RaisingEvent:
+            @property
+            def message_obj(self):
+                raise RuntimeError(secret)
+
+        try:
+            asyncio.run(
+                namespace["_save_platform_descriptions_to_cache"](
+                    plugin,
+                    save_event,
+                    "[图片内容: harmless]",
+                )
+            )
+            asyncio.run(
+                namespace["_try_cache_fallback_for_images"](
+                    plugin,
+                    RaisingEvent(),
+                )
+            )
+        finally:
+            for name, previous in previous_modules.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+
+        rendered = repr(helper_logger.records)
+        self.assertNotIn("private.example", rendered)
+        self.assertNotIn("SECRETPAYLOAD", rendered)
+        self.assertNotIn("exception-body", rendered)
+        self.assertNotIn("exc_info", rendered)
 
 
 if __name__ == "__main__":

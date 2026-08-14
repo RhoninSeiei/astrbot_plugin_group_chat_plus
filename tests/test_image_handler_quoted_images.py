@@ -14,14 +14,17 @@ quoted_calls = []
 
 
 class FakeLogger:
-    def info(self, *_args, **_kwargs):
-        pass
+    def __init__(self):
+        self.records = []
 
-    def warning(self, *_args, **_kwargs):
-        pass
+    def info(self, *args, **kwargs):
+        self.records.append(("info", args, kwargs))
 
-    def error(self, *_args, **_kwargs):
-        pass
+    def warning(self, *args, **kwargs):
+        self.records.append(("warning", args, kwargs))
+
+    def error(self, *args, **kwargs):
+        self.records.append(("error", args, kwargs))
 
 
 class FakeImage:
@@ -146,12 +149,15 @@ image_handler_module = _load_image_handler_module()
 ImageHandler = image_handler_module.ImageHandler
 ResolvedMessageImage = image_handler_module.ResolvedMessageImage
 PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
+image_handler_logger = image_handler_module.logger
 
 
 class ImageHandlerQuotedImagesTest(unittest.TestCase):
     def setUp(self):
         quoted_results.clear()
         quoted_calls.clear()
+        image_handler_logger.records.clear()
+        image_handler_module.DEBUG_MODE = False
 
     def test_embedded_reply_image_avoids_remote_fetch(self):
         chain = [FakeReply("r1", [FakeImage("quoted-a")])]
@@ -332,6 +338,45 @@ class ImageHandlerQuotedImagesTest(unittest.TestCase):
             [call["image_urls"] for call in provider.calls],
             [["quoted-a"], ["top-b"]],
         )
+
+    def test_image_processing_logs_hide_urls_base64_and_description_previews(self):
+        image_url = "https://private.example/quoted.png"
+        base64_value = "data:image/png;base64,SECRETPAYLOAD"
+
+        class SensitiveProvider:
+            async def text_chat(self, **_kwargs):
+                return types.SimpleNamespace(
+                    completion_text=f"description {image_url} {base64_value}"
+                )
+
+        chain = [
+            FakeReply("r1", [FakeImage(image_url)], message_str=""),
+            FakePlain("问题正文"),
+        ]
+        event = FakeEvent(chain)
+        image_handler_module.DEBUG_MODE = True
+        try:
+            result = asyncio.run(
+                ImageHandler.process_message_images(
+                    event,
+                    FakeContext(SensitiveProvider()),
+                    True,
+                    "all",
+                    "vision",
+                    "describe",
+                    True,
+                    False,
+                )
+            )
+        finally:
+            image_handler_module.DEBUG_MODE = False
+
+        self.assertIn(image_url, result[1])
+        self.assertIn(base64_value, result[1])
+        rendered = repr(image_handler_logger.records)
+        self.assertNotIn("private.example", rendered)
+        self.assertNotIn("SECRETPAYLOAD", rendered)
+        self.assertNotIn("description ", rendered)
 
 
 if __name__ == "__main__":

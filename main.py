@@ -4963,7 +4963,11 @@ class ChatPlus(Star):
         # 使用MessageCleaner提取纯净的原始消息（不含系统提示词）
         original_message_text = MessageCleaner.extract_raw_message_from_event(event)
         if self.debug_mode:
-            logger.info(f"  纯净原始消息: {original_message_text[:100]}...")
+            logger.info(
+                "MESSAGE_CONTENT_EXTRACTED has_text=%s length=%s",
+                bool(original_message_text),
+                len(original_message_text),
+            )
 
         real_is_at_message = (
             raw_is_at_message if raw_is_at_message is not None else is_at_message
@@ -5031,7 +5035,7 @@ class ChatPlus(Star):
             emoji_marker_applied = True
             if self.debug_mode:
                 logger.info(
-                    f"【步骤6.6】🎭 已为表情包消息添加标记: {processed_message[:100]}..."
+                    "EMOJI_MARKER_APPLIED has_text=%s", bool(processed_message)
                 )
         elif is_emoji_message and self.enable_emoji_filter and not image_retained:
             if self.debug_mode:
@@ -5043,10 +5047,10 @@ class ChatPlus(Star):
         # 🆕 v1.2.0: 不再在此处直接缓存，而是准备缓存数据返回给调用方
         if self.debug_mode:
             logger.info(
-                "【步骤7】准备待缓存的用户消息数据（不含元数据，由调用方决定是否缓存）"
+                "MESSAGE_CACHE_INPUT_READY original_length=%s processed_length=%s",
+                len(original_message_text),
+                len(processed_message),
             )
-            logger.info(f"  原始消息（提取自event）: {original_message_text[:200]}...")
-            logger.info(f"  处理后消息（图片处理后）: {processed_message[:200]}...")
 
         # 🆕 v1.0.4: 确定触发方式（用于后续添加系统提示）
         # 根据is_at_message和has_trigger_keyword判断触发方式
@@ -5079,6 +5083,9 @@ class ChatPlus(Star):
             # 🆕 v1.0.9: 保存戳一戳信息（如果存在）
             "poke_info": poke_info,
             "image_urls": image_urls or [],
+            "reference_image_urls": list(
+                event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []
+            ),
             # 🔧 修复：保存空@标记，用于生成正确的系统提示词
             "is_empty_at": is_empty_at,
             "is_at_all_message": is_at_all_message,
@@ -5110,13 +5117,12 @@ class ChatPlus(Star):
         # 详细日志（仅debug模式）
         if self.debug_mode:
             logger.info(
-                f"【缓存准备】原始: {original_message_text[:100] if original_message_text else '(空)'}"
-            )
-            logger.info(
-                f"【缓存准备】处理后: {processed_message[:100] if processed_message else '(空)'}"
-            )
-            logger.info(
-                f"【缓存准备】待缓存数据: {cached_message['content'][:100] if cached_message['content'] else '(空)'}"
+                "MESSAGE_CACHE_PREPARED original_length=%s processed_length=%s "
+                "cached_length=%s changed=%s",
+                len(original_message_text),
+                len(processed_message),
+                len(cached_message["content"]),
+                processed_message != original_message_text,
             )
             if processed_message != original_message_text:
                 logger.info(f"  ⚠️ 消息内容有变化！原始≠处理后")
@@ -5238,9 +5244,11 @@ class ChatPlus(Star):
                 logger.info(f"  已添加戳过对方提示: 目标={_n}(ID:{_id})")
 
         if self.debug_mode:
-            logger.info("【步骤7.5】为当前消息添加元数据（用于AI识别）")
-            logger.info(f"  处理后消息: {processed_message[:100]}...")
-            logger.info(f"  添加元数据后: {message_text_for_ai[:150]}...")
+            logger.info(
+                "MESSAGE_METADATA_APPLIED processed_length=%s final_length=%s",
+                len(processed_message),
+                len(message_text_for_ai),
+            )
 
         # 提取历史上下文
         max_context = self.max_context_messages
@@ -6984,7 +6992,12 @@ class ChatPlus(Star):
                 processed_text = original_message_text
                 should_cache = bool(processed_text and processed_text.strip())
 
-            if should_cache and processed_text:
+            has_cached_payload = bool(
+                processed_text
+                or cached_image_urls
+                or cached_reference_image_urls
+            )
+            if should_cache and has_cached_payload:
                 # 表情包标记检测（与概率过滤路径相同的逻辑）
                 is_emoji_message = False
                 if self.enable_emoji_filter:
@@ -7011,7 +7024,7 @@ class ChatPlus(Star):
 
                 cached_message = {
                     "role": "user",
-                    "content": processed_text,
+                    "content": processed_text or "",
                     "timestamp": time.time(),
                     "message_id": self._get_message_id(event),
                     "sender_id": event.get_sender_id(),
@@ -7040,8 +7053,11 @@ class ChatPlus(Star):
 
                 if self.debug_mode:
                     logger.info(
-                        f"[等待窗口] 已缓存用户{sender_id}的消息: "
-                        f"{processed_text[:60]}..."
+                        "WAIT_WINDOW_MESSAGE_CACHED has_text=%s "
+                        "image_count=%s reference_count=%s",
+                        bool(processed_text),
+                        len(cached_image_urls),
+                        len(cached_reference_image_urls),
                     )
             else:
                 if self.debug_mode:
@@ -7067,8 +7083,11 @@ class ChatPlus(Star):
                         )
             return True
 
-        except Exception as e:
-            logger.warning(f"[等待窗口] 拦截消息时发生错误: {e}", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "WAIT_WINDOW_INTERCEPT_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             return False
 
     async def _run_group_wait_window(self, chat_id: str, user_id: str) -> int:
@@ -7449,7 +7468,9 @@ class ChatPlus(Star):
                         # 成功获取平台的图片描述
                         processed_text = platform_processed_text
                         logger.info(
-                            f"🖼️ [概率过滤-平台图片描述] 成功提取图片描述，将缓存带描述的消息: {processed_text[:80]}..."
+                            "PROBABILITY_IMAGE_DESCRIPTION_READY source=platform "
+                            "has_text=%s",
+                            bool(processed_text),
                         )
                         # 🆕 将平台自动理解的图片描述保存到图片缓存（省钱!）
                         await self._save_platform_descriptions_to_cache(
@@ -7465,7 +7486,9 @@ class ChatPlus(Star):
                             processed_text = cache_fallback_text
                             success = True  # 标记图片信息已保留
                             logger.info(
-                                f"💰 [省钱回退-概率过滤] 从缓存恢复图片描述: {cache_fallback_text[:80]}..."
+                                "PROBABILITY_IMAGE_DESCRIPTION_READY source=cache "
+                                "has_text=%s",
+                                bool(cache_fallback_text),
                             )
                         elif is_pure_image:
                             # 纯图片消息且平台未处理，丢弃
@@ -7481,7 +7504,8 @@ class ChatPlus(Star):
                             )
                             if self.debug_mode:
                                 logger.info(
-                                    f"  图文混合消息，过滤图片后: {processed_text[:80] if processed_text else '(空)'}"
+                                    "PROBABILITY_IMAGE_FILTERED has_text=%s",
+                                    bool(processed_text),
                                 )
                 else:
                     # 不包含图片，直接使用原始文本
@@ -7502,7 +7526,8 @@ class ChatPlus(Star):
                         processed_text = EmojiDetector.add_emoji_marker(processed_text)
                         if self.debug_mode:
                             logger.info(
-                                f"  🎭 [概率过滤-缓存] 已为表情包消息添加标记: {processed_text[:80]}..."
+                                "PROBABILITY_EMOJI_MARKER_APPLIED has_text=%s",
+                                bool(processed_text),
                             )
                     elif (
                         is_emoji_message
@@ -12071,8 +12096,13 @@ class ChatPlus(Star):
                     self.image_description_cache.save(image_path, description)
                     save_count += 1
 
-                except Exception as e:
-                    logger.warning(f"[图片缓存-平台描述] 保存图片 {idx} 时失败: {e}")
+                except Exception as exc:
+                    logger.warning(
+                        "IMAGE_DESCRIPTION_CACHE_SAVE_FAILED "
+                        "index=%s error_type=%s",
+                        idx,
+                        exc.__class__.__name__,
+                    )
                     continue
 
             if save_count > 0:
@@ -12080,8 +12110,11 @@ class ChatPlus(Star):
                     f"💾 [图片缓存-平台描述] 已将 {save_count} 张平台自动理解的图片描述保存到缓存 (省钱!)"
                 )
 
-        except Exception as e:
-            logger.warning(f"[图片缓存-平台描述] 保存平台描述到缓存失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_DESCRIPTION_CACHE_PLATFORM_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
     async def _try_cache_fallback_for_images(self, event) -> Optional[str]:
         """
@@ -12139,8 +12172,11 @@ class ChatPlus(Star):
             logger.info(f"💰 [省钱回退] 从缓存恢复了 {cache_hit_count} 张图片的描述")
             return result_text
 
-        except Exception as e:
-            logger.warning(f"[省钱回退] 查询图片缓存时发生错误: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_DESCRIPTION_CACHE_LOOKUP_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             return None
 
     async def _check_probability(
