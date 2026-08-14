@@ -7,13 +7,22 @@
 """
 
 import asyncio
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from astrbot.api.all import *
 from astrbot.api.message_components import Face, At, Reply
+from astrbot.core.utils.quoted_message_parser import extract_quoted_message_images
 from .image_description_cache import ImageDescriptionCache
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
+
+
+@dataclass(frozen=True)
+class ResolvedMessageImage:
+    url: str
+    source: str
+    component_index: int
 
 
 class ImageHandler:
@@ -26,6 +35,123 @@ class ImageHandler:
     3. 调用AI将图片转为文字描述
     4. 将描述融入原消息
     """
+
+    @staticmethod
+    async def _resolve_image_component(image, source: str, component_index: int):
+        try:
+            value = await image.convert_to_file_path()
+        except Exception as exc:
+            logger.warning(
+                "[QUOTED_IMAGE_RESOLVE_FAILED] source=%s component_index=%s error_type=%s",
+                source,
+                component_index,
+                type(exc).__name__,
+            )
+            return None
+        value = str(value or "").strip()
+        if not value:
+            logger.warning(
+                "[QUOTED_IMAGE_RESOLVE_FAILED] source=%s component_index=%s error_type=empty_result",
+                source,
+                component_index,
+            )
+            return None
+        return ResolvedMessageImage(value, source, component_index)
+
+    @staticmethod
+    async def _collect_reply_images(event, reply, component_index):
+        embedded = [
+            item
+            for item in (getattr(reply, "chain", None) or [])
+            if isinstance(item, Image)
+        ]
+        embedded_results = []
+        embedded_failed = False
+        for image in embedded:
+            resolved = await ImageHandler._resolve_image_component(
+                image,
+                "quoted_embedded",
+                component_index,
+            )
+            if resolved is None:
+                embedded_failed = True
+            else:
+                embedded_results.append(resolved)
+
+        if embedded and not embedded_failed:
+            return embedded_results
+
+        reason = "missing_embedded" if not embedded else "embedded_resolve_failed"
+        logger.info("[QUOTED_IMAGE_FALLBACK] reason=%s", reason)
+        try:
+            fetched = await extract_quoted_message_images(event, reply)
+        except Exception as exc:
+            logger.warning(
+                "[QUOTED_IMAGE_RESOLVE_FAILED] source=quoted_fetched "
+                "component_index=%s error_type=%s",
+                component_index,
+                type(exc).__name__,
+            )
+            return embedded_results
+
+        fetched_results = [
+            ResolvedMessageImage(
+                str(value).strip(), "quoted_fetched", component_index
+            )
+            for value in fetched or []
+            if str(value or "").strip()
+        ]
+        return fetched_results or embedded_results
+
+    @staticmethod
+    async def collect_message_images(
+        event, message_chain=None, max_images=10
+    ) -> List[ResolvedMessageImage]:
+        chain = list(
+            message_chain or getattr(event.message_obj, "message", []) or []
+        )
+        limit = max(0, int(max_images))
+        if limit == 0:
+            return []
+
+        results = []
+        seen = set()
+
+        def append_items(items):
+            for item in items:
+                if item.url in seen:
+                    continue
+                seen.add(item.url)
+                results.append(item)
+                if len(results) >= limit:
+                    return True
+            return False
+
+        for component_index, component in enumerate(chain):
+            if isinstance(component, Image):
+                item = await ImageHandler._resolve_image_component(
+                    component, "top_level", component_index
+                )
+                if item and append_items([item]):
+                    break
+                continue
+            if not isinstance(component, Reply):
+                continue
+
+            items = await ImageHandler._collect_reply_images(
+                event, component, component_index
+            )
+            if append_items(items):
+                break
+
+        logger.info(
+            "[QUOTED_IMAGE_COLLECTED] top_level=%s quoted_embedded=%s quoted_fetched=%s total=%s",
+            sum(item.source == "top_level" for item in results),
+            sum(item.source == "quoted_embedded" for item in results),
+            sum(item.source == "quoted_fetched" for item in results),
+            len(results),
+        )
+        return results
 
     @staticmethod
     async def process_message_images(
