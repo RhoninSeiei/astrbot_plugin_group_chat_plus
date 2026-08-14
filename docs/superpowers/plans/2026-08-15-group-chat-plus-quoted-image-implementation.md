@@ -4,7 +4,7 @@
 
 **Goal:** Preserve quoted QQ images through Group Chat Plus image discovery, multimodal or image-to-text processing, wait-window caching, formal LLM requests, and official conversation history.
 
-**Architecture:** Add an ordered `ResolvedMessageImage` representation and a shared asynchronous collector to `ImageHandler`. Use the collector in normal message processing and the wait-window branch, then reuse one history-content builder for cached and current user messages. Existing `PLUGIN_IMAGE_URLS`, `ReplyHandler.generate_reply()`, and `on_llm_request()` remain the transport mechanism.
+**Architecture:** Add an ordered `ResolvedMessageImage` representation and a shared asynchronous collector to `ImageHandler`. Use the collector in normal message processing and the wait-window branch, preserve original references in a separate event field for image-edit tools, then reuse one history-content builder for cached and current user messages. Existing `PLUGIN_IMAGE_URLS`, `ReplyHandler.generate_reply()`, and `on_llm_request()` remain the formal-model image transport mechanism.
 
 **Tech Stack:** Python 3, AstrBot 4.27.2 message components, `astrbot.core.utils.quoted_message_parser`, `asyncio`, `unittest`, WSL, AstrBot Dashboard API.
 
@@ -20,7 +20,9 @@
 8. Keep `PLUGIN_IMAGE_URLS`, `ReplyHandler.generate_reply()`, and `on_llm_request()` production behavior unchanged.
 9. Logs may contain counts, fixed source names, stages, component indexes, and exception class names. Logs must exclude image URLs, Base64, local file contents, quoted text, group IDs, user IDs, Provider configuration, tokens, and keys.
 10. Tests must exercise ordinary successful behavior. Exception compensation alone cannot satisfy acceptance.
-11. Leave `docs/superpowers/plans/2026-04-17-matoi-guardian-ep5-plugin.md` untouched.
+11. Preserve original quoted-image references for `gcp_step_image_edit`; image-to-text descriptions must never be passed as `image_path`.
+12. Convert HTTP, Base64, or local reference values to a local file with `Image(file=value).convert_to_file_path()` before calling an image backend.
+13. Leave `docs/superpowers/plans/2026-04-17-matoi-guardian-ep5-plugin.md` untouched.
 
 ---
 
@@ -296,10 +298,11 @@ git commit -m "fix: collect images from quoted messages"
 - Modify: `tests/test_image_handler_quoted_images.py`
 - Create: `tests/test_wait_window_quoted_images.py`
 - Modify: `tests/test_tool_passthrough.py`
+- Modify: `tests/test_step_image_tool_integration.py`
 
 **Interfaces:**
 - Consumes: `ImageHandler.collect_message_images(...)` and `ResolvedMessageImage` from Task 1.
-- Produces: updated `process_message_images()` behavior, `_convert_images_to_text(..., resolved_images, ...)`, and wait-window cache entries with either `image_urls` or image descriptions.
+- Produces: updated `process_message_images()` behavior, `_convert_images_to_text(..., resolved_images, ...)`, `PLUGIN_REFERENCE_IMAGE_URLS`, wait-window cache entries with `reference_image_urls`, and tool reference conversion to a local file.
 
 - [ ] **Step 1: Write failing multimodal and image-to-text tests**
 
@@ -361,6 +364,10 @@ def test_image_to_text_places_quote_description_after_reply_marker(self):
     self.assertEqual(provider.calls[0]["image_urls"], ["quoted-a"])
     self.assertEqual(result[2], [])
     self.assertTrue(result[3])
+    self.assertEqual(
+        event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS),
+        ["quoted-a"],
+    )
 ```
 
 Add a mixed-message case where one Provider call raises and the remaining description remains in the returned text.
@@ -376,7 +383,15 @@ self.assertIn("引用探针", cached_message["content"])
 
 Add a non-empty Provider case that returns a description and asserts `image_urls == []` while the cached content contains `[引用图片内容: ...]`.
 
+In both wait-window modes assert the cache preserves the original value separately:
+
+```python
+self.assertEqual(cached_message["reference_image_urls"], ["quoted-a"])
+```
+
 Extend `tests/test_tool_passthrough.py` with a source-order or AST assertion proving that non-empty current and wait-window image arrays reach `PLUGIN_IMAGE_URLS`, and that `req.image_urls = plugin_image_urls` remains after request restoration.
+
+Extend `tests/test_step_image_tool_integration.py` with three failing cases: a quoted reference works when the top-level message chain has no image, an HTTP reference is converted to a local file before the backend call, and an empty reference list retains the top-level image compatibility branch. Assert that no image-description text becomes `image_path`.
 
 - [ ] **Step 3: Run Task 2 tests and verify RED**
 
@@ -388,13 +403,20 @@ wsl.exe --cd ~ -- bash -lc "
     python3 -m unittest \
       tests.test_image_handler_quoted_images \
       tests.test_wait_window_quoted_images \
-      tests.test_tool_passthrough -v
+      tests.test_tool_passthrough \
+      tests.test_step_image_tool_integration -v
 "
 ```
 
 Expected: the new integration tests fail because normal processing and the wait window do not consume the shared collector.
 
 - [ ] **Step 4: Refactor normal message processing to use resolved records**
+
+Define the dedicated event field beside `ResolvedMessageImage`:
+
+```python
+PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
+```
 
 At the start of `process_message_images()` after reading `message_chain`, collect images once:
 
@@ -406,6 +428,10 @@ resolved_images = await ImageHandler.collect_message_images(
 )
 has_image = bool(resolved_images)
 has_text = ImageHandler._has_text_content(message_chain)
+event.set_extra(
+    PLUGIN_REFERENCE_IMAGE_URLS,
+    [item.url for item in resolved_images],
+)
 ```
 
 Split the existing text detection from `_analyze_message()` into this method so `Reply` continues to count as textual context:
@@ -457,6 +483,8 @@ resolved_images = await ImageHandler.collect_message_images(
 resolved_image_urls = [item.url for item in resolved_images]
 has_image = bool(resolved_image_urls) or PlatformLTMHelper.has_image_in_message(event)
 cached_image_urls = []
+cached_reference_image_urls = resolved_image_urls
+event.set_extra(PLUGIN_REFERENCE_IMAGE_URLS, cached_reference_image_urls)
 ```
 
 For empty `image_to_text_provider_id`, preserve `original_message_text` and set:
@@ -472,15 +500,42 @@ Replace the fixed cache value with:
 
 ```python
 "image_urls": cached_image_urls,
+"reference_image_urls": cached_reference_image_urls,
 ```
 
 The existing wait-window image merge code remains unchanged and receives populated arrays in multimodal mode.
 
-- [ ] **Step 6: Remove unsafe image-address debug output**
+Before formal reply generation, merge `reference_image_urls` from the current message and each selected wait-window or Smart-concurrent cache entry with first-occurrence deduplication, then write the merged list to `PLUGIN_REFERENCE_IMAGE_URLS`. Keep this list separate from `PLUGIN_IMAGE_URLS` when `image_to_text_provider_id` is non-empty.
+
+- [ ] **Step 6: Route edit tools through original reference images**
+
+Import `PLUGIN_REFERENCE_IMAGE_URLS` from `utils.image_handler`. Extend `_has_current_image_component()` to return true when the event field contains a non-empty value.
+
+Update `_extract_first_current_image_path()` to materialize each reference into a local file before checking the top-level message chain:
+
+```python
+for reference in event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+    value = str(reference or "").strip()
+    if not value:
+        continue
+    try:
+        image_path = await Image(file=value).convert_to_file_path()
+        if image_path:
+            return image_path
+    except Exception as exc:
+        logger.warning(
+            "STEP_IMAGE_REFERENCE_EXTRACT_FAILED error_type=%s",
+            exc.__class__.__name__,
+        )
+```
+
+Retain the existing top-level `Image` loop after this block. The tool continues to pass only the resulting local path to `GroupImageService.edit()`.
+
+- [ ] **Step 7: Remove unsafe image-address debug output**
 
 Replace logs such as `提取到图片 ...: {image_path}` and `正在转换图片 ...: {image_path}` with index, source, cache state, and count fields. Keep exception class names and remove exception messages when an adapter could include an address.
 
-- [ ] **Step 7: Run Task 2 tests and related image regressions**
+- [ ] **Step 8: Run Task 2 tests and related image regressions**
 
 ```bash
 wsl.exe --cd ~ -- bash -lc "
@@ -499,13 +554,14 @@ wsl.exe --cd ~ -- bash -lc "
 
 Expected: all tests pass; the embedded success test still verifies zero public-parser calls.
 
-- [ ] **Step 8: Commit Task 2**
+- [ ] **Step 9: Commit Task 2**
 
 ```bash
 git add utils/image_handler.py main.py \
   tests/test_image_handler_quoted_images.py \
   tests/test_wait_window_quoted_images.py \
-  tests/test_tool_passthrough.py
+  tests/test_tool_passthrough.py \
+  tests/test_step_image_tool_integration.py
 git commit -m "fix: preserve quoted images through reply processing"
 ```
 
@@ -518,7 +574,7 @@ git commit -m "fix: preserve quoted images through reply processing"
 - Create: `tests/test_current_user_image_save_calls.py`
 
 **Interfaces:**
-- Consumes: current-message `last_cached.get("image_urls", [])` from Task 2.
+- Consumes: current-message `last_cached.get("reference_image_urls", [])` from Task 2.
 - Produces: `ContextManager.build_user_history_content(text, image_urls=None)` and `save_to_official_conversation_with_cache(..., user_image_urls=None)`.
 
 - [ ] **Step 1: Write failing history-content tests**
@@ -632,10 +688,14 @@ user_content = ContextManager.build_user_history_content(
 history_list.append({"role": "user", "content": user_content})
 ```
 
-In each phase-one caller, capture image addresses before consuming `last_cached`:
+In each phase-one caller, capture original image references before consuming `last_cached`:
 
 ```python
-user_image_urls = list(last_cached.get("image_urls", []) or []) if last_cached else []
+user_image_urls = (
+    list(last_cached.get("reference_image_urls", []) or [])
+    if last_cached
+    else []
+)
 ```
 
 Pass them by keyword:
@@ -692,6 +752,8 @@ empty or partially failed embedded extraction invokes the public parser
 ordinary top-level images retain prior behavior
 one shared order, deduplication rule, and image limit applies to all sources
 multimodal and image-to-text modes consume the same resolved records
+image-to-text descriptions never replace tool reference images
+HTTP, Base64, and local tool references are materialized to local files
 wait-window messages retain image information
 ordinary and compensation saves include current user images
 logs contain no image address or Base64 value
@@ -858,4 +920,4 @@ Probe A: quote the image and ask for a short description
 Probe B: quote the same image and request a visible edit through the configured image tool
 ```
 
-For Probe A, verify the request hook reports at least one image and the final model gives an image-grounded answer. For Probe B, verify the edit tool receives at least one source image, returns one image result, and the model provides a natural-language completion. Record only status, image count, dimensions, byte count, duration, and tool status.
+For Probe A, verify the request hook reports at least one image and the final model gives an image-grounded answer. For Probe B, verify the edit tool receives the original quoted image as a local reference file, returns one image result, and the model provides a natural-language completion. Repeat Probe B once with non-empty `image_to_text_provider_id`; the formal model may receive only the description, while the edit backend must still receive the original image file. Record only status, model-image count, reference-image count, dimensions, byte count, duration, and tool status.

@@ -20,12 +20,13 @@ QQ 群引用图片消息在 AstrBot 中以顶层 `Reply` 组件进入事件。�
 6. 当前用户消息以多模态内容保存到官方会话，后续读取仍能发现图片。
 7. 单张图片解析失败时继续处理正文与其余图片。
 8. 日志仅包含计数、来源、处理阶段和异常类型，不记录完整 URL、本地文件内容或 Base64。
+9. 引用图片的原始地址独立保留为图片编辑工具参考图。图片转文字结果只用于模型理解，不能替代工具输入。
 
 ## 范围
 
 本次只修改 `astrbot_plugin_group_chat_plus`。AstrBot Core、OAuth Provider、Matoi CC、NapCat 和 aiocqhttp 适配器保持原状。
 
-`reply_handler.py`、`PLUGIN_IMAGE_URLS` 与 `on_llm_request()` 已能传递非空图片数组，功能代码保持原状，仅增加回归测试。
+`reply_handler.py`、`PLUGIN_IMAGE_URLS` 与 `on_llm_request()` 已能传递正式模型的视觉输入，功能代码保持原状，仅增加回归测试。工具参考图使用独立事件字段，不复用 `PLUGIN_IMAGE_URLS`。
 
 ## 设计
 
@@ -102,6 +103,8 @@ image_urls = [item.url for item in resolved_images]
 
 只要至少一张图片成功解析，`image_retained=True`。后续缓存、`ReplyHandler.generate_reply()`、`PLUGIN_IMAGE_URLS` 与 `on_llm_request()` 使用现有机制传递图片。
 
+无论使用哪种图片处理模式，解析后的原始地址还会写入独立的 `PLUGIN_REFERENCE_IMAGE_URLS`，供图片编辑工具读取。
+
 ### 图片转文字模式
 
 `image_to_text_provider_id` 非空时，`_convert_images_to_text()` 改为接收 `List[ResolvedMessageImage]`，不再重复调用图片组件的 `convert_to_file_path()`：
@@ -129,6 +132,26 @@ async def _convert_images_to_text(
 
 图片描述缓存键继续使用解析后的图片地址。调试日志只输出图片序号和缓存命中状态。
 
+图片转文字模式仍把正式模型的 `image_urls` 设为空，避免模型重复处理已经转换成描述的图片。原始地址保留在 `PLUGIN_REFERENCE_IMAGE_URLS`，因此 `gcp_step_image_edit` 接收真实图片文件或地址，不接收图片描述文本。
+
+### 工具参考图
+
+在 `utils/image_handler.py` 中定义：
+
+```python
+PLUGIN_REFERENCE_IMAGE_URLS = "_group_chat_plus_reference_image_urls"
+```
+
+`process_message_images()` 完成统一采集后，把全部解析地址按顺序写入该事件字段。该字段与正式模型输入分离：
+
+1. 多模态模式下，`PLUGIN_IMAGE_URLS` 与 `PLUGIN_REFERENCE_IMAGE_URLS` 可以包含相同地址，但用途不同。
+2. 图片转文字模式下，`PLUGIN_IMAGE_URLS` 为空，`PLUGIN_REFERENCE_IMAGE_URLS` 仍保留原始地址。
+3. 等待窗口缓存使用 `reference_image_urls` 保存原始地址；正式回复开始前，把当前消息和等待窗口消息的参考图合并到事件字段。
+4. `gcp_step_image_edit` 优先读取 `PLUGIN_REFERENCE_IMAGE_URLS` 的第一张有效引用，通过 `Image(file=value).convert_to_file_path()` 把 HTTP、Base64 或本地引用转换为本地文件，再传给图片后端。全部参考图转换失败后才检查顶层 `Image`，以保持旧消息结构兼容。
+5. `_has_current_image_component()` 同时检查顶层 `Image` 和参考图字段，使引用图片编辑请求能够被识别为编辑动作。
+
+参考图字段只存在于当前消息事件及其等待窗口缓存副本，不写入工具参数、模型提示词或日志。事件生命周期结束后由事件对象自然释放。
+
 ### 等待窗口
 
 `main.py::_maybe_intercept_for_wait_window()` 在构造缓存消息前调用 `ImageHandler.collect_message_images()`。
@@ -138,6 +161,7 @@ async def _convert_images_to_text(
 1. `processed_text` 保留当前正文。
 2. 缓存消息的 `image_urls` 保存解析后的地址。
 3. 等待窗口结束后，现有图片合并逻辑把这些地址加入正式请求。
+4. 同一批地址同时保存在 `reference_image_urls`，用于图片编辑工具。
 
 非空图片转文字提供商模式：
 
@@ -145,6 +169,7 @@ async def _convert_images_to_text(
 2. 平台描述与本地缓存均未提供有效描述时，使用统一解析结果调用配置的图片转文字提供商。
 3. 转换成功后缓存文字描述，`image_urls` 为空。
 4. 转换失败时保留正文；纯图片消息沿用现有占位或过滤规则。
+5. 转换结果不会覆盖 `reference_image_urls`，图片编辑工具继续使用原始图片。
 
 等待窗口中的引用图片与普通即时消息因此使用相同的图片发现规则，同时保留现有节省调用次数的处理顺序。
 
@@ -178,7 +203,7 @@ def build_user_history_content(
 user_image_urls: Optional[List[str]] = None
 ```
 
-普通发送后保存、重复消息保护保存和 agent 最终保存补偿分支都从 `_message_cache_snapshots` 中取得当前消息图片地址，并通过关键字参数传入。第二阶段只转换等待窗口缓存，不传当前用户图片。
+普通发送后保存、重复消息保护保存和 agent 最终保存补偿分支都从 `_message_cache_snapshots` 中取得当前消息的 `reference_image_urls`，并通过 `user_image_urls` 关键字参数传入。这样图片转文字模式也能保存原始图片。第二阶段只转换等待窗口缓存，不传当前用户图片。
 
 ### 错误处理与日志
 
@@ -218,10 +243,13 @@ user_image_urls: Optional[List[str]] = None
 4. 多张引用图片描述顺序保持原状。
 5. 单张图片转文字失败时其余描述仍进入正文。
 6. 全部转换失败时保留文本分支。
+7. 图片转文字模式下，正式模型图片数组为空，但工具参考图字段仍包含原始引用图片。
 
 ### 等待窗口与正式请求
 
 扩展等待窗口测试，验证缓存消息保存 `image_urls`，图片转文字模式保存描述。扩展请求测试，验证 `on_llm_request()` 执行后 `req.image_urls` 仍包含引用图片。
+
+扩展 StepImage 工具测试，验证引用图片编辑时优先使用 `PLUGIN_REFERENCE_IMAGE_URLS`，图片转文字描述不会成为 `image_path`，顶层图片后备分支继续有效。
 
 测试必须覆盖普通成功分支。仅依赖异常补偿或最终保存补偿取得通过不计为有效验证。
 
@@ -233,7 +261,7 @@ user_image_urls: Optional[List[str]] = None
 2. 无图片时继续保存字符串内容。
 3. 空地址与重复地址被过滤。
 4. 缓存消息和当前消息同时保存时顺序正确。
-5. 普通发送、重复消息保护和 agent 最终保存补偿分支均传入当前图片。
+5. 普通发送、重复消息保护和 agent 最终保存补偿分支均从 `reference_image_urls` 传入当前图片。
 6. 保存后的多模态内容能够被现有规范化方法重新读取为文本和图片标记。
 
 ## 验证与发布
@@ -242,4 +270,4 @@ user_image_urls: Optional[List[str]] = None
 
 生产发布只同步本次修改文件到 `/volume1/docker/astrbot/data/plugins/astrbot_plugin_group_chat_plus`。容器内编译通过后，通过 Dashboard API 重载目标插件，不重启 AstrBot 容器。
 
-运行验证使用授权 QQ 群完成两次最小探针：引用图片询问内容，以及引用图片调用编辑工具。日志只检查图片数量、请求图片数组数量、工具状态和回复状态。
+运行验证使用授权 QQ 群完成两次最小探针：引用图片询问内容，以及引用图片调用编辑工具。第二次探针必须确认工具接收原始引用图片作为参考图，而非图片转文字描述。日志只检查图片数量、参考图数量、请求图片数组数量、工具状态和回复状态。
