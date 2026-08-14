@@ -50,6 +50,24 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         )
         self.assertIn("TOOL_CALL_PROMPT", self.main_source)
 
+    def test_on_llm_request_filters_step_image_tools_before_marker_return_and_after_merge(self):
+        filter_call = "self._filter_step_image_tools_for_request"
+        first_filter = self.main_source.index(filter_call)
+        second_filter = self.main_source.index(filter_call, first_filter + 1)
+        marker_read = self.main_source.index(
+            "is_plugin_request = event.get_extra(PLUGIN_REQUEST_MARKER, False)"
+        )
+        merge_complete = self.main_source.index(
+            'req.system_prompt = merged_system_prompt or ""'
+        )
+        current_tools_read = self.main_source.index(
+            "current_tools = _get_compatible_tools(req.func_tool)"
+        )
+
+        self.assertLess(first_filter, marker_read)
+        self.assertLess(merge_complete, second_filter)
+        self.assertLess(second_filter, current_tools_read)
+
     def test_formal_reply_expands_plugin_scope_for_tool_owner_filter(self):
         self.assertIn("PLUGIN_ORIGINAL_PLUGINS_NAME", self.reply_source)
         self.assertIn(

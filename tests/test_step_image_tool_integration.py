@@ -1,14 +1,27 @@
 import ast
 import asyncio
 import copy
+import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import Optional
 import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TOOL_POLICY_SPEC = importlib.util.spec_from_file_location(
+    "task_tool_policy",
+    REPO_ROOT / "utils" / "tool_policy.py",
+)
+assert TOOL_POLICY_SPEC is not None
+assert TOOL_POLICY_SPEC.loader is not None
+TOOL_POLICY_MODULE = importlib.util.module_from_spec(TOOL_POLICY_SPEC)
+sys.modules[TOOL_POLICY_SPEC.name] = TOOL_POLICY_MODULE
+TOOL_POLICY_SPEC.loader.exec_module(TOOL_POLICY_MODULE)
+STEP_IMAGE_TOOL_NAMES = TOOL_POLICY_MODULE.STEP_IMAGE_TOOL_NAMES
+ToolPolicy = TOOL_POLICY_MODULE.ToolPolicy
 
 
 class GroupImageUserError(Exception):
@@ -65,6 +78,25 @@ class FakeMessageEventResult:
     def file_image(self, path):
         self.chain = [("image", path)]
         return self
+
+
+class FakeToolContainer:
+    def __init__(self, names):
+        self.tools = [SimpleNamespace(name=name) for name in names]
+
+
+class FakeStepImageVisibilityEvent:
+    def __init__(self, origin, *, is_private):
+        self.unified_msg_origin = origin
+        self.session_id = origin
+        self.message_obj = SimpleNamespace(
+            unified_msg_origin=origin,
+            session_id=origin,
+        )
+        self._is_private = is_private
+
+    def is_private_chat(self):
+        return self._is_private
 
 
 class FakeEvent:
@@ -300,6 +332,59 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         exec(compile(module, "main.py", "exec"), namespace)
         return namespace, logger
 
+    def _make_visibility_harness(
+        self,
+        *,
+        enable_group_chat=True,
+        image_service_enabled=True,
+        enabled_groups=None,
+    ):
+        method_names = (
+            "_normalize_step_image_group_id",
+            "_extract_step_image_group_id_from_origin",
+            "_get_step_image_group_id",
+            "_is_step_image_enabled_for_event",
+            "_can_expose_step_image_tools",
+            "_filter_step_image_tools_for_request",
+        )
+        nodes = [copy.deepcopy(self._method_node(name)) for name in method_names]
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__",
+                    names=[ast.alias(name="annotations")],
+                    level=0,
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(module)
+
+        class FakeGroupImageService:
+            @staticmethod
+            def is_enabled(config):
+                return image_service_enabled
+
+        namespace = {
+            "GroupImageService": FakeGroupImageService,
+            "STEP_IMAGE_TOOL_NAMES": STEP_IMAGE_TOOL_NAMES,
+            "ToolPolicy": ToolPolicy,
+        }
+        exec(compile(module, "main.py", "exec"), namespace)
+
+        class VisibilityHarness:
+            pass
+
+        for name in method_names:
+            setattr(VisibilityHarness, name, namespace[name])
+
+        harness = VisibilityHarness()
+        harness.enable_group_chat = enable_group_chat
+        harness.step_image_config = {"image_tool_backend": "codex_oauth"}
+        harness.enabled_groups = list(enabled_groups or ["10001"])
+        return harness
+
     def _make_tool_harness(self, facade, *, current_image="current.png"):
         namespace, logger = self._compile_tool_methods()
 
@@ -347,6 +432,112 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "GroupImageProviderError",
         ):
             self.assertIn(error_name, handler_names)
+
+    def test_request_visibility_keeps_step_image_tools_for_authorized_group(self):
+        harness = self._make_visibility_harness()
+        event = FakeStepImageVisibilityEvent(
+            "aiocqhttp:GroupMessage:10001",
+            is_private=False,
+        )
+        original = FakeToolContainer(
+            [
+                "normal_search",
+                "gcp_step_image_generate",
+                "astrbot_plugin_imgflow_generate_image",
+                "gcp_step_image_edit",
+            ]
+        )
+
+        filtered, removed = harness._filter_step_image_tools_for_request(
+            event, original
+        )
+
+        self.assertIs(filtered, original)
+        self.assertEqual(removed, [])
+
+    def test_request_visibility_removes_step_image_tools_for_denied_events(self):
+        cases = (
+            ("aiocqhttp:GroupMessage:20002", False),
+            ("aiocqhttp:FriendMessage:42", True),
+            ("gewechat:FriendMessage:wxid", True),
+        )
+        for origin, is_private in cases:
+            with self.subTest(origin=origin):
+                harness = self._make_visibility_harness()
+                event = FakeStepImageVisibilityEvent(origin, is_private=is_private)
+                original = FakeToolContainer(
+                    [
+                        "normal_search",
+                        "gcp_step_image_generate",
+                        "astrbot_plugin_imgflow_generate_image",
+                        "gcp_step_image_edit",
+                    ]
+                )
+
+                filtered, removed = harness._filter_step_image_tools_for_request(
+                    event, original
+                )
+
+                self.assertIsNot(filtered, original)
+                self.assertEqual(
+                    [tool.name for tool in filtered.tools],
+                    ["normal_search", "astrbot_plugin_imgflow_generate_image"],
+                )
+                self.assertEqual(
+                    [tool.name for tool in original.tools],
+                    [
+                        "normal_search",
+                        "gcp_step_image_generate",
+                        "astrbot_plugin_imgflow_generate_image",
+                        "gcp_step_image_edit",
+                    ],
+                )
+                self.assertEqual(
+                    removed,
+                    ["gcp_step_image_generate", "gcp_step_image_edit"],
+                )
+
+    def test_request_visibility_removes_step_image_tools_when_service_is_disabled(self):
+        harness = self._make_visibility_harness(image_service_enabled=False)
+        event = FakeStepImageVisibilityEvent(
+            "aiocqhttp:GroupMessage:10001",
+            is_private=False,
+        )
+        original = FakeToolContainer(
+            ["normal_search", "gcp_step_image_generate", "gcp_step_image_edit"]
+        )
+
+        filtered, removed = harness._filter_step_image_tools_for_request(
+            event, original
+        )
+
+        self.assertFalse(harness._can_expose_step_image_tools(event))
+        self.assertEqual([tool.name for tool in filtered.tools], ["normal_search"])
+        self.assertEqual(
+            removed,
+            ["gcp_step_image_generate", "gcp_step_image_edit"],
+        )
+
+    def test_request_visibility_removes_step_image_tools_when_group_chat_is_disabled(self):
+        harness = self._make_visibility_harness(enable_group_chat=False)
+        event = FakeStepImageVisibilityEvent(
+            "aiocqhttp:GroupMessage:10001",
+            is_private=False,
+        )
+        original = FakeToolContainer(
+            ["normal_search", "gcp_step_image_generate", "gcp_step_image_edit"]
+        )
+
+        filtered, removed = harness._filter_step_image_tools_for_request(
+            event, original
+        )
+
+        self.assertFalse(harness._can_expose_step_image_tools(event))
+        self.assertEqual([tool.name for tool in filtered.tools], ["normal_search"])
+        self.assertEqual(
+            removed,
+            ["gcp_step_image_generate", "gcp_step_image_edit"],
+        )
 
     def test_main_registers_guarded_step_image_tools(self):
         self.assertIn(

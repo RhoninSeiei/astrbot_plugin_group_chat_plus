@@ -116,6 +116,8 @@
 
 ## 图片处理
 
+StepImage 工具可见性：模型推理前，私聊和未授权群聊的 `ProviderRequest` 工具集合会移除 `gcp_step_image_generate` 与 `gcp_step_image_edit`；执行期授权保护保持启用。
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enable_image_processing` | bool | `false` | 启用图片处理功能，将图片转换为文字描述 |

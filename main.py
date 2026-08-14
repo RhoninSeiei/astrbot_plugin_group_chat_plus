@@ -5907,7 +5907,7 @@ class ChatPlus(Star):
 
         tool_policy = ToolPolicy.from_allowed_tool_names(
             allowed_tool_names,
-            allow_step_image=GroupImageService.is_enabled(self.step_image_config),
+            allow_step_image=self._can_expose_step_image_tools(event),
         )
         policy_visible_tools = []
         try:
@@ -8386,6 +8386,21 @@ class ChatPlus(Star):
             return True
         return str(group_id) in enabled_groups
 
+    def _can_expose_step_image_tools(self, event: AstrMessageEvent) -> bool:
+        return (
+            self.enable_group_chat
+            and GroupImageService.is_enabled(self.step_image_config)
+            and self._is_step_image_enabled_for_event(event)
+        )
+
+    def _filter_step_image_tools_for_request(self, event, tool_container):
+        if self._can_expose_step_image_tools(event):
+            return tool_container, []
+        return ToolPolicy.clone_without_tool_names(
+            tool_container,
+            STEP_IMAGE_TOOL_NAMES,
+        )
+
     def _log_step_image_guard_denied(self, event: AstrMessageEvent) -> None:
         try:
             is_private = event.is_private_chat()
@@ -9057,6 +9072,20 @@ class ChatPlus(Star):
 
         self._sanitize_llm_request_images(event, req, stage="incoming")
 
+        req.func_tool, removed_step_image_tools = (
+            self._filter_step_image_tools_for_request(event, req.func_tool)
+        )
+        if removed_step_image_tools:
+            logger.info(
+                "GCP_TOOL_VISIBILITY_FILTERED platform=%s umo=%s private=%s "
+                "group_id=%s removed=%s",
+                event.get_platform_name(),
+                getattr(event, "unified_msg_origin", ""),
+                event.is_private_chat(),
+                self._get_step_image_group_id(event),
+                removed_step_image_tools,
+            )
+
         # 检查是否是来自本插件的请求
         is_plugin_request = event.get_extra(PLUGIN_REQUEST_MARKER, False)
         if not is_plugin_request:
@@ -9208,6 +9237,9 @@ class ChatPlus(Star):
         except Exception as e:
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
 
+        req.func_tool, _ = self._filter_step_image_tools_for_request(
+            event, req.func_tool
+        )
         ToolPolicy.filter_tool_container_for_visible_names(req.func_tool, visible_tool_names)
         current_tools = _get_compatible_tools(req.func_tool)
         if visible_tool_names is not None:
