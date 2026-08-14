@@ -148,6 +148,7 @@ from .utils import (
 from .utils.image_description_cache import (
     ImageDescriptionCache,
 )  # 🆕 v1.2.0: 图片描述缓存
+from .utils.image_handler import PLUGIN_REFERENCE_IMAGE_URLS
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils.restart_guard import is_restart_command_authorized, normalize_user_ids
@@ -4962,7 +4963,11 @@ class ChatPlus(Star):
         # 使用MessageCleaner提取纯净的原始消息（不含系统提示词）
         original_message_text = MessageCleaner.extract_raw_message_from_event(event)
         if self.debug_mode:
-            logger.info(f"  纯净原始消息: {original_message_text[:100]}...")
+            logger.info(
+                "MESSAGE_CONTENT_EXTRACTED has_text=%s length=%s",
+                bool(original_message_text),
+                len(original_message_text),
+            )
 
         real_is_at_message = (
             raw_is_at_message if raw_is_at_message is not None else is_at_message
@@ -5030,7 +5035,7 @@ class ChatPlus(Star):
             emoji_marker_applied = True
             if self.debug_mode:
                 logger.info(
-                    f"【步骤6.6】🎭 已为表情包消息添加标记: {processed_message[:100]}..."
+                    "EMOJI_MARKER_APPLIED has_text=%s", bool(processed_message)
                 )
         elif is_emoji_message and self.enable_emoji_filter and not image_retained:
             if self.debug_mode:
@@ -5042,10 +5047,10 @@ class ChatPlus(Star):
         # 🆕 v1.2.0: 不再在此处直接缓存，而是准备缓存数据返回给调用方
         if self.debug_mode:
             logger.info(
-                "【步骤7】准备待缓存的用户消息数据（不含元数据，由调用方决定是否缓存）"
+                "MESSAGE_CACHE_INPUT_READY original_length=%s processed_length=%s",
+                len(original_message_text),
+                len(processed_message),
             )
-            logger.info(f"  原始消息（提取自event）: {original_message_text[:200]}...")
-            logger.info(f"  处理后消息（图片处理后）: {processed_message[:200]}...")
 
         # 🆕 v1.0.4: 确定触发方式（用于后续添加系统提示）
         # 根据is_at_message和has_trigger_keyword判断触发方式
@@ -5077,7 +5082,10 @@ class ChatPlus(Star):
             "has_trigger_keyword": has_trigger_keyword,
             # 🆕 v1.0.9: 保存戳一戳信息（如果存在）
             "poke_info": poke_info,
-            "image_urls": image_urls or [],
+            "image_urls": list(image_urls or []),
+            "reference_image_urls": list(
+                event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []
+            ),
             # 🔧 修复：保存空@标记，用于生成正确的系统提示词
             "is_empty_at": is_empty_at,
             "is_at_all_message": is_at_all_message,
@@ -5109,13 +5117,12 @@ class ChatPlus(Star):
         # 详细日志（仅debug模式）
         if self.debug_mode:
             logger.info(
-                f"【缓存准备】原始: {original_message_text[:100] if original_message_text else '(空)'}"
-            )
-            logger.info(
-                f"【缓存准备】处理后: {processed_message[:100] if processed_message else '(空)'}"
-            )
-            logger.info(
-                f"【缓存准备】待缓存数据: {cached_message['content'][:100] if cached_message['content'] else '(空)'}"
+                "MESSAGE_CACHE_PREPARED original_length=%s processed_length=%s "
+                "cached_length=%s changed=%s",
+                len(original_message_text),
+                len(processed_message),
+                len(cached_message["content"]),
+                processed_message != original_message_text,
             )
             if processed_message != original_message_text:
                 logger.info(f"  ⚠️ 消息内容有变化！原始≠处理后")
@@ -5237,9 +5244,11 @@ class ChatPlus(Star):
                 logger.info(f"  已添加戳过对方提示: 目标={_n}(ID:{_id})")
 
         if self.debug_mode:
-            logger.info("【步骤7.5】为当前消息添加元数据（用于AI识别）")
-            logger.info(f"  处理后消息: {processed_message[:100]}...")
-            logger.info(f"  添加元数据后: {message_text_for_ai[:150]}...")
+            logger.info(
+                "MESSAGE_METADATA_APPLIED processed_length=%s final_length=%s",
+                len(processed_message),
+                len(message_text_for_ai),
+            )
 
         # 提取历史上下文
         max_context = self.max_context_messages
@@ -6138,7 +6147,10 @@ class ChatPlus(Star):
                 raw_content = last_cached["content"]
 
                 if self.debug_mode:
-                    logger.info(f"【步骤14-读缓存】内容: {raw_content[:100]}")
+                    logger.info(
+                        "FORMAL_SAVE_CACHE_READ content_length=%s",
+                        len(str(raw_content or "")),
+                    )
                 else:
                     logger.info("🟢 读取缓存中")
 
@@ -6180,7 +6192,10 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
                 if self.debug_mode:
-                    logger.info(f"【步骤14-加元数据后】内容: {message_to_save[:150]}")
+                    logger.info(
+                        "FORMAL_SAVE_METADATA_APPLIED content_length=%s",
+                        len(str(message_to_save or "")),
+                    )
 
             # 如果从缓存获取失败，使用当前处理后的消息并添加元数据
             if not message_to_save:
@@ -6212,15 +6227,21 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
             if self.debug_mode:
-                logger.info(f"  准备保存的完整消息: {message_to_save[:300]}...")
+                logger.info(
+                    "FORMAL_SAVE_READY content_length=%s",
+                    len(str(message_to_save or "")),
+                )
 
             await ContextManager.save_user_message(event, message_to_save, self.context)
             if self.debug_mode:
                 logger.info(
                     f"  ✅ 用户消息已保存到自定义存储: {len(message_to_save)} 字符"
                 )
-        except Exception as e:
-            logger.error(f"保存用户消息时发生错误: {e}")
+        except Exception as exc:
+            logger.error(
+                "CUSTOM_USER_SAVE_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
         # 🆕 发送前过滤检查：防止直接转发用户消息和重复发送相同回复
         # 提取回复文本（仅当为字符串类型时；LLM请求结果在装饰阶段处理）
@@ -6241,16 +6262,10 @@ class ChatPlus(Star):
 
             if reply_text == user_message_clean:
                 logger.info("[消息过滤]回复与用户消息相同，已过滤")
-                if self.debug_mode:
-                    logger.warning(
-                        f"🚫 [消息过滤] 检测到回复与用户消息相同，跳过发送\n"
-                        f"  用户消息: {user_message_clean[:100]}...\n"
-                        f"  AI回复: {reply_text[:100]}..."
-                    )
-                else:
-                    # 非debug模式下也显示部分信息
-                    logger.info(f"  用户消息: {user_message_clean[:50]}...")
-                    logger.info(f"  AI回复: {reply_text[:50]}...")
+                logger.info(
+                    "DUPLICATE_USER_REPLY_FILTERED content_length=%s",
+                    len(reply_text),
+                )
 
                 # 🔧 重要修复：设置标记，防止平台兜底处理@消息
                 if event.is_at_or_wake_command:
@@ -6276,15 +6291,12 @@ class ChatPlus(Star):
                 logger.info(
                     f"[消息过滤]回复与最近发送的回复{reason_label}，已拦截发送（后续流程继续执行）"
                 )
-                if self.debug_mode:
-                    logger.warning(
-                        f"🚫 [消息过滤] 检测到回复与最近发送的回复{reason_label}，跳过发送\n"
-                        f"  最近回复: {recent_content[:100]}...\n"
-                        f"  当前回复: {reply_text[:100]}..."
-                    )
-                else:
-                    logger.info(f"  最近回复: {recent_content[:50]}...")
-                    logger.info(f"  当前回复: {reply_text[:50]}...")
+                logger.info(
+                    "RECENT_REPLY_MATCH_CANDIDATE previous_length=%s "
+                    "current_length=%s",
+                    len(str(recent_content or "")),
+                    len(reply_text),
+                )
                 is_duplicate_blocked = True
 
         # 发送回复
@@ -6730,6 +6742,17 @@ class ChatPlus(Star):
         else:  # blacklist
             return sender_id not in user_list
 
+    @staticmethod
+    def _merge_reference_image_urls(*collections) -> list:
+        merged = []
+        seen = set()
+        for values in collections:
+            for value in values or []:
+                if value and value not in seen:
+                    seen.add(value)
+                    merged.append(value)
+        return merged
+
     async def _maybe_intercept_for_wait_window(
         self,
         event: AstrMessageEvent,
@@ -6778,6 +6801,7 @@ class ChatPlus(Star):
         force_complete_after_buffer = False
 
         # 有活跃窗口 —— 处理 @消息特殊情况
+        empty_merged_at_candidate = False
         if is_at_message:
             at_mode = self.group_wait_window_at_mode
             if at_mode == "bypass":
@@ -6817,28 +6841,19 @@ class ChatPlus(Star):
                 # 4. 判断剥离后是否有实际内容（文字或图片）
                 remaining_text = event.message_str
                 has_remaining_image = PlatformLTMHelper.has_image_in_message(event)
-                if not remaining_text and not has_remaining_image:
-                    if at_mode in ("immediate", "force_close"):
-                        await _force_complete_window("空@机器人消息")
-                    if self.debug_mode:
-                        logger.info(
-                            f"[等待窗口] 用户{sender_id}在窗口期内发送空@消息，"
-                            f"已剥离@组件，不缓存"
-                        )
-                    return True  # 拦截，我们插件不再处理
+                empty_merged_at_candidate = (
+                    not remaining_text and not has_remaining_image
+                )
                 # 有内容（文字和/或图片）：fall through 到下方普通消息缓存分支
                 if at_mode in ("immediate", "force_close"):
                     count_after_buffer = False
                     force_complete_after_buffer = True
                 if self.debug_mode:
-                    _content_desc = []
-                    if remaining_text:
-                        _content_desc.append(f"文字: {remaining_text[:60]}...")
-                    if has_remaining_image:
-                        _content_desc.append("图片")
                     logger.info(
-                        f"[等待窗口] 用户{sender_id}在窗口期内发送@消息，"
-                        f"已剥离@组件，作为普通消息缓存 ({', '.join(_content_desc)})"
+                        "WAIT_WINDOW_MERGED_AT_STRIPPED has_text=%s "
+                        "has_top_level_image=%s",
+                        bool(remaining_text),
+                        bool(has_remaining_image),
                     )
             else:
                 # 原有逻辑：@他人 / 未开启合并 / 不在名单内 → force_complete
@@ -6877,7 +6892,27 @@ class ChatPlus(Star):
             # 让出控制权，让平台 LTM 有机会开始处理图片
             await asyncio.sleep(0)
 
-            has_image = PlatformLTMHelper.has_image_in_message(event)
+            resolved_images = await ImageHandler.collect_message_images(
+                event,
+                event.get_messages(),
+                self.max_images_per_message,
+            )
+            resolved_image_urls = [item.url for item in resolved_images]
+            has_image = bool(
+                resolved_image_urls
+            ) or PlatformLTMHelper.has_image_in_message(event)
+            if empty_merged_at_candidate and not has_image:
+                if at_mode in ("immediate", "force_close"):
+                    await _force_complete_window("空@机器人消息")
+                if self.debug_mode:
+                    logger.info("WAIT_WINDOW_MERGED_AT_EMPTY skipped=true")
+                return True
+            cached_image_urls = []
+            cached_reference_image_urls = resolved_image_urls
+            event.set_extra(
+                PLUGIN_REFERENCE_IMAGE_URLS,
+                cached_reference_image_urls,
+            )
             if has_image and self.probability_filter_cache_delay > 0:
                 await asyncio.sleep(self.probability_filter_cache_delay / 1000.0)
 
@@ -6886,7 +6921,15 @@ class ChatPlus(Star):
             should_cache = True
             success = False
 
-            if has_image:
+            if has_image and not self.image_to_text_provider_id:
+                processed_text = original_message_text
+                cached_image_urls = resolved_image_urls
+                success = bool(cached_image_urls)
+                should_cache = bool(
+                    (processed_text and processed_text.strip())
+                    or cached_image_urls
+                )
+            elif has_image:
                 # 尝试从平台获取图片描述
                 (
                     success,
@@ -6916,8 +6959,27 @@ class ChatPlus(Star):
                             True  # 标记图片信息已保留（影响后续 image_retained 判断）
                         )
                         logger.info(
-                            f"💰 [省钱回退-等待窗口] 从缓存恢复图片描述: {cache_fallback_text[:80]}..."
+                            "[图片缓存-等待窗口] 已恢复图片描述"
                         )
+                    elif resolved_images:
+                        processed_text = await ImageHandler._convert_images_to_text(
+                            event.get_messages(),
+                            self.context,
+                            self.image_to_text_provider_id,
+                            self.image_to_text_prompt,
+                            resolved_images,
+                            self.image_to_text_timeout,
+                            self.image_description_cache,
+                        )
+                        success = bool(processed_text)
+                        if not success and is_pure_image:
+                            should_cache = False
+                        elif not success:
+                            should_cache, processed_text = (
+                                MessageCleaner.process_cached_message_images(
+                                    original_message_text
+                                )
+                            )
                     elif is_pure_image:
                         should_cache = False  # 纯图片且无描述，丢弃
                     else:
@@ -6931,7 +6993,12 @@ class ChatPlus(Star):
                 processed_text = original_message_text
                 should_cache = bool(processed_text and processed_text.strip())
 
-            if should_cache and processed_text:
+            has_cached_payload = bool(
+                processed_text
+                or cached_image_urls
+                or cached_reference_image_urls
+            )
+            if should_cache and has_cached_payload:
                 # 表情包标记检测（与概率过滤路径相同的逻辑）
                 is_emoji_message = False
                 if self.enable_emoji_filter:
@@ -6946,7 +7013,11 @@ class ChatPlus(Star):
                         except Exception:
                             pass
 
-                image_retained = (has_image and success) or (not has_image)
+                image_retained = (
+                    bool(cached_image_urls)
+                    or (has_image and success)
+                    or (not has_image)
+                )
                 if is_emoji_message and self.enable_emoji_filter and image_retained:
                     processed_text = EmojiDetector.add_emoji_marker(processed_text)
                     if self.debug_mode:
@@ -6954,7 +7025,7 @@ class ChatPlus(Star):
 
                 cached_message = {
                     "role": "user",
-                    "content": processed_text,
+                    "content": processed_text or "",
                     "timestamp": time.time(),
                     "message_id": self._get_message_id(event),
                     "sender_id": event.get_sender_id(),
@@ -6974,7 +7045,8 @@ class ChatPlus(Star):
                     "wait_window_intercepted": True,  # 标记为等待窗口拦截的消息
                     "window_buffered": True,  # 标记为窗口缓冲消息，用于上下文分离
                     "gww_token": current_window_token,
-                    "image_urls": [],
+                    "image_urls": cached_image_urls,
+                    "reference_image_urls": cached_reference_image_urls,
                 }
                 self.cache_manager.add_to_cache(
                     chat_id, cached_message, source="等待窗口"
@@ -6982,8 +7054,11 @@ class ChatPlus(Star):
 
                 if self.debug_mode:
                     logger.info(
-                        f"[等待窗口] 已缓存用户{sender_id}的消息: "
-                        f"{processed_text[:60]}..."
+                        "WAIT_WINDOW_MESSAGE_CACHED has_text=%s "
+                        "image_count=%s reference_count=%s",
+                        bool(processed_text),
+                        len(cached_image_urls),
+                        len(cached_reference_image_urls),
                     )
             else:
                 if self.debug_mode:
@@ -7009,8 +7084,11 @@ class ChatPlus(Star):
                         )
             return True
 
-        except Exception as e:
-            logger.warning(f"[等待窗口] 拦截消息时发生错误: {e}", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "WAIT_WINDOW_INTERCEPT_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             return False
 
     async def _run_group_wait_window(self, chat_id: str, user_id: str) -> int:
@@ -7391,7 +7469,9 @@ class ChatPlus(Star):
                         # 成功获取平台的图片描述
                         processed_text = platform_processed_text
                         logger.info(
-                            f"🖼️ [概率过滤-平台图片描述] 成功提取图片描述，将缓存带描述的消息: {processed_text[:80]}..."
+                            "PROBABILITY_IMAGE_DESCRIPTION_READY source=platform "
+                            "has_text=%s",
+                            bool(processed_text),
                         )
                         # 🆕 将平台自动理解的图片描述保存到图片缓存（省钱!）
                         await self._save_platform_descriptions_to_cache(
@@ -7407,7 +7487,9 @@ class ChatPlus(Star):
                             processed_text = cache_fallback_text
                             success = True  # 标记图片信息已保留
                             logger.info(
-                                f"💰 [省钱回退-概率过滤] 从缓存恢复图片描述: {cache_fallback_text[:80]}..."
+                                "PROBABILITY_IMAGE_DESCRIPTION_READY source=cache "
+                                "has_text=%s",
+                                bool(cache_fallback_text),
                             )
                         elif is_pure_image:
                             # 纯图片消息且平台未处理，丢弃
@@ -7423,7 +7505,8 @@ class ChatPlus(Star):
                             )
                             if self.debug_mode:
                                 logger.info(
-                                    f"  图文混合消息，过滤图片后: {processed_text[:80] if processed_text else '(空)'}"
+                                    "PROBABILITY_IMAGE_FILTERED has_text=%s",
+                                    bool(processed_text),
                                 )
                 else:
                     # 不包含图片，直接使用原始文本
@@ -7444,7 +7527,8 @@ class ChatPlus(Star):
                         processed_text = EmojiDetector.add_emoji_marker(processed_text)
                         if self.debug_mode:
                             logger.info(
-                                f"  🎭 [概率过滤-缓存] 已为表情包消息添加标记: {processed_text[:80]}..."
+                                "PROBABILITY_EMOJI_MARKER_APPLIED has_text=%s",
+                                bool(processed_text),
                             )
                     elif (
                         is_emoji_message
@@ -7605,7 +7689,7 @@ class ChatPlus(Star):
             emoji_marker_applied,  # 🆕 v1.2.0: 表情包标记是否已添加
         ) = result
 
-        merged_image_urls = image_urls or []
+        merged_image_urls = list(image_urls or [])
         try:
             if (
                 self.enable_image_processing
@@ -7626,8 +7710,25 @@ class ChatPlus(Star):
                             _seen_urls.add(_u)
                             _dedup_urls.append(_u)
                     merged_image_urls = _dedup_urls
-        except Exception as e:
-            logger.warning(f"[图片缓存] 合并图片URL失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_URL_MERGE_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
+
+        pending_reference_image_urls = [
+            cached.get("reference_image_urls") or []
+            for cached in self.pending_messages_cache.get(chat_id, [])
+            if isinstance(cached, dict)
+        ]
+        merged_reference_image_urls = self._merge_reference_image_urls(
+            event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []),
+            *pending_reference_image_urls,
+        )
+        event.set_extra(
+            PLUGIN_REFERENCE_IMAGE_URLS,
+            merged_reference_image_urls,
+        )
 
         # 🔧 修复并发竞争：在AI决策判断之前就提取缓存副本
         # 避免在决策AI判断期间（可能耗时6-8秒），缓存被其他并发消息清空
@@ -7643,10 +7744,17 @@ class ChatPlus(Star):
                 )
                 if self.debug_mode:
                     logger.info(
-                        f"🔒 [并发保护] 已保存当前消息缓存副本: {current_message_cache.get('content', '')[:100]}..."
+                        "MESSAGE_CACHE_SNAPSHOT_SAVED content_length=%s "
+                        "image_count=%s reference_image_count=%s",
+                        len(str(current_message_cache.get("content", "") or "")),
+                        len(current_message_cache.get("image_urls") or []),
+                        len(current_message_cache.get("reference_image_urls") or []),
                     )
-        except Exception as e:
-            logger.warning(f"[并发保护] 保存缓存副本失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "MESSAGE_CACHE_SNAPSHOT_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
         smart_batch_messages = []
         if self.concurrent_mode == "smart" and current_message_cache:
@@ -7743,6 +7851,18 @@ class ChatPlus(Star):
                         for _url in _smart_msg.get("image_urls") or []:
                             if _url and _url not in merged_image_urls:
                                 merged_image_urls.append(_url)
+                    merged_reference_image_urls = self._merge_reference_image_urls(
+                        merged_reference_image_urls,
+                        *[
+                            smart_message.get("reference_image_urls") or []
+                            for smart_message in smart_batch_messages
+                            if isinstance(smart_message, dict)
+                        ],
+                    )
+                    event.set_extra(
+                        PLUGIN_REFERENCE_IMAGE_URLS,
+                        merged_reference_image_urls,
+                    )
                     if self.enable_smart_batch_reply_hint:
                         sender_name = event.get_sender_name() or "当前发送者"
                         summary_lines = []
@@ -8012,6 +8132,10 @@ class ChatPlus(Star):
             elif not has_image_info and self.debug_mode:
                 logger.info("【回退路径】🎭 表情包图片信息已被过滤，跳过添加标记")
 
+        event.set_extra(
+            PLUGIN_REFERENCE_IMAGE_URLS,
+            merged_reference_image_urls,
+        )
         async for result in self._generate_and_send_reply(
             event,
             formatted_context,
@@ -8490,6 +8614,8 @@ class ChatPlus(Star):
 
     def _has_current_image_component(self, event: AstrMessageEvent) -> bool:
         try:
+            if event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+                return True
             message_chain = getattr(getattr(event, "message_obj", None), "message", [])
             return any(isinstance(component, Image) for component in message_chain)
         except Exception:
@@ -8759,6 +8885,20 @@ class ChatPlus(Star):
     async def _extract_first_current_image_path(
         self, event: AstrMessageEvent
     ) -> Optional[str]:
+        for reference in event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+            value = str(reference or "").strip()
+            if not value:
+                continue
+            try:
+                image_path = await Image(file=value).convert_to_file_path()
+                if image_path:
+                    return image_path
+            except Exception as exc:
+                logger.warning(
+                    "STEP_IMAGE_REFERENCE_EXTRACT_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
+
         if not hasattr(event, "message_obj") or not hasattr(
             event.message_obj, "message"
         ):
@@ -10068,6 +10208,12 @@ class ChatPlus(Star):
                         "[消息发送后] ⚠️ 缓存快照和共享缓存均未找到匹配消息，将从event提取"
                     )
 
+            user_image_urls = (
+                list(last_cached.get("reference_image_urls", []) or [])
+                if last_cached
+                else []
+            )
+
             if (
                 last_cached
                 and isinstance(last_cached, dict)
@@ -10077,11 +10223,16 @@ class ChatPlus(Star):
                 raw_content = last_cached["content"]
 
                 # 强制日志：从缓存读取的内容
-                logger.info(f"🟡 [官方保存-读缓存] 内容: {raw_content[:100]}")
+                logger.info(
+                    "OFFICIAL_SAVE_CACHE_READ content_length=%s image_count=%s",
+                    len(str(raw_content or "")),
+                    len(user_image_urls),
+                )
 
                 if self.debug_mode:
                     logger.info(
-                        f"[消息发送后] 从缓存副本读取内容: {raw_content[:200]}..."
+                        "OFFICIAL_SAVE_CACHE_SNAPSHOT_USED content_length=%s",
+                        len(str(raw_content or "")),
                     )
 
                 # 使用缓存中的发送者信息添加元数据
@@ -10122,7 +10273,10 @@ class ChatPlus(Star):
                 message_to_save = MessageCleaner.clean_message(message_to_save)
 
                 # 强制日志：添加元数据后的内容
-                logger.info(f"🟡 [官方保存-加元数据后] 内容: {message_to_save[:150]}")
+                logger.info(
+                    "OFFICIAL_SAVE_METADATA_APPLIED content_length=%s",
+                    len(str(message_to_save or "")),
+                )
 
             # 如果缓存中没有，尝试从当前消息提取
             if not message_to_save:
@@ -10144,7 +10298,8 @@ class ChatPlus(Star):
                     # 清理系统提示（保存前过滤）
                     message_to_save = MessageCleaner.clean_message(message_to_save)
                     logger.info(
-                        f"[消息发送后] 从event提取的消息: {message_to_save[:200]}..."
+                        "OFFICIAL_SAVE_EVENT_FALLBACK content_length=%s",
+                        len(str(message_to_save or "")),
                     )
 
             if not message_to_save:
@@ -10153,7 +10308,9 @@ class ChatPlus(Star):
 
             if self.debug_mode:
                 logger.info(
-                    f"[消息发送后] 准备保存到官方系统的消息: {message_to_save[:300]}..."
+                    "OFFICIAL_SAVE_READY content_length=%s image_count=%s",
+                    len(str(message_to_save or "")),
+                    len(user_image_urls),
                 )
 
             # 准备需要转正的缓存消息（包含那些之前未回复的消息）
@@ -10267,6 +10424,7 @@ class ChatPlus(Star):
                 message_to_save,  # 当前用户消息（已添加时间戳和发送者信息）
                 bot_to_save,  # AI回复
                 self.context,
+                user_image_urls=user_image_urls,
             )
 
             if success:
@@ -10425,6 +10583,10 @@ class ChatPlus(Star):
             if not isinstance(last_cached, dict) or "content" not in last_cached:
                 return
 
+            user_image_urls = list(
+                last_cached.get("reference_image_urls", []) or []
+            )
+
             # 获取处理后的消息内容
             raw_content = last_cached["content"]
 
@@ -10491,6 +10653,7 @@ class ChatPlus(Star):
                 message_to_save,
                 None,  # bot_message=None，不保存AI回复
                 self.context,
+                user_image_urls=user_image_urls,
             )
 
             if success:
@@ -10846,6 +11009,11 @@ class ChatPlus(Star):
             # 获取用户消息
             message_to_save = ""
             last_cached = self._message_cache_snapshots.pop(message_id, None)
+            user_image_urls = (
+                list(last_cached.get("reference_image_urls", []) or [])
+                if last_cached
+                else []
+            )
             if (
                 last_cached
                 and isinstance(last_cached, dict)
@@ -10905,6 +11073,7 @@ class ChatPlus(Star):
                     message_to_save,
                     bot_reply_to_save,
                     self.context,
+                    user_image_urls=user_image_urls,
                 )
                 if success:
                     try:
@@ -11964,8 +12133,13 @@ class ChatPlus(Star):
                     self.image_description_cache.save(image_path, description)
                     save_count += 1
 
-                except Exception as e:
-                    logger.warning(f"[图片缓存-平台描述] 保存图片 {idx} 时失败: {e}")
+                except Exception as exc:
+                    logger.warning(
+                        "IMAGE_DESCRIPTION_CACHE_SAVE_FAILED "
+                        "index=%s error_type=%s",
+                        idx,
+                        exc.__class__.__name__,
+                    )
                     continue
 
             if save_count > 0:
@@ -11973,8 +12147,11 @@ class ChatPlus(Star):
                     f"💾 [图片缓存-平台描述] 已将 {save_count} 张平台自动理解的图片描述保存到缓存 (省钱!)"
                 )
 
-        except Exception as e:
-            logger.warning(f"[图片缓存-平台描述] 保存平台描述到缓存失败: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_DESCRIPTION_CACHE_PLATFORM_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
 
     async def _try_cache_fallback_for_images(self, event) -> Optional[str]:
         """
@@ -12032,8 +12209,11 @@ class ChatPlus(Star):
             logger.info(f"💰 [省钱回退] 从缓存恢复了 {cache_hit_count} 张图片的描述")
             return result_text
 
-        except Exception as e:
-            logger.warning(f"[省钱回退] 查询图片缓存时发生错误: {e}")
+        except Exception as exc:
+            logger.warning(
+                "IMAGE_DESCRIPTION_CACHE_LOOKUP_FAILED error_type=%s",
+                exc.__class__.__name__,
+            )
             return None
 
     async def _check_probability(

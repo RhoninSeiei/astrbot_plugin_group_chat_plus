@@ -251,6 +251,35 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             self.reply_source,
         )
 
+    def test_current_and_buffered_images_reach_restored_provider_request(self):
+        harness, _logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(["normal_search"]),
+            system_prompt="platform system prompt",
+            contexts=["platform context"],
+            prompt="short retrieval prompt",
+            image_urls=["platform-image"],
+        )
+        event = FakeRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": ["plugin context"],
+                "plugin_system_prompt": "plugin system prompt",
+                "plugin_prompt": "formal prompt",
+                "plugin_image_urls": ["current-a", "wait-a", "smart-a"],
+                "plugin_func_tool": None,
+            }
+        )
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(request.prompt, "formal prompt")
+        self.assertEqual(request.contexts, ["plugin context"])
+        self.assertEqual(
+            request.image_urls,
+            ["current-a", "wait-a", "smart-a"],
+        )
+
     def test_formal_reply_clones_legacy_tool_manager_before_filtering(self):
         self.assertIn("from .tool_policy import ToolPolicy", self.reply_source)
         self.assertIn(

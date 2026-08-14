@@ -1021,6 +1021,113 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("await component.convert_to_file_path()", self.main_source)
         self.assertIn("请把图片和编辑要求放在同一条消息里", self.main_source)
 
+    def test_quoted_reference_counts_as_current_image_without_top_level_image(self):
+        reference_key = "_group_chat_plus_reference_image_urls"
+        has_current_image = self._compile_unbound_method(
+            "_has_current_image_component",
+            {
+                "AstrMessageEvent": object,
+                "Image": type("Image", (), {}),
+                "PLUGIN_REFERENCE_IMAGE_URLS": reference_key,
+            },
+        )
+        event = SimpleNamespace(
+            message_obj=SimpleNamespace(message=[]),
+            get_extra=lambda key, default=None: (
+                ["https://example.invalid/quoted.png"]
+                if key == reference_key
+                else default
+            ),
+        )
+
+        self.assertTrue(has_current_image(SimpleNamespace(), event))
+
+    def test_http_quoted_reference_is_materialized_before_edit_backend_call(self):
+        reference_key = "_group_chat_plus_reference_image_urls"
+        conversions = []
+
+        class MaterializingImage:
+            def __init__(self, file=None):
+                self.file = file
+
+            async def convert_to_file_path(self):
+                conversions.append(self.file)
+                return "C:/tmp/quoted-local.png"
+
+        extract_current_image = self._compile_unbound_method(
+            "_extract_first_current_image_path",
+            {
+                "AstrMessageEvent": object,
+                "Image": MaterializingImage,
+                "PLUGIN_REFERENCE_IMAGE_URLS": reference_key,
+                "logger": RecordingLogger(),
+            },
+        )
+        order = []
+        facade = RecordingFacade(order)
+        harness, _logger = self._make_tool_harness(facade)
+        harness._extract_first_current_image_path = extract_current_image.__get__(
+            harness, type(harness)
+        )
+        event = FakeEvent(order)
+        event.message_obj = SimpleNamespace(
+            message=[
+                SimpleNamespace(
+                    text="[quoted image content: desc:quoted-a]"
+                )
+            ]
+        )
+        event.set_extra(
+            reference_key,
+            ["https://example.invalid/quoted.png"],
+        )
+
+        self._collect_tool_results(
+            harness.gcp_step_image_edit(event, prompt="change the sky")
+        )
+
+        self.assertEqual(
+            conversions,
+            ["https://example.invalid/quoted.png"],
+        )
+        self.assertEqual(
+            facade.calls[0][1]["image_path"],
+            "C:/tmp/quoted-local.png",
+        )
+        self.assertNotIn("desc:quoted-a", facade.calls[0][1]["image_path"])
+
+    def test_empty_reference_list_keeps_top_level_image_compatibility(self):
+        reference_key = "_group_chat_plus_reference_image_urls"
+
+        class MaterializingImage:
+            def __init__(self, file=None):
+                self.file = file
+
+            async def convert_to_file_path(self):
+                return self.file
+
+        extract_current_image = self._compile_unbound_method(
+            "_extract_first_current_image_path",
+            {
+                "AstrMessageEvent": object,
+                "Image": MaterializingImage,
+                "PLUGIN_REFERENCE_IMAGE_URLS": reference_key,
+                "logger": RecordingLogger(),
+            },
+        )
+        event = SimpleNamespace(
+            message_obj=SimpleNamespace(
+                message=[MaterializingImage("C:/tmp/top-level.png")]
+            ),
+            get_extra=lambda key, default=None: [] if key == reference_key else default,
+        )
+
+        image_path = asyncio.run(
+            extract_current_image(SimpleNamespace(), event)
+        )
+
+        self.assertEqual(image_path, "C:/tmp/top-level.png")
+
     def test_schema_exposes_safe_step_image_settings(self):
         for key in (
             '"enable_step_image_tools"',

@@ -2770,19 +2770,15 @@ class ContextManager:
                 if hashable_content is not None and hashable_content in existing_contents:
                     continue
 
-                image_urls = cached_msg.get("image_urls", [])
-                if image_urls:
-                    multimodal_content = []
-                    if content:
-                        multimodal_content.append({"type": "text", "text": content})
-                    for img_url in image_urls:
-                        if img_url:
-                            multimodal_content.append(
-                                {"type": "image_url", "image_url": {"url": img_url}}
-                            )
-                    history_list.append({"role": "user", "content": multimodal_content})
-                else:
-                    history_list.append({"role": "user", "content": content})
+                history_list.append(
+                    {
+                        "role": "user",
+                        "content": ContextManager.build_user_history_content(
+                            content,
+                            cached_msg.get("image_urls", []),
+                        ),
+                    }
+                )
 
                 if hashable_content is not None:
                     existing_contents.add(hashable_content)
@@ -2805,6 +2801,28 @@ class ContextManager:
             return False
 
     @staticmethod
+    def build_user_history_content(text, image_urls=None):
+        clean_urls = []
+        seen = set()
+        for value in image_urls or []:
+            value = str(value or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            clean_urls.append(value)
+        if not clean_urls:
+            return text
+
+        content = []
+        if text:
+            content.append({"type": "text", "text": text})
+        content.extend(
+            {"type": "image_url", "image_url": {"url": value}}
+            for value in clean_urls
+        )
+        return content
+
+    @staticmethod
     async def save_to_official_conversation_with_cache(
         event: AstrMessageEvent,
         cached_messages: list,
@@ -2812,6 +2830,8 @@ class ContextManager:
         bot_message: str,
         context: "Context",
         save_kind: str = "",
+        *,
+        user_image_urls=None,
     ) -> bool:
         """
         保存到官方对话系统，支持缓存转正
@@ -2824,6 +2844,10 @@ class ContextManager:
             user_message: 当前用户消息（原始，不带元数据）
             bot_message: AI回复
             context: Context对象
+            save_kind: 保存类型标识，保留为第六个位置参数以兼容既有调用
+            user_image_urls: 当前用户原始图片地址。空值会被过滤，重复地址按首次
+                出现顺序去重；存在有效图片时，用户历史内容为 text 与 image_url
+                内容块组成的列表，否则保持字符串内容。
 
         Returns:
             是否成功
@@ -3029,56 +3053,42 @@ class ContextManager:
                                         "[工具调用记录清理] 缓存消息仅包含工具审计文本，跳过转正"
                                     )
                                     continue
-                            hashable_content = make_content_hashable(
-                                cached_content
+                            cached_image_urls = cached_msg.get("image_urls", [])
+                            final_content = (
+                                ContextManager.build_user_history_content(
+                                    cached_content,
+                                    cached_image_urls,
+                                )
+                                if cached_image_urls
+                                else cached_content
                             )
+                            hashable_content = make_content_hashable(final_content)
                             if hashable_content not in existing_contents:
-                                # 🔧 修复：支持多模态消息格式（包含图片URL）
-                                # 检查是否有图片URL需要保存
-                                cached_image_urls = cached_msg.get("image_urls", [])
-
                                 if cached_image_urls:
-                                    # 有图片URL，构建多模态消息格式
-                                    # 格式: [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
-                                    multimodal_content = []
-
-                                    # 添加文本部分
-                                    if cached_content:
-                                        multimodal_content.append(
-                                            {
-                                                "type": "text",
-                                                "text": cached_content,
-                                            }
-                                        )
-
-                                    # 添加图片URL部分
-                                    for img_url in cached_image_urls:
-                                        if img_url:
-                                            multimodal_content.append(
-                                                {
-                                                    "type": "image_url",
-                                                    "image_url": {"url": img_url},
-                                                }
-                                            )
-
                                     history_list.append(
                                         {
                                             "role": role,
-                                            "content": multimodal_content,
+                                            "content": final_content,
                                         }
                                     )
-                                    image_count += len(cached_image_urls)
+                                    clean_image_count = sum(
+                                        1
+                                        for item in final_content
+                                        if isinstance(item, dict)
+                                        and item.get("type") == "image_url"
+                                    )
+                                    image_count += clean_image_count
 
                                     if DEBUG_MODE:
                                         logger.info(
-                                            f"[官方保存+缓存转正] 添加多模态消息: 文本+{len(cached_image_urls)}张图片"
+                                            f"[官方保存+缓存转正] 添加多模态消息: 文本+{clean_image_count}张图片"
                                         )
                                 else:
                                     # 无图片URL，使用普通文本格式
                                     history_list.append(
                                         {
                                             "role": role,
-                                            "content": cached_content,
+                                            "content": final_content,
                                         }
                                     )
 
@@ -3118,10 +3128,21 @@ class ContextManager:
 
             # 7. 添加当前用户消息（如果有）
             if user_message:
-                history_list.append({"role": "user", "content": user_message})
+                user_content = ContextManager.build_user_history_content(
+                    user_message,
+                    user_image_urls,
+                )
+                history_list.append({"role": "user", "content": user_content})
                 if DEBUG_MODE:
+                    image_count = sum(
+                        1
+                        for item in user_content
+                        if isinstance(user_content, list)
+                        and isinstance(item, dict)
+                        and item.get("type") == "image_url"
+                    )
                     logger.info(
-                        f"[官方保存+缓存转正] 添加用户消息: {user_message[:50]}..."
+                        f"[官方保存+缓存转正] 添加用户消息: image_count={image_count}"
                     )
             elif DEBUG_MODE:
                 logger.info(
