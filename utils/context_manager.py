@@ -2829,8 +2829,9 @@ class ContextManager:
         user_message: str,
         bot_message: str,
         context: "Context",
-        user_image_urls=None,
         save_kind: str = "",
+        *,
+        user_image_urls=None,
     ) -> bool:
         """
         保存到官方对话系统，支持缓存转正
@@ -2843,6 +2844,10 @@ class ContextManager:
             user_message: 当前用户消息（原始，不带元数据）
             bot_message: AI回复
             context: Context对象
+            save_kind: 保存类型标识，保留为第六个位置参数以兼容既有调用
+            user_image_urls: 当前用户原始图片地址。空值会被过滤，重复地址按首次
+                出现顺序去重；存在有效图片时，用户历史内容为 text 与 image_url
+                内容块组成的列表，否则保持字符串内容。
 
         Returns:
             是否成功

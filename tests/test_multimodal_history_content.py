@@ -382,6 +382,45 @@ class MultimodalHistoryContentTest(unittest.TestCase):
             },
         )
 
+    def test_official_save_preserves_positional_save_kind_compatibility(self):
+        conversation = types.SimpleNamespace(content=[])
+
+        class FakeConversationManager:
+            def __init__(self):
+                self.updated_history = None
+
+            async def get_curr_conversation_id(self, _origin):
+                return "conversation-1"
+
+            async def get_conversation(self, *_args, **_kwargs):
+                return conversation
+
+            async def update_conversation(
+                self, _origin, *, conversation_id, history
+            ):
+                self.updated_history = history
+                conversation.content = history
+
+        manager = FakeConversationManager()
+        event = types.SimpleNamespace(unified_msg_origin="origin-1")
+        context = types.SimpleNamespace(conversation_manager=manager)
+
+        asyncio.run(
+            self.ContextManager.save_to_official_conversation_with_cache(
+                event,
+                [{"role": "assistant", "content": "缓存回复"}],
+                "普通消息",
+                None,
+                context,
+                "poke_event",
+            )
+        )
+
+        self.assertEqual(
+            manager.updated_history[-1],
+            {"role": "user", "content": "普通消息"},
+        )
+
     def test_main_and_proactive_use_normalized_content(self):
         main_py = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
         proactive = (REPO_ROOT / "utils" / "proactive_chat_manager.py").read_text(
