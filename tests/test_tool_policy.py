@@ -215,6 +215,24 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertEqual([tool.name for tool in filtered.tools], ["normal_search"])
         self.assertEqual(removed, [])
 
+    def test_clone_without_tool_names_returns_original_when_targets_are_absent(self):
+        tool_policy = _load_tool_policy()
+        original = RemoveToolContainer(
+            ["normal_search", "astrbot_plugin_imgflow_generate_image"]
+        )
+
+        filtered, removed = tool_policy.clone_without_tool_names(
+            original,
+            {"gcp_step_image_generate", "gcp_step_image_edit"},
+        )
+
+        self.assertIs(filtered, original)
+        self.assertEqual(
+            [tool.name for tool in filtered.tools],
+            ["normal_search", "astrbot_plugin_imgflow_generate_image"],
+        )
+        self.assertEqual(removed, [])
+
     def test_main_uses_tool_policy_for_visible_tool_filtering(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
 

@@ -15,8 +15,9 @@
 3. Authorized group requests retain the original tool container and both StepImage tools.
 4. Private chats, unauthorized groups, disabled group chat, and disabled image service exclude both StepImage tools before model inference.
 5. Keep `_step_image_guard()` as execution-time verification.
-6. Visibility-filter logs contain only platform, private-chat state, and removed tool names; do not expose UMO, group IDs, prompts, Provider configuration, access tokens, or keys.
+6. Visibility-filter logs contain only stage, safe platform, private-chat state, and removed tool names; guard-denied logs contain only safe platform, private-chat state, and a fixed reason code. Do not expose UMO, group IDs, session IDs, enabled groups, prompts, Provider configuration, access tokens, or keys.
 7. Leave `docs/superpowers/plans/2026-04-17-matoi-guardian-ep5-plugin.md` untouched.
+8. Execution-time authorization uses the complete group-chat, image-service, and event authorization decision while preserving the dedicated disabled-image-service message.
 
 ---
 
@@ -100,6 +101,14 @@ def clone_without_tool_names(
     if not denied_set:
         return tool_container, []
 
+    existing_names = {
+        str(getattr(tool, "name", "")).strip()
+        for tool in cls._get_container_tools(tool_container)
+        if str(getattr(tool, "name", "")).strip()
+    }
+    if not denied_set.intersection(existing_names):
+        return tool_container, []
+
     cloned = cls.clone_tool_container(tool_container)
     visible_names = {
         str(getattr(tool, "name", "")).strip()
@@ -140,7 +149,7 @@ git commit -m "fix: add non-destructive tool exclusion"
 
 **Interfaces:**
 - Consumes: `ToolPolicy.clone_without_tool_names(...)`, `GroupImageService.is_enabled(...)`, `_is_step_image_enabled_for_event(event)`, and `STEP_IMAGE_TOOL_NAMES`.
-- Produces: `ChatPlus._can_expose_step_image_tools(event) -> bool` and `ChatPlus._filter_step_image_tools_for_request(event, tool_container) -> tuple[object | None, list[str]]`.
+- Produces: `ChatPlus._can_expose_step_image_tools(event) -> bool`, `ChatPlus._filter_step_image_tools_for_request(event, tool_container) -> tuple[object | None, list[str]]`, safe event-log context, and stage-aware visibility logging.
 
 - [ ] **Step 1: Write failing authorization and filtering tests**
 
@@ -242,16 +251,14 @@ At the start of `on_llm_request`, after image sanitization and before reading `P
 req.func_tool, removed_step_image_tools = (
     self._filter_step_image_tools_for_request(event, req.func_tool)
 )
-if removed_step_image_tools:
-    logger.info(
-        "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
-        event.get_platform_name(),
-        event.is_private_chat(),
-        removed_step_image_tools,
-    )
+self._log_step_image_tools_filtered(
+    event,
+    removed_step_image_tools,
+    stage="incoming",
+)
 ```
 
-After merging `PLUGIN_FUNC_TOOL` and before `current_tools = _get_compatible_tools(req.func_tool)`, call the same helper again. This second call prevents plugin tool merging or a visible-tool metadata failure from reintroducing either StepImage tool.
+After merging `PLUGIN_FUNC_TOOL` and before `current_tools = _get_compatible_tools(req.func_tool)`, call the same helper again with `stage="post_merge"`. Log only when that stage actually removes a tool. This second call prevents plugin tool merging or a visible-tool metadata failure from reintroducing either StepImage tool. Event logging must use fixed `unknown` values when platform or private-chat methods are absent or raise.
 
 - [ ] **Step 5: Update configuration documentation**
 

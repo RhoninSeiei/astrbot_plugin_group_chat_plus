@@ -16,10 +16,11 @@
 
 工具可见性与执行鉴权共同使用以下条件：
 
-1. `GroupImageService.is_enabled(self.step_image_config)` 返回真。
-2. `_is_step_image_enabled_for_event(event)` 返回真。
+1. `enable_group_chat` 返回真。
+2. `GroupImageService.is_enabled(self.step_image_config)` 返回真。
+3. `_is_step_image_enabled_for_event(event)` 返回真。
 
-第二项继续从事件字段、消息对象、`unified_msg_origin` 和 `session_id` 识别群号，并使用 `enabled_groups` 判断授权范围。私聊事件缺少群聊来源时返回假。
+第三项继续从事件字段、消息对象、`unified_msg_origin` 和 `session_id` 识别群号，并使用 `enabled_groups` 判断授权范围。私聊事件缺少群聊来源时返回假。执行期 `_step_image_guard()` 复用完整授权判断，同时保留图片服务关闭时的专用提示。
 
 ### 普通主模型请求
 
@@ -44,9 +45,11 @@
 
 方法返回过滤后的容器和移除工具名，便于请求接入和日志验证。无关工具保持输入顺序。
 
+容器中不存在目标工具时，方法返回原容器与空列表，避免产生无行为变化的副本。
+
 ### 日志
 
-请求级过滤实际移除工具时记录结构化日志，仅包含平台名、私聊状态和移除工具名。日志不包含 UMO、群号、提示词、Provider 配置、访问令牌或密钥。
+请求级过滤实际移除工具时记录结构化日志，仅包含过滤阶段、平台名、私聊状态和移除工具名。过滤阶段固定为 `incoming` 或 `post_merge`；缺失平台名或私聊状态方法、方法调用异常时使用固定值 `unknown`。执行期拒绝日志仅包含相同的安全平台值、私聊状态和固定原因码。日志不包含 UMO、群号、`session_id`、`enabled_groups`、提示词、Provider 配置、访问令牌或密钥。
 
 ## 测试
 
@@ -61,6 +64,8 @@
 5. 图片服务关闭时，授权群也移除两项 GCP 工具。
 6. 插件自身请求完成工具合并后仍满足相同权限规则。
 7. 人格工具名单的普通允许分支继续生效，测试不得依赖执行期拒绝文本取得通过。
+8. `VirtualMessageEvent` 缺少平台名和私聊状态方法时，请求仍完成上下文恢复并使用固定日志值。
+9. `enable_group_chat=False` 时，生成和编辑均在后端调用前由执行期鉴权拒绝。
 
 ## 生产验证
 

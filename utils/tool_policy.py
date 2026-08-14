@@ -121,6 +121,14 @@ class ToolPolicy:
         if not denied_set:
             return tool_container, []
 
+        existing_names = {
+            str(getattr(tool, "name", "")).strip()
+            for tool in cls._get_container_tools(tool_container)
+            if str(getattr(tool, "name", "")).strip()
+        }
+        if not denied_set.intersection(existing_names):
+            return tool_container, []
+
         cloned = cls.clone_tool_container(tool_container)
         visible_names = {
             str(getattr(tool, "name", "")).strip()

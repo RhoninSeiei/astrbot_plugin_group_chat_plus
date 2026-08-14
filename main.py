@@ -8401,25 +8401,63 @@ class ChatPlus(Star):
             STEP_IMAGE_TOOL_NAMES,
         )
 
-    def _log_step_image_guard_denied(self, event: AstrMessageEvent) -> None:
+    def _safe_step_image_log_context(self, event) -> tuple[str, object]:
+        platform = "unknown"
+        is_private: object = "unknown"
+
         try:
-            is_private = event.is_private_chat()
+            platform_getter = getattr(event, "get_platform_name", None)
+            if callable(platform_getter):
+                platform_value = str(platform_getter() or "").strip()
+                if platform_value:
+                    platform = platform_value
         except Exception:
-            is_private = None
-        logger.warning(
-            "[StepImage] 群聊启用判定失败: group_id=%s, is_private=%s, "
-            "unified_msg_origin=%s, session_id=%s, enabled_groups=%s",
-            self._get_step_image_group_id(event),
+            pass
+
+        try:
+            private_getter = getattr(event, "is_private_chat", None)
+            if callable(private_getter):
+                private_value = private_getter()
+                if isinstance(private_value, bool):
+                    is_private = private_value
+        except Exception:
+            pass
+
+        return platform, is_private
+
+    def _log_step_image_tools_filtered(
+        self,
+        event,
+        removed_tool_names,
+        *,
+        stage: str,
+    ) -> None:
+        if not removed_tool_names:
+            return
+        platform, is_private = self._safe_step_image_log_context(event)
+        logger.info(
+            "GCP_TOOL_VISIBILITY_FILTERED "
+            "stage=%s platform=%s private=%s removed=%s",
+            stage,
+            platform,
             is_private,
-            getattr(event, "unified_msg_origin", None),
-            getattr(event, "session_id", None),
-            self.enabled_groups,
+            removed_tool_names,
+        )
+
+    def _log_step_image_guard_denied(self, event: AstrMessageEvent) -> None:
+        platform, is_private = self._safe_step_image_log_context(event)
+        logger.warning(
+            "STEP_IMAGE_GUARD_DENIED "
+            "platform=%s private=%s reason_code=%s",
+            platform,
+            is_private,
+            "event_not_authorized",
         )
 
     def _step_image_guard(self, event: AstrMessageEvent) -> Optional[str]:
         if not GroupImageService.is_enabled(self.step_image_config):
             return "图片生成工具未启用。"
-        if not self._is_step_image_enabled_for_event(event):
+        if not self._can_expose_step_image_tools(event):
             self._log_step_image_guard_denied(event)
             return "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
         return None
@@ -9075,13 +9113,11 @@ class ChatPlus(Star):
         req.func_tool, removed_step_image_tools = (
             self._filter_step_image_tools_for_request(event, req.func_tool)
         )
-        if removed_step_image_tools:
-            logger.info(
-                "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
-                event.get_platform_name(),
-                event.is_private_chat(),
-                removed_step_image_tools,
-            )
+        self._log_step_image_tools_filtered(
+            event,
+            removed_step_image_tools,
+            stage="incoming",
+        )
 
         # 检查是否是来自本插件的请求
         is_plugin_request = event.get_extra(PLUGIN_REQUEST_MARKER, False)
@@ -9234,8 +9270,16 @@ class ChatPlus(Star):
         except Exception as e:
             logger.warning(f"⚠️ 注入 Skills 提示词时出错（不影响主流程）: {e}")
 
-        req.func_tool, _ = self._filter_step_image_tools_for_request(
-            event, req.func_tool
+        req.func_tool, removed_step_image_tools = (
+            self._filter_step_image_tools_for_request(
+                event,
+                req.func_tool,
+            )
+        )
+        self._log_step_image_tools_filtered(
+            event,
+            removed_step_image_tools,
+            stage="post_merge",
         )
         ToolPolicy.filter_tool_container_for_visible_names(req.func_tool, visible_tool_names)
         current_tools = _get_compatible_tools(req.func_tool)

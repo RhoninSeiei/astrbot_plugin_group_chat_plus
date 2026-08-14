@@ -385,6 +385,69 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         harness.enabled_groups = list(enabled_groups or ["10001"])
         return harness
 
+    def _make_guard_harness(
+        self,
+        *,
+        enable_group_chat=True,
+        image_service_enabled=True,
+        enabled_groups=None,
+    ):
+        method_names = [
+            "_normalize_step_image_group_id",
+            "_extract_step_image_group_id_from_origin",
+            "_get_step_image_group_id",
+            "_is_step_image_enabled_for_event",
+            "_can_expose_step_image_tools",
+            "_log_step_image_guard_denied",
+            "_step_image_guard",
+        ]
+        available_method_names = {
+            node.name
+            for node in self.chat_plus_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        if "_safe_step_image_log_context" in available_method_names:
+            method_names.insert(-2, "_safe_step_image_log_context")
+
+        nodes = [copy.deepcopy(self._method_node(name)) for name in method_names]
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__",
+                    names=[ast.alias(name="annotations")],
+                    level=0,
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(module)
+        logger = RecordingLogger()
+
+        class FakeGroupImageService:
+            @staticmethod
+            def is_enabled(config):
+                return image_service_enabled
+
+        namespace = {
+            "GroupImageService": FakeGroupImageService,
+            "logger": logger,
+            "Optional": Optional,
+        }
+        exec(compile(module, "main.py", "exec"), namespace)
+
+        class GuardHarness:
+            pass
+
+        for name in method_names:
+            setattr(GuardHarness, name, namespace[name])
+
+        harness = GuardHarness()
+        harness.enable_group_chat = enable_group_chat
+        harness.step_image_config = {"image_tool_backend": "codex_oauth"}
+        harness.enabled_groups = list(enabled_groups or ["10001"])
+        return harness, logger
+
     def _make_tool_harness(self, facade, *, current_image="current.png"):
         namespace, logger = self._compile_tool_methods()
 
@@ -538,6 +601,102 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             removed,
             ["gcp_step_image_generate", "gcp_step_image_edit"],
         )
+
+    def test_step_image_tools_reject_disabled_group_chat_before_backend_calls(self):
+        guard_harness, _guard_logger = self._make_guard_harness(
+            enable_group_chat=False
+        )
+
+        for operation in ("generate", "edit"):
+            with self.subTest(operation=operation):
+                order = []
+                facade = RecordingFacade(order)
+                tool_harness, _tool_logger = self._make_tool_harness(facade)
+                tool_harness._step_image_guard = guard_harness._step_image_guard
+                event = FakeEvent(order)
+                event.unified_msg_origin = "aiocqhttp:GroupMessage:10001"
+                event.session_id = event.unified_msg_origin
+                event.message_obj = SimpleNamespace(
+                    unified_msg_origin=event.unified_msg_origin,
+                    session_id=event.session_id,
+                )
+                event.get_group_id = lambda: "10001"
+                event.get_platform_name = lambda: "aiocqhttp"
+                event.is_private_chat = lambda: False
+
+                if operation == "generate":
+                    results = self._collect_tool_results(
+                        tool_harness.gcp_step_image_generate(
+                            event,
+                            prompt="cat",
+                            size="",
+                        )
+                    )
+                else:
+                    results = self._collect_tool_results(
+                        tool_harness.gcp_step_image_edit(
+                            event,
+                            prompt="change",
+                        )
+                    )
+
+                self.assertEqual(facade.calls, [])
+                self.assertEqual(event.sent, [])
+                self.assertEqual(event.extras["tool_status"], "failed")
+                self.assertEqual(
+                    results,
+                    [
+                        "群聊图片工具 "
+                        f"图片{'生成' if operation == 'generate' else '编辑'}失败："
+                        "图片生成工具仅在启用 group_chat_plus 的群聊中可用。"
+                    ],
+                )
+
+    def test_step_image_guard_keeps_disabled_service_message(self):
+        harness, _logger = self._make_guard_harness(
+            enable_group_chat=False,
+            image_service_enabled=False,
+        )
+        event = FakeStepImageVisibilityEvent(
+            "aiocqhttp:GroupMessage:10001",
+            is_private=False,
+        )
+
+        self.assertEqual(
+            harness._step_image_guard(event),
+            "图片生成工具未启用。",
+        )
+
+    def test_step_image_guard_denied_log_excludes_session_identifiers(self):
+        harness, logger = self._make_guard_harness(enabled_groups=["10001"])
+        event = FakeStepImageVisibilityEvent(
+            "aiocqhttp:GroupMessage:20002",
+            is_private=False,
+        )
+        event.get_platform_name = lambda: "aiocqhttp"
+
+        guard_message = harness._step_image_guard(event)
+
+        self.assertEqual(
+            guard_message,
+            "图片生成工具仅在启用 group_chat_plus 的群聊中可用。",
+        )
+        self.assertEqual(
+            logger.records,
+            [
+                (
+                    "warning",
+                    "STEP_IMAGE_GUARD_DENIED "
+                    "platform=%s private=%s reason_code=%s",
+                    ("aiocqhttp", False, "event_not_authorized"),
+                    {},
+                )
+            ],
+        )
+        rendered_log_arguments = repr(logger.records[0][2])
+        self.assertNotIn("20002", rendered_log_arguments)
+        self.assertNotIn("10001", rendered_log_arguments)
+        self.assertNotIn("GroupMessage", rendered_log_arguments)
 
     def test_main_registers_guarded_step_image_tools(self):
         self.assertIn(

@@ -72,6 +72,37 @@ class FakeRequestEvent:
         return False
 
 
+class VirtualRequestEvent:
+    def __init__(self, extras):
+        self.extras = dict(extras)
+        self.unified_msg_origin = "aiocqhttp:GroupMessage:20002"
+        self.session_id = self.unified_msg_origin
+        self.message_obj = SimpleNamespace(
+            unified_msg_origin=self.unified_msg_origin,
+            session_id=self.session_id,
+        )
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        if value is None:
+            self.extras.pop(key, None)
+        else:
+            self.extras[key] = value
+
+    def get_group_id(self):
+        return "20002"
+
+
+class RaisingRequestEvent(FakeRequestEvent):
+    def get_platform_name(self):
+        raise RuntimeError("sensitive-platform-value")
+
+    def is_private_chat(self):
+        raise RuntimeError("sensitive-private-value")
+
+
 class ToolPassthroughIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
@@ -99,7 +130,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         return matches[0]
 
     def _make_on_llm_request_harness(self):
-        method_names = (
+        method_names = [
             "_normalize_step_image_group_id",
             "_extract_step_image_group_id_from_origin",
             "_get_step_image_group_id",
@@ -107,7 +138,18 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             "_can_expose_step_image_tools",
             "_filter_step_image_tools_for_request",
             "on_llm_request",
-        )
+        ]
+        available_method_names = {
+            node.name
+            for node in self.chat_plus_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for optional_name in (
+            "_safe_step_image_log_context",
+            "_log_step_image_tools_filtered",
+        ):
+            if optional_name in available_method_names:
+                method_names.insert(-1, optional_name)
 
         class ImportStripper(ast.NodeTransformer):
             def visit_Import(self, node):
@@ -288,8 +330,10 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             [
                 (
                     "info",
-                    "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
                     (
+                        "incoming",
                         "aiocqhttp",
                         False,
                         ["gcp_step_image_generate", "gcp_step_image_edit"],
@@ -336,8 +380,174 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             [
                 (
                     "info",
-                    "GCP_TOOL_VISIBILITY_FILTERED platform=%s private=%s removed=%s",
-                    ("aiocqhttp", False, ["gcp_step_image_generate"]),
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "incoming",
+                        "aiocqhttp",
+                        False,
+                        ["gcp_step_image_generate"],
+                    ),
+                    {},
+                ),
+                (
+                    "info",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "post_merge",
+                        "aiocqhttp",
+                        False,
+                        ["gcp_step_image_edit"],
+                    ),
+                    {},
+                ),
+            ],
+        )
+
+    def test_plugin_request_skips_post_merge_log_when_no_tool_is_removed(self):
+        harness, logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(
+                [
+                    "normal_search",
+                    "gcp_step_image_generate",
+                    "gcp_step_image_edit",
+                ]
+            ),
+            system_prompt="platform prompt",
+            contexts=[],
+            prompt="message",
+            image_urls=[],
+        )
+        event = FakeRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": [],
+                "plugin_system_prompt": "plugin prompt",
+                "plugin_prompt": "message",
+                "plugin_image_urls": [],
+                "plugin_func_tool": FakeToolContainer(
+                    ["astrbot_plugin_imgflow_generate_image"]
+                ),
+                "plugin_visible_tool_names": None,
+            }
+        )
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(
+            [tool.name for tool in request.func_tool.tools],
+            ["normal_search", "astrbot_plugin_imgflow_generate_image"],
+        )
+        self.assertEqual(
+            self._visibility_log_records(logger),
+            [
+                (
+                    "info",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "incoming",
+                        "aiocqhttp",
+                        False,
+                        ["gcp_step_image_generate", "gcp_step_image_edit"],
+                    ),
+                    {},
+                )
+            ],
+        )
+
+    def test_virtual_plugin_request_uses_safe_log_values_and_restores_prompt(self):
+        harness, logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(
+                ["normal_search", "gcp_step_image_generate"]
+            ),
+            system_prompt="platform prompt",
+            contexts=[],
+            prompt="short message",
+            image_urls=[],
+        )
+        event = VirtualRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": [],
+                "plugin_system_prompt": "plugin system prompt",
+                "plugin_prompt": "restored full prompt",
+                "plugin_image_urls": [],
+                "plugin_func_tool": FakeToolContainer(
+                    ["astrbot_plugin_imgflow_generate_image", "gcp_step_image_edit"]
+                ),
+                "plugin_visible_tool_names": None,
+            }
+        )
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(request.prompt, "restored full prompt")
+        self.assertEqual(
+            [tool.name for tool in request.func_tool.tools],
+            ["normal_search", "astrbot_plugin_imgflow_generate_image"],
+        )
+        self.assertEqual(
+            self._visibility_log_records(logger),
+            [
+                (
+                    "info",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "incoming",
+                        "unknown",
+                        "unknown",
+                        ["gcp_step_image_generate"],
+                    ),
+                    {},
+                ),
+                (
+                    "info",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "post_merge",
+                        "unknown",
+                        "unknown",
+                        ["gcp_step_image_edit"],
+                    ),
+                    {},
+                ),
+            ],
+        )
+
+    def test_visibility_log_uses_safe_values_when_event_methods_raise(self):
+        harness, logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(
+                ["normal_search", "gcp_step_image_generate"]
+            ),
+            system_prompt="platform prompt",
+            contexts=[],
+            prompt="message",
+            image_urls=[],
+        )
+        event = RaisingRequestEvent({"plugin_request_marker": False})
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(
+            self._visibility_log_records(logger),
+            [
+                (
+                    "info",
+                    "GCP_TOOL_VISIBILITY_FILTERED "
+                    "stage=%s platform=%s private=%s removed=%s",
+                    (
+                        "incoming",
+                        "unknown",
+                        "unknown",
+                        ["gcp_step_image_generate"],
+                    ),
                     {},
                 )
             ],
