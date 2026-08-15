@@ -1128,6 +1128,48 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
         self.assertEqual(image_path, "C:/tmp/top-level.png")
 
+    def test_edit_lazily_collects_quoted_image_when_reply_flow_was_skipped(self):
+        reference_key = "_group_chat_plus_reference_image_urls"
+        collected = []
+
+        class MaterializingImage:
+            def __init__(self, file=None):
+                self.file = file
+
+            async def convert_to_file_path(self):
+                return self.file
+
+        class FakeImageHandler:
+            @staticmethod
+            async def collect_message_images(event, message_chain, max_images):
+                collected.append((list(message_chain), max_images))
+                return [SimpleNamespace(url="C:/tmp/quoted-lazy.png")]
+
+        extract_current_image = self._compile_unbound_method(
+            "_extract_first_current_image_path",
+            {
+                "AstrMessageEvent": object,
+                "Image": MaterializingImage,
+                "ImageHandler": FakeImageHandler,
+                "PLUGIN_REFERENCE_IMAGE_URLS": reference_key,
+                "logger": RecordingLogger(),
+            },
+        )
+        quoted_reply = SimpleNamespace(chain=[])
+        event = FakeEvent([])
+        event.message_obj = SimpleNamespace(message=[quoted_reply])
+
+        image_path = asyncio.run(
+            extract_current_image(SimpleNamespace(), event)
+        )
+
+        self.assertEqual(image_path, "C:/tmp/quoted-lazy.png")
+        self.assertEqual(collected, [([quoted_reply], 1)])
+        self.assertEqual(
+            event.get_extra(reference_key),
+            ["C:/tmp/quoted-lazy.png"],
+        )
+
     def test_schema_exposes_safe_step_image_settings(self):
         for key in (
             '"enable_step_image_tools"',

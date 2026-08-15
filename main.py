@@ -8885,7 +8885,32 @@ class ChatPlus(Star):
     async def _extract_first_current_image_path(
         self, event: AstrMessageEvent
     ) -> Optional[str]:
-        for reference in event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+        references = list(
+            event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []
+        )
+        if not references and hasattr(event, "message_obj") and hasattr(
+            event.message_obj, "message"
+        ):
+            try:
+                resolved_images = await ImageHandler.collect_message_images(
+                    event,
+                    event.message_obj.message,
+                    1,
+                )
+                references = [item.url for item in resolved_images]
+                if references:
+                    event.set_extra(PLUGIN_REFERENCE_IMAGE_URLS, references)
+                    logger.info(
+                        "STEP_IMAGE_REFERENCE_LAZY_COLLECTED total=%s",
+                        len(references),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "STEP_IMAGE_REFERENCE_LAZY_COLLECT_FAILED error_type=%s",
+                    exc.__class__.__name__,
+                )
+
+        for reference in references:
             value = str(reference or "").strip()
             if not value:
                 continue
