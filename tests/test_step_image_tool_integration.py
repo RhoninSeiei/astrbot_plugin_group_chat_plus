@@ -1209,6 +1209,40 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             on_request_source.index("if not is_plugin_request"),
         )
 
+    def test_text_only_provider_reuses_core_quoted_attachment_reference(self):
+        reference_key = "_group_chat_plus_reference_image_urls"
+        capture_references = self._compile_unbound_method(
+            "_capture_step_image_request_references",
+            {
+                "AstrMessageEvent": object,
+                "ProviderRequest": object,
+                "PLUGIN_REFERENCE_IMAGE_URLS": reference_key,
+                "logger": RecordingLogger(),
+            },
+        )
+        event = FakeEvent([])
+        request = SimpleNamespace(
+            image_urls=[],
+            extra_user_content_parts=[
+                SimpleNamespace(
+                    text=(
+                        "[Image Attachment in quoted message: path "
+                        "C:/tmp/core-resolved-text-only.png]"
+                    )
+                )
+            ],
+        )
+        plugin = SimpleNamespace(
+            _can_expose_step_image_tools=lambda current_event: True
+        )
+
+        capture_references(plugin, event, request)
+
+        self.assertEqual(
+            event.get_extra(reference_key),
+            ["C:/tmp/core-resolved-text-only.png"],
+        )
+
     def test_schema_exposes_safe_step_image_settings(self):
         for key in (
             '"enable_step_image_tools"',

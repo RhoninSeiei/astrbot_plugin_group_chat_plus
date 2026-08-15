@@ -9264,6 +9264,23 @@ class ChatPlus(Star):
             seen.add(value)
             references.append(value)
 
+        attachment_prefixes = (
+            "[Image Attachment in quoted message: path ",
+            "[Image Attachment: path ",
+        )
+        for part in getattr(req, "extra_user_content_parts", None) or []:
+            text = str(getattr(part, "text", "") or "").strip()
+            if not text.endswith("]"):
+                continue
+            for prefix in attachment_prefixes:
+                if not text.startswith(prefix):
+                    continue
+                value = text[len(prefix) : -1].strip()
+                if value and value not in seen:
+                    seen.add(value)
+                    references.append(value)
+                break
+
         if not references:
             return
         event.set_extra(PLUGIN_REFERENCE_IMAGE_URLS, references)
