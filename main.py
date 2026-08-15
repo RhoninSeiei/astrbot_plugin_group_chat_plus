@@ -9245,6 +9245,33 @@ class ChatPlus(Star):
             sanitized.removed_empty_messages,
         )
 
+    def _capture_step_image_request_references(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        if not self._can_expose_step_image_tools(event):
+            return
+        if event.get_extra(PLUGIN_REFERENCE_IMAGE_URLS, []) or []:
+            return
+
+        references = []
+        seen = set()
+        for image_url in getattr(req, "image_urls", None) or []:
+            value = str(image_url or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            references.append(value)
+
+        if not references:
+            return
+        event.set_extra(PLUGIN_REFERENCE_IMAGE_URLS, references)
+        logger.info(
+            "STEP_IMAGE_REQUEST_REFERENCES_CAPTURED total=%s",
+            len(references),
+        )
+
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """
@@ -9274,6 +9301,7 @@ class ChatPlus(Star):
         )
 
         self._sanitize_llm_request_images(event, req, stage="incoming")
+        self._capture_step_image_request_references(event, req)
 
         req.func_tool, removed_step_image_tools = (
             self._filter_step_image_tools_for_request(event, req.func_tool)

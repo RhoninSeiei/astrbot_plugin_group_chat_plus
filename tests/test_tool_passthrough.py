@@ -137,6 +137,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             "_is_step_image_enabled_for_event",
             "_can_expose_step_image_tools",
             "_filter_step_image_tools_for_request",
+            "_capture_step_image_request_references",
             "on_llm_request",
         ]
         available_method_names = {
@@ -207,6 +208,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             "PLUGIN_CURRENT_MESSAGE": "plugin_current_message",
             "PLUGIN_VISIBLE_TOOL_NAMES": "plugin_visible_tool_names",
             "PLUGIN_ORIGINAL_PLUGINS_NAME": "plugin_original_plugins_name",
+            "PLUGIN_REFERENCE_IMAGE_URLS": "plugin_reference_image_urls",
             "PLUGIN_STEP_IMAGE_ACTION": "step_image_action",
             "TOOL_CALL_PROMPT": "tool call prompt",
             "logger": logger,
@@ -225,6 +227,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         harness.enabled_groups = ["10001"]
         harness.debug_mode = False
         harness._sanitize_llm_request_images = lambda event, req, stage: None
+        harness._group_llm_runtime_guard_enabled = lambda event: True
         harness._infer_step_image_action = lambda event: None
         harness._check_compliance_status = lambda: None
         harness._build_step_image_tool_directive = lambda tool_names: ""
