@@ -11,6 +11,7 @@ v1.2.0 更新：
 """
 
 import asyncio
+import inspect
 import re
 
 from astrbot.api.all import *
@@ -985,6 +986,8 @@ class ReplyHandler:
         req: ProviderRequest,
     ) -> tuple[object | None, str, str, int]:
         provider = _select_provider(event, context)
+        if inspect.isawaitable(provider):
+            provider = await provider
         if not provider:
             return None, "", "", 0
 
