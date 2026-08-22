@@ -240,7 +240,7 @@ class ToolPolicyTest(unittest.TestCase):
         self.assertIn("tool_policy = ToolPolicy", main_source)
         self.assertIn("policy_visible_tools = tool_policy.filter_tools", main_source)
         self.assertIn(
-            "tool_policy.allowed_names_for_prompt(policy_visible_tools)",
+            "ToolsReminder.inject_structured_tool_usage_hint(req.prompt)",
             main_source,
         )
         self.assertNotIn("def _filter_tool_container_for_visible_names", main_source)
@@ -271,13 +271,9 @@ class ToolPolicyTest(unittest.TestCase):
         set_visible_pos = tool_section.index(
             "event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, visible_tool_names)"
         )
-        reminder_if_pos = tool_section.index("if self.enable_tools_reminder:")
-        inject_pos = tool_section.index("ToolsReminder.inject_tools_to_message")
-
-        self.assertLess(policy_pos, reminder_if_pos)
-        self.assertLess(set_visible_pos, reminder_if_pos)
-        self.assertGreater(inject_pos, reminder_if_pos)
+        self.assertNotIn("ToolsReminder.inject_tools_to_message", tool_section)
         self.assertIn("policy_visible_tools = tool_policy.filter_tools", tool_section)
+        self.assertLess(policy_pos, set_visible_pos)
 
     def test_main_uses_step_image_config_for_tool_policy_flag(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")

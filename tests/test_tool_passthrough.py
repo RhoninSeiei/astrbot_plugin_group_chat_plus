@@ -191,6 +191,11 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
                 "gcp_step_image_edit",
             },
             "ToolPolicy": ToolPolicy,
+            "ToolsReminder": SimpleNamespace(
+                inject_structured_tool_usage_hint=lambda prompt: (
+                    str(prompt or "") + "\nSHORT STRUCTURED TOOL RULE"
+                )
+            ),
             "SystemPromptRewriter": SimpleNamespace(
                 rewrite_preserving_plugin_base=lambda current, base: SimpleNamespace(
                     merged_system_prompt=current,
@@ -226,6 +231,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         harness.step_image_config = {"image_tool_backend": "codex_oauth"}
         harness.enabled_groups = ["10001"]
         harness.debug_mode = False
+        harness.enable_tools_reminder = True
         harness._sanitize_llm_request_images = lambda event, req, stage: None
         harness._group_llm_runtime_guard_enabled = lambda event: True
         harness._infer_step_image_action = lambda event: None
@@ -276,12 +282,66 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
 
         asyncio.run(harness.on_llm_request(event, request))
 
-        self.assertEqual(request.prompt, "formal prompt")
+        self.assertEqual(
+            request.prompt,
+            "formal prompt\nSHORT STRUCTURED TOOL RULE",
+        )
         self.assertEqual(request.contexts, ["plugin context"])
         self.assertEqual(
             request.image_urls,
             ["current-a", "wait-a", "smart-a"],
         )
+
+    def test_short_tool_rule_uses_final_executable_toolset(self):
+        harness, _logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer(["normal_search"]),
+            system_prompt="platform system prompt",
+            contexts=[],
+            prompt="short retrieval prompt",
+            image_urls=[],
+        )
+        event = FakeRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": [],
+                "plugin_system_prompt": "plugin system prompt",
+                "plugin_prompt": "formal prompt",
+                "plugin_image_urls": [],
+                "plugin_func_tool": None,
+            }
+        )
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(
+            request.prompt,
+            "formal prompt\nSHORT STRUCTURED TOOL RULE",
+        )
+
+    def test_short_tool_rule_is_omitted_when_final_toolset_is_empty(self):
+        harness, _logger = self._make_on_llm_request_harness()
+        request = SimpleNamespace(
+            func_tool=FakeToolContainer([]),
+            system_prompt="platform system prompt",
+            contexts=[],
+            prompt="short retrieval prompt",
+            image_urls=[],
+        )
+        event = FakeRequestEvent(
+            {
+                "plugin_request_marker": True,
+                "plugin_contexts": [],
+                "plugin_system_prompt": "plugin system prompt",
+                "plugin_prompt": "formal prompt",
+                "plugin_image_urls": [],
+                "plugin_func_tool": None,
+            }
+        )
+
+        asyncio.run(harness.on_llm_request(event, request))
+
+        self.assertEqual(request.prompt, "formal prompt")
 
     def test_formal_reply_clones_legacy_tool_manager_before_filtering(self):
         self.assertIn("from .tool_policy import ToolPolicy", self.reply_source)
@@ -517,7 +577,10 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
 
         asyncio.run(harness.on_llm_request(event, request))
 
-        self.assertEqual(request.prompt, "restored full prompt")
+        self.assertEqual(
+            request.prompt,
+            "restored full prompt\nSHORT STRUCTURED TOOL RULE",
+        )
         self.assertEqual(
             [tool.name for tool in request.func_tool.tools],
             ["normal_search", "astrbot_plugin_imgflow_generate_image"],

@@ -264,6 +264,8 @@ class ReplyHandler:
 - 禁止输出解释、理由、标签、引号、代码块或任何额外文字
 - 这是内部 gate 请求，结果不会发送到群聊
 """
+    FINAL_GATE_MAX_HISTORY_LINES = 6
+    FINAL_GATE_MAX_CONTEXT_CHARS = 6000
     BRIEF_REPLY_MAX_CHARS_DEFAULT = 30
     BRIEF_REPLY_MAX_CHARS_DIRECT = 42
     BRIEF_REPLY_MAX_CHARS_EXPLICIT = 78
@@ -663,13 +665,135 @@ class ReplyHandler:
         sender_emphasis: str = "",
         fatigue_closing_prompt: str = "",
     ) -> str:
+        compact_message = ReplyHandler._compact_final_decision_context(
+            formatted_message
+        )
         return (
             ReplyHandler.MAIN_MODEL_FINAL_GATE_PROMPT
             + "\n"
             + sender_emphasis
             + "\n"
-            + formatted_message
+            + compact_message
             + fatigue_closing_prompt
+        )
+
+    @staticmethod
+    def _compact_final_decision_context(formatted_message: str) -> str:
+        text = str(formatted_message or "").strip()
+        limit = ReplyHandler.FINAL_GATE_MAX_CONTEXT_CHARS
+        if not text:
+            return ""
+
+        processed_marker = (
+            "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ==="
+        )
+        marker_pos = text.find(processed_marker)
+        if marker_pos < 0:
+            return text[-limit:]
+
+        history_text = text[:marker_pos].strip()
+        current_and_suffix = text[marker_pos:]
+        current_lines = current_and_suffix.splitlines()
+        current_end = len(current_lines)
+        separator_count = 0
+        for index, line in enumerate(current_lines):
+            if line.strip() == "=" * 50:
+                separator_count += 1
+                if separator_count == 2:
+                    current_end = index + 1
+                    break
+
+        window_start_marker = (
+            "--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---"
+        )
+        window_end_marker = "--- 以上为紧接着的追加消息 ---"
+        try:
+            window_start = current_lines.index(window_start_marker, current_end)
+            window_end = current_lines.index(window_end_marker, window_start + 1)
+            current_end = window_end + 1
+        except ValueError:
+            pass
+        current_section = "\n".join(current_lines[:current_end]).strip()
+
+        history_lines = [
+            line
+            for line in history_text.splitlines()
+            if line.strip() and line.strip() != "=" * 50
+        ]
+        recent_history = history_lines[-ReplyHandler.FINAL_GATE_MAX_HISTORY_LINES :]
+        compact_parts = ["=== 最近群聊上下文 ==="]
+        compact_parts.extend(recent_history)
+        compact_parts.append("")
+        compact_parts.append(current_section)
+        compact = "\n".join(compact_parts).strip()
+        if len(compact) <= limit:
+            return compact
+
+        current_budget = max(0, limit - len("=== 最近群聊上下文 ===\n"))
+        return "=== 最近群聊上下文 ===\n" + current_section[-current_budget:]
+
+    @staticmethod
+    async def run_final_decision_gate(
+        *,
+        event: AstrMessageEvent,
+        context: Context,
+        formatted_message: str,
+        image_urls: list | None = None,
+        include_sender_info: bool = True,
+        conversation_fatigue_info: dict | None = None,
+    ) -> bool:
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name()
+        sender_emphasis = ""
+        if include_sender_info:
+            if sender_name:
+                sender_emphasis = (
+                    f"[系统信息-当前对话对象] {sender_name}（ID:{sender_id}）\n"
+                    f"只判断是否需要回复 {sender_name} 的当前消息，不要混淆其他成员。"
+                )
+            else:
+                sender_emphasis = (
+                    f"[系统信息-当前对话对象] 用户ID:{sender_id}\n"
+                    "只判断是否需要回复该用户的当前消息。"
+                )
+
+        fatigue_closing_prompt = ""
+        if conversation_fatigue_info and conversation_fatigue_info.get(
+            "should_add_closing_hint", False
+        ):
+            fatigue_level = conversation_fatigue_info.get("fatigue_level", "none")
+            consecutive_replies = conversation_fatigue_info.get(
+                "consecutive_replies", 0
+            )
+            fatigue_closing_prompt = (
+                "\n[连续对话状态] "
+                f"level={fatigue_level}, rounds={consecutive_replies}。"
+                "仅将该状态用于判断本轮是否仍值得回复。"
+            )
+
+        system_prompt = ""
+        try:
+            persona = await resolve_session_persona(context, event=event)
+            system_prompt = persona.get("prompt", "")
+        except Exception as exc:
+            logger.warning("[主模型最终判断] 获取人格失败，使用空人格: %s", exc)
+
+        compact_message = ReplyHandler._compact_final_decision_context(
+            formatted_message
+        )
+        logger.info(
+            "[主模型最终判断] 精简上下文: %s -> %s 字符",
+            len(formatted_message or ""),
+            len(compact_message),
+        )
+        return await ReplyHandler._run_final_decision_gate(
+            event=event,
+            context=context,
+            formatted_message=compact_message,
+            sender_emphasis=sender_emphasis,
+            system_prompt=system_prompt,
+            image_urls=image_urls,
+            fatigue_closing_prompt=fatigue_closing_prompt,
         )
 
     @staticmethod

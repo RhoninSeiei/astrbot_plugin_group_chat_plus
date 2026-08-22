@@ -5774,6 +5774,70 @@ class ChatPlus(Star):
             emoji_marker_applied,  # 🆕 v1.2.0: 表情包标记是否已添加
         )
 
+    def _clear_pre_decision_state(self, chat_key: str) -> None:
+        if hasattr(self, "_pre_decision_context_by_chat"):
+            self._pre_decision_context_by_chat.pop(chat_key, None)
+        if hasattr(self, "_ai_decision_skipped"):
+            self._ai_decision_skipped.discard(chat_key)
+
+    async def _handle_main_model_final_decline(
+        self,
+        event: AstrMessageEvent,
+        formatted_context: str,
+        platform_name: str,
+        is_private: bool,
+        chat_id: str,
+        current_message_cache: dict | None,
+        message_id_for_reply: str | None,
+    ) -> None:
+        logger.info("主模型最终判断: 不应该回复此消息")
+
+        pending_final_decision = event.get_extra(
+            PLUGIN_PENDING_MAIN_MODEL_DECISION, {}
+        ) or {}
+        if self.humanize_mode_enabled and pending_final_decision:
+            try:
+                pending_chat_key = pending_final_decision.get("chat_key") or (
+                    ProbabilityManager.get_chat_key(
+                        platform_name, is_private, chat_id
+                    )
+                )
+                await HumanizeModeManager.record_decision(
+                    chat_key=pending_chat_key,
+                    decision=False,
+                    reason="主模型最终判断不需要回复",
+                    message_preview=pending_final_decision.get(
+                        "message_preview",
+                        formatted_context[:50] if formatted_context else "",
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(f"[拟人增强] 记录主模型最终判断失败: {exc}")
+
+        declined_message_cache = current_message_cache
+        if not declined_message_cache and message_id_for_reply:
+            declined_message_cache = self._message_cache_snapshots.get(
+                message_id_for_reply
+            )
+
+        if declined_message_cache:
+            self.cache_manager.add_to_cache(
+                chat_id, declined_message_cache, source="主模型最终判断过滤"
+            )
+            logger.info("📦 主模型最终判断: 不回复此消息，已缓存消息，等待后续转正")
+        else:
+            logger.info("📦 主模型最终判断: 不回复此消息，无待缓存数据")
+
+        if message_id_for_reply:
+            self._message_cache_snapshots.pop(message_id_for_reply, None)
+        event.call_llm = True
+        try:
+            event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
+            event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, None)
+            event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
+        except Exception:
+            pass
+
     async def _generate_and_send_reply(
         self,
         event: AstrMessageEvent,
@@ -5820,6 +5884,44 @@ class ChatPlus(Star):
         # 如果image_urls为None，初始化为空列表
         if image_urls is None:
             image_urls = []
+
+        enable_final_decision_gate = (
+            self.enable_main_model_final_decision
+            and not is_at_message
+            and (not has_trigger_keyword or self.keyword_smart_mode)
+        )
+        if enable_final_decision_gate:
+            should_generate_reply = await ReplyHandler.run_final_decision_gate(
+                event=event,
+                context=self.context,
+                formatted_message=formatted_context,
+                image_urls=image_urls,
+                include_sender_info=self.include_sender_info,
+                conversation_fatigue_info=conversation_fatigue_info,
+            )
+            if not should_generate_reply:
+                logger.info(
+                    "[主模型最终判断] 当前消息无需回复，跳过正式回复扩展与生成"
+                )
+                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                ckey = ProbabilityManager.get_chat_key(
+                    platform_name, is_private, chat_id
+                )
+                self._clear_pre_decision_state(ckey)
+                await self._handle_main_model_final_decline(
+                    event=event,
+                    formatted_context=formatted_context,
+                    platform_name=platform_name,
+                    is_private=is_private,
+                    chat_id=chat_id,
+                    current_message_cache=current_message_cache,
+                    message_id_for_reply=message_id_for_reply,
+                )
+                return
+            logger.info(
+                "[主模型最终判断] 当前消息值得回复，开始构造正式回复上下文"
+            )
+
         # 注入记忆
         final_message = formatted_context
         try:
@@ -5937,21 +6039,6 @@ class ChatPlus(Star):
             event.set_extra(PLUGIN_VISIBLE_TOOL_NAMES, None)
             logger.warning(f"记录提示工具列表失败: {e}")
 
-        if self.enable_tools_reminder:
-            if self.debug_mode:
-                logger.info("【步骤12】注入工具信息")
-
-            old_len = len(final_message)
-            final_message = ToolsReminder.inject_tools_to_message(
-                final_message,
-                self.context,
-                tool_policy.allowed_names_for_prompt(policy_visible_tools),
-            )
-            if self.debug_mode:
-                logger.info(
-                    f"  已注入工具信息,长度增加: {len(final_message) - old_len} 字符"
-                )
-
         # 🆕 v1.0.2: 注入情绪状态（如果启用）
         if self.mood_enabled and self.mood_tracker:
             if self.debug_mode:
@@ -5992,12 +6079,6 @@ class ChatPlus(Star):
         ai_error_flag = False
         message_id_for_error = message_id_for_reply
 
-        enable_final_decision_gate = (
-            self.enable_main_model_final_decision
-            and not is_at_message
-            and (not has_trigger_keyword or self.keyword_smart_mode)
-        )
-
         try:
             reply_result = await ReplyHandler.generate_reply(
                 event,
@@ -6010,7 +6091,7 @@ class ChatPlus(Star):
                 include_timestamp=self.include_timestamp,  # 🔧 v1.2.0: 补传时间戳开关，确保contexts格式与prompt一致
                 history_messages=history_messages,  # 🔧 修复：传递历史消息用于构建contexts
                 conversation_fatigue_info=conversation_fatigue_info,  # 🆕 v1.2.0: 传递疲劳信息
-                enable_final_decision_gate=enable_final_decision_gate,
+                enable_final_decision_gate=False,
             )
         except Exception as e:
             ai_error_flag = True
@@ -6054,52 +6135,15 @@ class ChatPlus(Star):
             event.get_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, False)
         )
         if main_model_declined:
-            logger.info("主模型最终判断: 不应该回复此消息")
-
-            pending_final_decision = event.get_extra(
-                PLUGIN_PENDING_MAIN_MODEL_DECISION, {}
-            ) or {}
-            if self.humanize_mode_enabled and pending_final_decision:
-                try:
-                    pending_chat_key = pending_final_decision.get("chat_key") or (
-                        ProbabilityManager.get_chat_key(
-                            platform_name, is_private, chat_id
-                        )
-                    )
-                    await HumanizeModeManager.record_decision(
-                        chat_key=pending_chat_key,
-                        decision=False,
-                        reason="主模型最终判断不需要回复",
-                        message_preview=pending_final_decision.get(
-                            "message_preview", formatted_context[:50] if formatted_context else ""
-                        ),
-                    )
-                except Exception as e:
-                    logger.warning(f"[拟人增强] 记录主模型最终判断失败: {e}")
-
-            declined_message_cache = current_message_cache
-            if not declined_message_cache and message_id_for_reply:
-                declined_message_cache = self._message_cache_snapshots.get(
-                    message_id_for_reply
-                )
-
-            if declined_message_cache:
-                self.cache_manager.add_to_cache(
-                    chat_id, declined_message_cache, source="主模型最终判断过滤"
-                )
-                logger.info("📦 主模型最终判断: 不回复此消息，已缓存消息，等待后续转正")
-            else:
-                logger.info("📦 主模型最终判断: 不回复此消息，无待缓存数据")
-
-            if message_id_for_reply:
-                self._message_cache_snapshots.pop(message_id_for_reply, None)
-            event.call_llm = True
-            try:
-                event.set_extra(PLUGIN_DIRECT_REPLY_MODE, None)
-                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, None)
-                event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
-            except Exception:
-                pass
+            await self._handle_main_model_final_decline(
+                event=event,
+                formatted_context=formatted_context,
+                platform_name=platform_name,
+                is_private=is_private,
+                chat_id=chat_id,
+                current_message_cache=current_message_cache,
+                message_id_for_reply=message_id_for_reply,
+            )
             return
 
         # 📝 注意：错字模拟和延迟模拟已迁移到 @on_decorating_result() 钩子中处理
@@ -9493,6 +9537,8 @@ class ChatPlus(Star):
         )
         ToolPolicy.filter_tool_container_for_visible_names(req.func_tool, visible_tool_names)
         current_tools = _get_compatible_tools(req.func_tool)
+        if current_tools and self.enable_tools_reminder:
+            req.prompt = ToolsReminder.inject_structured_tool_usage_hint(req.prompt)
         if visible_tool_names is not None:
             _log_tool_visibility_delta(
                 visible_tool_names,

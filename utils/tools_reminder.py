@@ -187,10 +187,23 @@ class ToolsReminder:
             return None
 
     @staticmethod
+    def inject_structured_tool_usage_hint(original_message: str) -> str:
+        hint = (
+            "=== 工具使用规则 ===\n"
+            "需要外部信息或操作时调用请求中提供的工具，并依据工具结果回复。"
+            "禁止输出工具协议、调用参数、内部过程或未经工具确认的结果。"
+        )
+        message = str(original_message or "")
+        if hint in message:
+            return message
+        return message + "\n\n" + hint
+
+    @staticmethod
     def inject_tools_to_message(
         original_message: str,
         context: Context,
         allowed_tool_names: Optional[List[str]] = None,
+        structured_tools_available: bool = False,
     ) -> str:
         """
         将工具信息注入到消息
@@ -199,11 +212,17 @@ class ToolsReminder:
             original_message: 原始消息
             context: Context对象
             allowed_tool_names: 允许的工具名称列表，None表示不过滤
+            structured_tools_available: 请求是否同时携带结构化工具定义
 
         Returns:
             注入工具信息后的文本
         """
         try:
+            if structured_tools_available:
+                return ToolsReminder.inject_structured_tool_usage_hint(
+                    original_message
+                )
+
             # 获取工具列表
             tools = ToolsReminder.get_available_tools(context)
 
