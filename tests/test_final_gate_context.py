@@ -1,5 +1,6 @@
 import ast
 import copy
+import re
 from pathlib import Path
 import unittest
 
@@ -37,10 +38,9 @@ def _load_final_gate_helpers():
 
     class FakeReplyHandler:
         MAIN_MODEL_FINAL_GATE_PROMPT = "FINAL GATE"
-        FINAL_GATE_MAX_HISTORY_LINES = 6
         FINAL_GATE_MAX_CONTEXT_CHARS = 6000
 
-    namespace = {"ReplyHandler": FakeReplyHandler}
+    namespace = {"ReplyHandler": FakeReplyHandler, "re": re}
     exec(compile(module, "reply_handler.py", "exec"), namespace)
     FakeReplyHandler._compact_final_decision_context = staticmethod(
         namespace["_compact_final_decision_context"]
@@ -80,7 +80,7 @@ class FinalGateContextTest(unittest.TestCase):
 
         self.assertIn("历史消息6", prompt)
         self.assertIn("历史消息11", prompt)
-        self.assertNotIn("历史消息0", prompt)
+        self.assertIn("历史消息0", prompt)
         self.assertIn("请处理这条当前消息", prompt)
         self.assertIn("WAIT WINDOW FOLLOWUP", prompt)
         self.assertIn("CURRENT SENDER", prompt)
@@ -101,6 +101,64 @@ class FinalGateContextTest(unittest.TestCase):
         self.assertLessEqual(len(compact), reply_handler.FINAL_GATE_MAX_CONTEXT_CHARS)
         self.assertNotIn("old-prefix", compact)
         self.assertTrue(compact.endswith("-current-tail"))
+
+    def test_budget_keeps_whole_recent_messages_in_order(self):
+        handler = _load_final_gate_helpers()
+        current = (
+            "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n"
+            + "=" * 50 + "\nCURRENT\n" + "=" * 50 + "\n"
+            "--- 以下是你收到这条消息后，同一用户或其他用户紧接着又发的消息 ---\n"
+            "FOLLOWUP\n--- 以上为紧接着的追加消息 ---"
+        )
+        newest = "成员(ID:3): newest\nsecond line\n\nlast line"
+        middle = "成员(ID:2): middle"
+        prefix = "=== 最近群聊上下文 ===\n"
+        expected = prefix + middle + "\n" + newest + "\n\n" + current
+        handler.FINAL_GATE_MAX_CONTEXT_CHARS = len(expected)
+        formatted = "成员(ID:1): " + "old" * 2000 + "\n" + middle + "\n" + newest + "\n" + current
+        self.assertEqual(handler._compact_final_decision_context(formatted), expected)
+        handler.FINAL_GATE_MAX_CONTEXT_CHARS -= 1
+        compact = handler._compact_final_decision_context(formatted)
+        self.assertNotIn(middle, compact)
+        self.assertIn(newest, compact)
+        self.assertTrue(compact.endswith(current))
+        self.assertLessEqual(len(compact), handler.FINAL_GATE_MAX_CONTEXT_CHARS)
+
+    def test_oversized_current_section_remains_bounded(self):
+        handler = _load_final_gate_helpers()
+        current = "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\n" + "x" * 7000 + "TAIL"
+        compact = handler._compact_final_decision_context("成员(ID:1): OLD\n" + current)
+        self.assertEqual(len(compact), 6000)
+        self.assertTrue(compact.endswith("TAIL"))
+        self.assertNotIn("OLD", compact)
+
+    def test_unidentified_multiline_history_is_never_partially_kept(self):
+        handler = _load_final_gate_helpers()
+        current = "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\nCURRENT"
+        history = "anonymous first line\nsecond line\nlast line"
+        formatted = history + "\n" + current
+        self.assertIn(history, handler._compact_final_decision_context(formatted))
+        handler.FINAL_GATE_MAX_CONTEXT_CHARS = len(current) + 35
+        compact = handler._compact_final_decision_context(formatted)
+        self.assertNotIn("last line", compact)
+        self.assertTrue(compact.endswith(current))
+
+    def test_timestamp_only_and_cached_bot_messages_preserve_boundaries(self):
+        handler = _load_final_gate_helpers()
+        current = "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\nCURRENT"
+        recent = "【📦近期未回复】 [2026-09-05 周六 12:00:00] anonymous\ncontinuation"
+        bot = "【禁止重复-你的历史回复】: prior reply\ncontinuation"
+        expected = "=== 最近群聊上下文 ===\n" + bot + "\n" + recent + "\n\n" + current
+        handler.FINAL_GATE_MAX_CONTEXT_CHARS = len(expected)
+        formatted = "[2026-09-05 周六 11:00:00] " + "x" * 6000 + "\n" + bot + "\n" + recent + "\n" + current
+        self.assertEqual(handler._compact_final_decision_context(formatted), expected)
+
+    def test_does_not_skip_oversized_newest_message_to_include_older_one(self):
+        handler = _load_final_gate_helpers()
+        current = "=== 以上全部是历史消息，你已经处理过了，不要重复回答 ===\nCURRENT"
+        formatted = "成员(ID:1): OLD\n成员(ID:2): " + "x" * 6000 + "\n" + current
+        compact = handler._compact_final_decision_context(formatted)
+        self.assertEqual(compact, "=== 最近群聊上下文 ===\n" + current)
 
 
 if __name__ == "__main__":

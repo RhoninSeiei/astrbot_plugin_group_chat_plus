@@ -264,7 +264,6 @@ class ReplyHandler:
 - 禁止输出解释、理由、标签、引号、代码块或任何额外文字
 - 这是内部 gate 请求，结果不会发送到群聊
 """
-    FINAL_GATE_MAX_HISTORY_LINES = 6
     FINAL_GATE_MAX_CONTEXT_CHARS = 6000
     BRIEF_REPLY_MAX_CHARS_DEFAULT = 30
     BRIEF_REPLY_MAX_CHARS_DIRECT = 42
@@ -715,22 +714,44 @@ class ReplyHandler:
             pass
         current_section = "\n".join(current_lines[:current_end]).strip()
 
-        history_lines = [
-            line
-            for line in history_text.splitlines()
-            if line.strip() and line.strip() != "=" * 50
-        ]
-        recent_history = history_lines[-ReplyHandler.FINAL_GATE_MAX_HISTORY_LINES :]
-        compact_parts = ["=== 最近群聊上下文 ==="]
-        compact_parts.extend(recent_history)
-        compact_parts.append("")
-        compact_parts.append(current_section)
-        compact = "\n".join(compact_parts).strip()
-        if len(compact) <= limit:
-            return compact
+        prefix = "=== 最近群聊上下文 ===\n"
+        current_budget = max(0, limit - len(prefix))
+        if len(current_section) > current_budget:
+            return (prefix + current_section[-current_budget:])[-limit:]
 
-        current_budget = max(0, limit - len("=== 最近群聊上下文 ===\n"))
-        return "=== 最近群聊上下文 ===\n" + current_section[-current_budget:]
+        # History messages may contain newlines. Use the formatter's sender or
+        # timestamp prefixes, rather than treating each content line as a message.
+        history_text = history_text.removesuffix("=" * 50).rstrip()
+        starts = list(re.finditer(
+            r"(?m)^(?:【📦近期未回复】 )?(?:"
+            r"\[\d{4}-\d{2}-\d{2} [^\]\n]+\] "
+            r"|[^\n]*?\(ID:[^\n)]+\): "
+            r"|【禁止重复-你的历史回复】:)",
+            history_text,
+        ))
+        if starts:
+            messages = [
+                history_text[start.start():end].rstrip()
+                for start, end in zip(
+                    starts, [match.start() for match in starts[1:]] + [len(history_text)]
+                )
+            ]
+        else:
+            # With both identity and timestamps disabled there is no reliable
+            # message delimiter. Keep or omit the entire block without splitting it.
+            messages = [history_text] if history_text else []
+
+        remaining = limit - len(prefix) - len(current_section) - 1
+        recent_history = []
+        for message in reversed(messages):
+            cost = len(message) + 1
+            if cost > remaining:
+                break
+            recent_history.append(message)
+            remaining -= cost
+        if not recent_history:
+            return prefix + current_section
+        return prefix + "\n".join(reversed(recent_history)) + "\n\n" + current_section
 
     @staticmethod
     async def run_final_decision_gate(
