@@ -669,6 +669,9 @@ class DecisionAI:
                     contexts=[],
                     image_urls=image_urls if image_urls else [],
                     func_tool=None,
+                    tool_choice="none",
+                    oauth_web_search="disabled",
+                    retry_rate_limits=False,
                     system_prompt=persona_prompt,  # 包含人格设定
                 )
                 return response.completion_text
@@ -777,6 +780,9 @@ class DecisionAI:
                     contexts=[],
                     image_urls=[],
                     func_tool=None,
+                    tool_choice="none",
+                    oauth_web_search="disabled",
+                    retry_rate_limits=False,
                     system_prompt=persona_prompt,
                 )
                 return response.completion_text

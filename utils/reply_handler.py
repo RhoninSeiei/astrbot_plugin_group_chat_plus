@@ -582,6 +582,9 @@ class ReplyHandler:
                 func_tool_manager=func_tools_mgr,
                 tool_set=plugin_tool_set,
                 session_id=event.session_id,
+                oauth_web_search="disabled",
+                retry_rate_limits=False,
+                fallback_on_rate_limit=False,
                 image_urls=image_urls,
                 contexts=contexts,
                 system_prompt=system_prompt,
@@ -1166,8 +1169,13 @@ class ReplyHandler:
                     tool_calls_result=req.tool_calls_result,
                     model=req.model if idx == 0 else None,
                     extra_user_content_parts=req.extra_user_content_parts,
+                    tool_choice="none",
+                    oauth_web_search="disabled",
+                    retry_rate_limits=False,
                 )
                 last_provider_id = candidate_id
+                if llm_resp and str(getattr(llm_resp, "status_code", None)) == "429":
+                    return llm_resp, primary_provider_id, candidate_id, len(fallback_providers)
                 if (
                     llm_resp
                     and getattr(llm_resp, "role", "assistant") == "err"
@@ -1192,6 +1200,18 @@ class ReplyHandler:
                     )
                 return llm_resp, primary_provider_id, candidate_id, len(fallback_providers)
             except Exception as exc:  # noqa: BLE001
+                # A rate limit must not trigger another account/provider request.
+                response = getattr(exc, "response", None)
+                if any(
+                    str(value) == "429"
+                    for value in (
+                        getattr(exc, "status_code", None),
+                        getattr(exc, "status", None),
+                        getattr(exc, "code", None),
+                        getattr(response, "status_code", None),
+                    )
+                ):
+                    raise
                 last_exception = exc
                 logger.warning(
                     "Chat Model %s request error: %s",

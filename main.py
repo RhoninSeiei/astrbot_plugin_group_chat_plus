@@ -9706,6 +9706,8 @@ class ChatPlus(Star):
         event: AstrMessageEvent,
         reason_code: str,
     ) -> str:
+        if reason_code in {"provider_rate_limit", "provider_quota"}:
+            return DEFAULT_PERSONA_FAILURE_REPLY
         provider_id = self._resolve_persona_failure_provider_id(event)
         if not provider_id:
             logger.warning(
@@ -9738,6 +9740,8 @@ class ChatPlus(Star):
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=build_persona_failure_prompt(reason_code),
+                    oauth_web_search="disabled",
+                    retry_rate_limits=False,
                     contexts=[],
                     image_urls=[],
                     tools=None,

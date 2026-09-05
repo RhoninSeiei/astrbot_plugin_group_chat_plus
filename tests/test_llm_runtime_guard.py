@@ -195,6 +195,12 @@ class RawLLMFailureClassificationTest(unittest.TestCase):
             "provider_timeout",
         )
 
+    def test_classifies_rate_limits_without_matching_normal_numbers(self):
+        for detail in ("RateLimitError: busy", "Error code: 429", "HTTP 429", "status_code=429"):
+            with self.subTest(detail=detail):
+                self.assertEqual(self.guard.classify_raw_llm_failure("LLM 响应错误: " + detail), "provider_rate_limit")
+        self.assertIsNone(self.guard.classify_raw_llm_failure("第429条消息"))
+
     def test_classifies_invalid_history_image(self):
         raw = (
             "LLM 响应错误: Invalid 'input[32].content[1].image_url'. "

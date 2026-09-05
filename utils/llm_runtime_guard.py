@@ -169,6 +169,11 @@ def classify_raw_llm_failure(text: str) -> str | None:
         return None
 
     lowered = value.lower()
+    if "ratelimiterror" in lowered or re.search(
+        r"\b(?:http|error(?:\s+code)?|status(?:_code)?)\s*[:=]?\s*429\b",
+        lowered,
+    ):
+        return "provider_rate_limit"
     if "image_url" in lowered and (
         "expected a valid url" in lowered or "invalid format" in lowered
     ):

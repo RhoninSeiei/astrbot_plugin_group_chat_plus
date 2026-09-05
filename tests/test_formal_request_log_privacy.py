@@ -124,6 +124,10 @@ class FormalRequestLogPrivacyTest(unittest.TestCase):
         )
 
         self.assertEqual(result["image_urls"], [secret_url, secret_base64])
+        self.assertEqual(result["oauth_web_search"], "disabled")
+        self.assertIs(result["retry_rate_limits"], False)
+        self.assertIs(result["fallback_on_rate_limit"], False)
+        self.assertNotIn("tool_choice", result)
         self.assertEqual(event.extras["image_urls"], [secret_url, secret_base64])
         rendered = repr(logger.records)
         self.assertNotIn("private.example", rendered)
