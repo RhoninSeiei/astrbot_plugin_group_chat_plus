@@ -85,6 +85,45 @@ def raising_factory(error):
 
 
 class GroupImageServiceTest(unittest.TestCase):
+    def planner_service(self, provider_type, *, grok=None, codex=None):
+        provider = SimpleNamespace(
+            meta=lambda: SimpleNamespace(type=provider_type),
+            get_model=lambda: "grok-4.6" if provider_type.startswith("grok") else "gpt-6-astra",
+        )
+        return GroupImageService(
+            context=SimpleNamespace(get_provider_by_id=lambda _: provider),
+            config={"image_tool_backend": "codex_oauth", "image_planner_provider_id": "selected/planner"},
+            output_dir=Path("unused"),
+            grok_factory=lambda **kwargs: grok or RecordingBackend("grok_oauth"),
+            codex_factory=codex or (lambda **kwargs: RecordingBackend("codex_oauth")),
+        )
+
+    def test_planner_type_automatically_selects_grok_backend(self):
+        backend = RecordingBackend("grok_oauth")
+        service = self.planner_service("grok_oauth_chat_completion", grok=backend)
+        self.assertEqual(service.backend_name(), "grok_oauth")
+        result = asyncio.run(service.generate(prompt="cat", size="16:9"))
+        self.assertEqual(result.backend, "grok_oauth")
+        self.assertEqual(backend.calls, [("generate", {"prompt": "cat", "size": "16:9"})])
+        asyncio.run(service.edit(prompt="change subject", image_path="original.png"))
+        self.assertEqual(backend.calls[-1], ("edit", {"prompt": "change subject", "image_path": "original.png"}))
+
+    def test_codex_planner_uses_selected_provider_and_model(self):
+        seen = []
+        def factory(**kwargs):
+            seen.append(kwargs["config"])
+            return RecordingBackend("codex_oauth")
+        service = self.planner_service("openai_oauth_chat_completion", codex=factory)
+        asyncio.run(service.generate(prompt="cat"))
+        self.assertEqual(seen[0]["codex_oauth_image_provider_id"], "selected/planner")
+        self.assertEqual(seen[0]["codex_oauth_image_model"], "gpt-6-astra")
+        self.assertNotIn("codex_oauth_image_model", service.config)
+
+    def test_unsupported_planner_does_not_fallback_to_codex(self):
+        service = self.planner_service("unknown_provider")
+        with self.assertRaises(GroupImageConfigError):
+            asyncio.run(service.generate(prompt="cat"))
+
     def make_service(
         self,
         *,

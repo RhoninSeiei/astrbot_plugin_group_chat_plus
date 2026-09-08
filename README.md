@@ -163,6 +163,16 @@
 
 #### 群聊图片后端配置
 
+设置 `image_planner_provider_id` 可按图片规划模型自动选择后端：选择 Codex OAuth Provider 时使用 Codex，选择 Grok OAuth Provider 时使用 Grok Imagine。群聊继续使用同一组生图和改图工具，无需点名后端。该设置优先于旧的 `image_tool_backend`；留空保留原有配置和默认行为。
+
+例如，设置 `image_planner_provider_id=grok_oauth/grok-4.6` 后，图片接口使用 `grok_image_model=grok-imagine-image-2.0`。`grok-4.6` 是规划 Provider 的文本模型，不会被传入 Imagine 图片模型字段。选择 Codex Provider 时，使用该 Provider 当前模型，覆盖旧的 `codex_oauth_image_model`。群聊正式回复模型及 UMO 规则不受这项配置影响。
+
+Grok 默认比例为 `1:1`、分辨率为 `1k`，可配置 `grok_image_aspect_ratio`、`grok_image_resolution` 和 `grok_image_timeout`。比例支持 `auto`、`1:1`、`3:2`、`2:3`、`4:3`、`3:4`、`16:9`、`9:16`、`21:9`、`5:2`；分辨率支持 `1k`、`2k`。超时默认 180 秒，允许 1 至 600 秒。配置图片规划 Provider 后，上层工具超时覆盖 Codex 和 Grok 两者的预算，并为 Grok 预留 10 秒本地处理与发送时间；实际 SDK 请求仍使用所选后端自己的超时。启动时不依赖 Provider 加载顺序。
+
+Grok 生图及编辑依赖已安装、已授权且启用图片能力的 `astrbot_plugin_grok_oauth`。适配器通过其公共 `generate_image()` SDK 调用，不保存凭据、不访问自定义图片 API 地址、不回退到 API Key。一次调用生成一张图片；编辑复用当前消息或引用消息中的第一张原图，最多 20 MiB，支持 PNG、JPEG、WebP、GIF，不用识图文字代替原图。429、超时或结果未知时不自动重试，也不跨后端切换。
+
+本插件图片工具可用于当前群聊时，本功能统一使用 `gcp_step_image_generate` 与 `gcp_step_image_edit` 入口，Grok 插件的原生图片工具会从该请求中排除，避免绕过规划配置；共享注册表、其他工具及其他群聊保持原状。
+
 新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`，默认 Provider ID 为 `openai_oauth/gpt-5.6-sol`。`image_tool_backend_config_version` 是内部兼容标记，schema 默认值为 `0`。插件首次构造时，标记为 `0` 且 `config.first_deploy=True` 的新安装保留 `codex_oauth`；标记为 `0` 的现有旧配置会选择 `stepfun`，避免 AstrBot 自动补齐 schema 默认值后改变原有行为。迁移选择会立即写入配置，并把标记更新为 `1`；保存失败时当前运行期仍使用本次选定的后端。需要切回 StepFun 时，设置 `image_tool_backend=stepfun`。
 
 Codex OAuth 配置只保存 Provider ID、Codex 主模型、尺寸和超时。AstrBot Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求，Group Chat Plus 只调用公共 `generate_image()` 接口。文生图需要 Provider 声明 `image_generate`，修图额外需要 `image_edit`。Codex OAuth 尺寸采用 `width x height`（宽x高），可选 `1024x1024`、`1536x1024`、`1024x1536`；StepFun 继续采用 `height x width`（高x宽）。

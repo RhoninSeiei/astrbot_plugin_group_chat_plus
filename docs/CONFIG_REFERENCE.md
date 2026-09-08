@@ -127,6 +127,11 @@ StepImage 工具可见性：模型推理前，私聊和未授权群聊的 `Provi
 | `image_to_text_timeout` | int | `60` | 图片处理API调用超时（秒） |
 | `max_images_per_message` | int | `10` | 单条消息最大处理图片数量（1-50） |
 | `enable_step_image_tools` | bool | `false` | 启用群聊生图与修图工具。仅在启用本插件的群聊正式回复阶段可用 |
+| `image_planner_provider_id` | string | `""` | 图片规划 Provider。按提供商类型自动选择 Codex OAuth 或 Grok OAuth 后端；留空保留旧图片配置，独立于群聊 UMO 模型 |
+| `grok_image_model` | string | `"grok-imagine-image-2.0"` | Grok 图片接口的 Imagine 模型，不填 `grok-4.6` 等文本模型 |
+| `grok_image_aspect_ratio` | string | `"1:1"` | Grok 默认比例，支持 auto、1:1、3:2、2:3、4:3、3:4、16:9、9:16、21:9、5:2 |
+| `grok_image_resolution` | string | `"1k"` | Grok 图片分辨率，可选 1k、2k |
+| `grok_image_timeout` | int | `180` | Grok SDK 总超时，范围 1 至 600 秒，不进行自动重试或跨后端回退 |
 | `image_tool_backend` | string | `"codex_oauth"` | 图片工具后端，可选 `codex_oauth` 或 `stepfun`。新安装默认使用 Codex OAuth |
 | `image_tool_backend_config_version` | int | `0` | 内部兼容标记。`0` 表示首次构造时执行迁移，迁移完成后写为 `1`；无需手动修改 |
 | `codex_oauth_image_provider_id` | string | `"openai_oauth/gpt-5.6-sol"` | Codex OAuth 图片 Provider ID。文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit` |

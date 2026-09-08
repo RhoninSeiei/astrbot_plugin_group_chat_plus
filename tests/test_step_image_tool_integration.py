@@ -518,6 +518,24 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIs(filtered, original)
         self.assertEqual(removed, [])
 
+    def test_planner_routing_hides_native_grok_tools_without_mutating_registry(self):
+        harness = self._make_visibility_harness()
+        harness.step_image_config["image_planner_provider_id"] = "selected/planner"
+        event = FakeStepImageVisibilityEvent("aiocqhttp:GroupMessage:10001", is_private=False)
+        names = ["normal_search", "gcp_step_image_generate", "gcp_step_image_edit",
+                 "grok_image_generate", "grok_image_edit"]
+        original = FakeToolContainer(names)
+        filtered, removed = harness._filter_step_image_tools_for_request(event, original)
+        self.assertEqual({t.name for t in filtered.tools}, set(names[:3]))
+        self.assertEqual(set(removed), set(names[3:]))
+        self.assertEqual([t.name for t in original.tools], names)
+        harness.step_image_config.pop("image_planner_provider_id")
+        filtered, _ = harness._filter_step_image_tools_for_request(event, original)
+        self.assertEqual({t.name for t in filtered.tools}, set(names[:3]))
+        outside = FakeStepImageVisibilityEvent("aiocqhttp:GroupMessage:20002", is_private=False)
+        filtered, _ = harness._filter_step_image_tools_for_request(outside, original)
+        self.assertIn("grok_image_generate", {t.name for t in filtered.tools})
+
     def test_request_visibility_removes_step_image_tools_for_denied_events(self):
         cases = (
             ("aiocqhttp:GroupMessage:20002", False),
@@ -776,10 +794,17 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         asyncio.run(initialize(plugin))
 
         self.assertEqual(state.install_calls, [300])
-        self.assertIs(
-            plugin._group_image_tool_timeout_override_handle,
-            state.installed_handle,
-        )
+        self.assertIs(plugin._group_image_tool_timeout_override_handle, state.installed_handle)
+
+    def test_planner_timeout_is_installed_before_providers_exist(self):
+        initialize, plugin, state = self._make_initialize_harness()
+        plugin.step_image_config["image_planner_provider_id"] = "late-loaded/planner"
+        def premature_lookup():
+            raise AssertionError("Providers are initialized after plugins")
+        plugin._get_step_image_service = premature_lookup
+        asyncio.run(initialize(plugin))
+        self.assertEqual(state.install_calls, [300])
+        self.assertIs(plugin._group_image_tool_timeout_override_handle, state.installed_handle)
 
     def test_early_initialize_failures_do_not_install_timeout_override(self):
         for stage in ("session", "fingerprint", "metadata"):
@@ -1686,7 +1711,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
     def test_tool_description_requires_model_refined_prompt(self):
         self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
         self.assertEqual(
-            self.main_source.count("Codex OAuth 后端最多 2048 个字符"), 2
+            self.main_source.count("OAuth 后端最多 2048 个字符"), 2
         )
         self.assertEqual(
             self.main_source.count("StepFun 后端最多 512 个字符"), 2

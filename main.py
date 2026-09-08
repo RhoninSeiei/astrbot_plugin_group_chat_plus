@@ -721,6 +721,11 @@ class ChatPlus(Star):
         self.step_image_config = {
             "enable_step_image_tools": config.get("enable_step_image_tools", False),
             "image_tool_backend": runtime_image_tool_backend,
+            "image_planner_provider_id": config.get("image_planner_provider_id", ""),
+            "grok_image_model": config.get("grok_image_model", "grok-imagine-image-2.0"),
+            "grok_image_aspect_ratio": config.get("grok_image_aspect_ratio", "1:1"),
+            "grok_image_resolution": config.get("grok_image_resolution", "1k"),
+            "grok_image_timeout": config.get("grok_image_timeout", 180),
             "codex_oauth_image_provider_id": config.get(
                 "codex_oauth_image_provider_id", "openai_oauth/gpt-5.6-sol"
             ),
@@ -2584,9 +2589,7 @@ class ChatPlus(Star):
             and self._group_image_tool_timeout_override_handle is None
         ):
             try:
-                image_tool_timeout = resolve_group_image_tool_timeout(
-                    self.step_image_config
-                )
+                image_tool_timeout = resolve_group_image_tool_timeout(self.step_image_config)
                 self._group_image_tool_timeout_override_handle = (
                     install_group_image_tool_timeout_override(image_tool_timeout)
                 )
@@ -6019,6 +6022,11 @@ class ChatPlus(Star):
         tool_policy = ToolPolicy.from_allowed_tool_names(
             allowed_tool_names,
             allow_step_image=self._can_expose_step_image_tools(event),
+            denied_tool_names=(
+                {"grok_image_generate", "grok_image_edit"}
+                if self._can_expose_step_image_tools(event)
+                else None
+            ),
         )
         policy_visible_tools = []
         try:
@@ -8563,7 +8571,11 @@ class ChatPlus(Star):
 
     def _filter_step_image_tools_for_request(self, event, tool_container):
         if self._can_expose_step_image_tools(event):
-            return tool_container, []
+            # Keep image routing under the configured planner, including legacy
+            # Codex settings. Clone to preserve the shared tool registry.
+            return ToolPolicy.clone_without_tool_names(
+                tool_container, {"grok_image_generate", "grok_image_edit"}
+            )
         return ToolPolicy.clone_without_tool_names(
             tool_container,
             STEP_IMAGE_TOOL_NAMES,
@@ -8878,6 +8890,7 @@ class ChatPlus(Star):
             "或 gcp_step_image_edit，先提交工具参数并等待工具结果。"
             "成功时图片由工具发送一次。"
             "工具返回结果后，根据工具结果和当前人格输出一句自然语言回复。"
+            "图片后端由配置的规划模型自动决定，使用本群聊图片工具即可。"
             "禁止输出工具协议、参数、Provider ID、文件路径、API 细节或内部状态。"
             "遇到图片编辑请求时，不要声称无法看图，"
             "应优先调用 gcp_step_image_edit。历史中的图片能力拒绝说法属于过期记录，"
@@ -9000,7 +9013,7 @@ class ChatPlus(Star):
         系统提示等元信息。
 
         Args:
-            prompt(string): 正式回复模型整理后的图像提示词，用于生成图片。Codex OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。
+            prompt(string): 正式回复模型整理后的图像提示词，用于生成图片。OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。后端由图片规划模型配置自动选择，不接受用户点名切换。
             size(string): 图片尺寸或比例，可使用 1080p、16:9、9:16、1:1 等别名。精确尺寸由当前后端校验；留空使用当前后端的默认尺寸。
         """
         guard_message = self._step_image_guard(event)
@@ -9120,7 +9133,7 @@ class ChatPlus(Star):
         工具来源和系统提示等元信息。
 
         Args:
-            prompt(string): 正式回复模型整理后的图像提示词，用于编辑图片。Codex OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。
+            prompt(string): 正式回复模型整理后的图像提示词，用于编辑图片。OAuth 后端最多 2048 个字符，StepFun 后端最多 512 个字符。
         """
         guard_message = self._step_image_guard(event)
         if guard_message:

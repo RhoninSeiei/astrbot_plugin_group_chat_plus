@@ -121,16 +121,41 @@ def _rewire_outer_timeout_wrapper(
 
 
 def resolve_group_image_tool_timeout(config: Mapping[str, Any]) -> int | float:
+    if str(config.get("image_planner_provider_id") or "").strip():
+        # Core initializes providers after plugins. Cover either OAuth backend
+        # without looking up a provider during plugin initialization. The active
+        # adapter still validates and enforces its own request timeout.
+        budgets = []
+        for key, default, minimum, maximum, grace in (
+            ("codex_oauth_image_timeout", 300, 30, 900, 0),
+            ("grok_image_timeout", 180, 1, 600, 10),
+        ):
+            raw = config.get(key, default)
+            try:
+                value = float(raw)
+                if isinstance(raw, bool) or not math.isfinite(value) or not minimum <= value <= maximum:
+                    value = default
+            except (TypeError, ValueError):
+                value = default
+            budgets.append(value + grace)
+        budget = float(max(budgets))
+        return int(budget) if budget.is_integer() else budget
     backend = str(config.get("image_tool_backend") or "").strip().lower()
     if backend == "codex_oauth":
         raw_timeout = config.get("codex_oauth_image_timeout")
     elif backend == "stepfun":
         raw_timeout = config.get("step_image_timeout")
+    elif backend == "grok_oauth":
+        raw_timeout = config.get("grok_image_timeout", 180)
     else:
         raise ValueError("unsupported image tool backend")
     timeout = float(raw_timeout)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("image tool timeout must be a finite positive number")
+    if backend == "grok_oauth":
+        if isinstance(raw_timeout, bool) or timeout > 600:
+            raise ValueError("Grok image timeout must not exceed 600 seconds")
+        timeout += 10  # Allow bounded local reference handling and image delivery.
     return int(timeout) if timeout.is_integer() else timeout
 
 

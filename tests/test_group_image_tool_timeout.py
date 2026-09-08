@@ -441,6 +441,26 @@ class GroupImageToolTimeoutTest(unittest.TestCase):
 
     def test_backend_timeout_resolution(self):
         module = load_module()
+        self.assertEqual(module.resolve_group_image_tool_timeout({
+            "image_planner_provider_id": "grok_oauth/grok-4.6",
+            "image_tool_backend": "codex_oauth",
+            "codex_oauth_image_timeout": 300,
+            "grok_image_timeout": 500,
+        }), 510)
+        self.assertEqual(module.resolve_group_image_tool_timeout({
+            "image_planner_provider_id": "late-loaded/provider",
+            "image_tool_backend": "stepfun",
+            "step_image_timeout": 10,
+            "codex_oauth_image_timeout": float("nan"),
+            "grok_image_timeout": True,
+        }), 300)
+        self.assertEqual(module.resolve_group_image_tool_timeout(
+            {"image_tool_backend": "grok_oauth", "grok_image_timeout": 180}), 190)
+        for invalid in (601, True, float("nan")):
+            with self.subTest(grok_timeout=invalid):
+                with self.assertRaises(ValueError):
+                    module.resolve_group_image_tool_timeout(
+                        {"image_tool_backend": "grok_oauth", "grok_image_timeout": invalid})
         self.assertEqual(
             module.resolve_group_image_tool_timeout(
                 {

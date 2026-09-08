@@ -17,6 +17,12 @@ from .step_image_service import (
     StepImageService,
     StepImageUserError,
 )
+from .grok_oauth_image_service import (
+    GrokOAuthImageConfigError,
+    GrokOAuthImageProviderError,
+    GrokOAuthImageService,
+    GrokOAuthImageUserError,
+)
 
 
 class GroupImageUserError(Exception):
@@ -50,7 +56,7 @@ class GroupImageProviderError(Exception):
             }
             else "provider_call_failed"
         )
-        self.backend = backend if backend in {"stepfun", "codex_oauth"} else "unknown"
+        self.backend = backend if backend in {"stepfun", "codex_oauth", "grok_oauth"} else "unknown"
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,7 @@ class GroupImageResult:
 class GroupImageService:
     BACKEND_STEPFUN = "stepfun"
     BACKEND_CODEX_OAUTH = "codex_oauth"
+    BACKEND_GROK_OAUTH = "grok_oauth"
 
     def __init__(
         self,
@@ -74,18 +81,37 @@ class GroupImageService:
         output_dir: Path | None,
         stepfun_factory: Callable[..., Any] = StepImageService,
         codex_factory: Callable[..., Any] = CodexOAuthImageService,
+        grok_factory: Callable[..., Any] = GrokOAuthImageService,
     ) -> None:
         self.context = context
         self.config = dict(config or {})
         self.output_dir = output_dir
         self._stepfun_factory = stepfun_factory
         self._codex_factory = codex_factory
+        self._grok_factory = grok_factory
+        self._planner = None
 
     @staticmethod
     def is_enabled(config: dict) -> bool:
         return StepImageService.is_enabled(config or {})
 
     def backend_name(self) -> str:
+        planner_id = str(self.config.get("image_planner_provider_id") or "").strip()
+        if planner_id:
+            lookup_failed = False
+            try:
+                if self._planner is None:
+                    self._planner = self.context.get_provider_by_id(planner_id)
+                adapter_type = self._planner.meta().type if self._planner is not None else ""
+            except Exception:
+                lookup_failed = True
+            if lookup_failed:
+                raise GroupImageConfigError("图片规划提供商查询失败。") from None
+            if adapter_type == "openai_oauth_chat_completion":
+                return self.BACKEND_CODEX_OAUTH
+            if adapter_type == "grok_oauth_chat_completion":
+                return self.BACKEND_GROK_OAUTH
+            raise GroupImageConfigError("图片规划模型必须选择 Codex OAuth 或 Grok OAuth 提供商。")
         raw = self.config.get("image_tool_backend")
         name = "stepfun" if raw in (None, "") else str(raw).strip().lower()
         if name not in {self.BACKEND_STEPFUN, self.BACKEND_CODEX_OAUTH}:
@@ -93,11 +119,15 @@ class GroupImageService:
         return name
 
     def display_name(self) -> str:
+        if self.backend_name() == self.BACKEND_GROK_OAUTH:
+            return "Grok Imagine 图像生成服务"
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
             return "OpenAI Codex 图像生成服务"
         return "阶跃星辰 Step Image Edit 2"
 
     def max_prompt_chars(self) -> int:
+        if self.backend_name() == self.BACKEND_GROK_OAUTH:
+            return GrokOAuthImageService.MAX_PROMPT_CHARS
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
             return CodexOAuthImageService.MAX_PROMPT_CHARS
         return StepImageService.MAX_PROMPT_CHARS
@@ -113,8 +143,20 @@ class GroupImageService:
             )
 
     def _backend(self) -> Any:
+        if self.backend_name() == self.BACKEND_GROK_OAUTH:
+            return self._grok_factory(context=self.context, config=self.config)
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
-            return self._codex_factory(context=self.context, config=self.config)
+            config = dict(self.config)
+            if self._planner is not None:
+                config["codex_oauth_image_provider_id"] = config["image_planner_provider_id"]
+                model_error = False
+                try:
+                    config["codex_oauth_image_model"] = self._planner.get_model()
+                except Exception:
+                    model_error = True
+                if model_error:
+                    raise GroupImageConfigError("图片规划模型读取失败。") from None
+            return self._codex_factory(context=self.context, config=config)
         if self.output_dir is None:
             raise GroupImageConfigError("StepFun 图片输出目录未配置。")
         return self._stepfun_factory(
@@ -124,6 +166,8 @@ class GroupImageService:
         )
 
     def _default_size(self) -> str:
+        if self.backend_name() == self.BACKEND_GROK_OAUTH:
+            return str(self.config.get("grok_image_aspect_ratio") or "1:1").strip()
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
             return str(
                 self.config.get("codex_oauth_image_default_size") or "1024x1024"
@@ -151,14 +195,19 @@ class GroupImageService:
                 prompt=prompt,
                 size=str(size or self._default_size()).strip(),
             )
-        except (StepImageUserError, CodexOAuthImageUserError) as exc:
+        except (StepImageUserError, CodexOAuthImageUserError, GrokOAuthImageUserError) as exc:
             raise GroupImageUserError(str(exc)) from None
-        except (StepImageConfigError, CodexOAuthImageConfigError):
+        except (StepImageConfigError, CodexOAuthImageConfigError, GrokOAuthImageConfigError):
             raise GroupImageConfigError("图片工具配置不可用。") from None
         except StepImageProviderError:
             provider_error = GroupImageProviderError(
                 "图片服务调用失败。",
                 backend=self.BACKEND_STEPFUN,
+            )
+        except GrokOAuthImageProviderError as exc:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。", reason_code=exc.reason_code,
+                backend=self.BACKEND_GROK_OAUTH,
             )
         except CodexOAuthImageProviderError as exc:
             provider_error = GroupImageProviderError(
@@ -176,14 +225,19 @@ class GroupImageService:
         try:
             backend = self._backend()
             result = await backend.edit(prompt=prompt, image_path=image_path)
-        except (StepImageUserError, CodexOAuthImageUserError) as exc:
+        except (StepImageUserError, CodexOAuthImageUserError, GrokOAuthImageUserError) as exc:
             raise GroupImageUserError(str(exc)) from None
-        except (StepImageConfigError, CodexOAuthImageConfigError):
+        except (StepImageConfigError, CodexOAuthImageConfigError, GrokOAuthImageConfigError):
             raise GroupImageConfigError("图片工具配置不可用。") from None
         except StepImageProviderError:
             provider_error = GroupImageProviderError(
                 "图片服务调用失败。",
                 backend=self.BACKEND_STEPFUN,
+            )
+        except GrokOAuthImageProviderError as exc:
+            provider_error = GroupImageProviderError(
+                "图片服务调用失败。", reason_code=exc.reason_code,
+                backend=self.BACKEND_GROK_OAUTH,
             )
         except CodexOAuthImageProviderError as exc:
             provider_error = GroupImageProviderError(
