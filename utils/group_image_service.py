@@ -68,6 +68,24 @@ class GroupImageResult:
     revised_prompt: str = ""
 
 
+class _PlannerProviderContext:
+    def __init__(self, context, provider_id, provider):
+        self._context = context
+        self._provider_id = provider_id
+        self._provider = provider
+
+    def get_provider_by_id(self, provider_id):
+        if provider_id == self._provider_id:
+            return self._provider
+        raise GroupImageConfigError("图片调用不能切换至其他规划提供商。")
+
+    def get_all_providers(self):
+        return [self._provider]
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+
 class GroupImageService:
     BACKEND_STEPFUN = "stepfun"
     BACKEND_CODEX_OAUTH = "codex_oauth"
@@ -82,6 +100,8 @@ class GroupImageService:
         stepfun_factory: Callable[..., Any] = StepImageService,
         codex_factory: Callable[..., Any] = CodexOAuthImageService,
         grok_factory: Callable[..., Any] = GrokOAuthImageService,
+        planner_provider: Any = None,
+        require_planner: bool = False,
     ) -> None:
         self.context = context
         self.config = dict(config or {})
@@ -89,13 +109,24 @@ class GroupImageService:
         self._stepfun_factory = stepfun_factory
         self._codex_factory = codex_factory
         self._grok_factory = grok_factory
-        self._planner = None
+        self._planner = planner_provider
+        self._require_planner = require_planner
+        if planner_provider is not None:
+            provider_id = str(getattr(planner_provider, "provider_config", {}).get("id") or "").strip()
+            if not provider_id:
+                raise GroupImageConfigError("无法确定实际图片规划模型。")
+            self.config["image_planner_provider_id"] = provider_id
+            # Pin the exact instance that issued this tool call. A provider
+            # reload must not redirect an in-flight call through a new lookup.
+            self.context = _PlannerProviderContext(context, provider_id, planner_provider)
 
     @staticmethod
     def is_enabled(config: dict) -> bool:
         return StepImageService.is_enabled(config or {})
 
     def backend_name(self) -> str:
+        if self._require_planner and self._planner is None:
+            raise GroupImageConfigError("无法确定实际图片规划模型，未发起绘图请求。")
         planner_id = str(self.config.get("image_planner_provider_id") or "").strip()
         if planner_id:
             lookup_failed = False

@@ -4,6 +4,7 @@ import sys
 import types
 import traceback
 import unittest
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,6 +86,68 @@ def raising_factory(error):
 
 
 class GroupImageServiceTest(unittest.TestCase):
+    def test_actual_caller_drives_real_adapters_for_generation_and_editing(self):
+        for backend in ("grok_oauth", "codex_oauth"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "result.png"
+                path.write_bytes(b"\x89PNG\r\n\x1a\noriginal")
+                calls = []
+                async def generate_image(**kwargs):
+                    calls.append(kwargs)
+                    return [SimpleNamespace(path=str(path), mime_type="image/png", revised_prompt="")]
+                kind = "grok_oauth_chat_completion" if backend == "grok_oauth" else "openai_oauth_chat_completion"
+                model = "grok-4.6" if backend == "grok_oauth" else "gpt-6-astra"
+                provider = SimpleNamespace(
+                    provider_config={"id": "actual/caller", "auth_mode": "openai_oauth"},
+                    meta=lambda: SimpleNamespace(id="actual/caller", type=kind),
+                    get_model=lambda: model, generate_image=generate_image,
+                    capabilities={"image_generate": True, "image_edit": True,
+                                  "image_generation": {"implementation": True, "enabled": True},
+                                  "image_editing": {"implementation": True, "enabled": True}},
+                )
+                service = GroupImageService(
+                    context=SimpleNamespace(
+                        get_all_providers=lambda: self.fail("must not look up a replacement provider"),
+                        get_provider_by_id=lambda _: self.fail("must not look up a replacement provider"),
+                    ),
+                    config={"image_tool_backend": "codex_oauth", "image_planner_provider_id": "", "codex_oauth_image_model": "stale"},
+                    output_dir=None, planner_provider=provider, require_planner=True,
+                )
+                self.assertEqual(asyncio.run(service.generate(prompt="landscape")).backend, backend)
+                self.assertEqual(asyncio.run(service.edit(prompt="add clouds", image_path=str(path))).backend, backend)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual([call["action"] for call in calls], ["generate", "edit"])
+                expected_model = "grok-imagine-image-2.0" if backend == "grok_oauth" else model
+                self.assertTrue(all(call["model"] == expected_model for call in calls))
+                self.assertIsNotNone(calls[1]["reference_images"])
+
+    def test_actual_grok_caller_overrides_blank_or_stale_codex_settings(self):
+        for configured_planner in ("", "openai_oauth/stale"):
+            provider = SimpleNamespace(
+                provider_config={"id": "grok_oauth/actual"},
+                meta=lambda: SimpleNamespace(type="grok_oauth_chat_completion"),
+            )
+            backend = RecordingBackend("grok_oauth")
+            service = GroupImageService(
+                context=SimpleNamespace(get_provider_by_id=lambda _: self.fail("must pin the actual caller")),
+                config={"image_tool_backend": "codex_oauth", "image_planner_provider_id": configured_planner},
+                output_dir=None, planner_provider=provider, require_planner=True,
+                grok_factory=lambda **kwargs: backend,
+                codex_factory=lambda **kwargs: self.fail("Grok must never dispatch to Codex"),
+            )
+            result = asyncio.run(service.generate(prompt="draw a landscape"))
+            self.assertEqual(result.backend, "grok_oauth")
+            self.assertEqual(len(backend.calls), 1)
+
+    def test_unknown_actual_caller_cannot_use_legacy_codex_default(self):
+        service = GroupImageService(
+            context=None, config={"image_tool_backend": "codex_oauth"},
+            output_dir=None, require_planner=True,
+            codex_factory=lambda **kwargs: self.fail("unidentified caller dispatched"),
+        )
+        with self.assertRaises(GroupImageConfigError):
+            asyncio.run(service.generate(prompt="draw a landscape"))
+
     def planner_service(self, provider_type, *, grok=None, codex=None):
         provider = SimpleNamespace(
             meta=lambda: SimpleNamespace(type=provider_type),

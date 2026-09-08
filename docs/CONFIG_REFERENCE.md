@@ -127,15 +127,15 @@ StepImage 工具可见性：模型推理前，私聊和未授权群聊的 `Provi
 | `image_to_text_timeout` | int | `60` | 图片处理API调用超时（秒） |
 | `max_images_per_message` | int | `10` | 单条消息最大处理图片数量（1-50） |
 | `enable_step_image_tools` | bool | `false` | 启用群聊生图与修图工具。仅在启用本插件的群聊正式回复阶段可用 |
-| `image_planner_provider_id` | string | `""` | 图片规划 Provider。按提供商类型自动选择 Codex OAuth 或 Grok OAuth 后端；留空保留旧图片配置，独立于群聊 UMO 模型 |
+| `image_planner_provider_id` | string | `""` | 旧版本兼容字段；群聊绘图跟随实际发起工具调用的模型，包含 AstrBot 回退后的 Provider。此字段不再覆盖路由 |
 | `grok_image_model` | string | `"grok-imagine-image-2.0"` | Grok 图片接口的 Imagine 模型，不填 `grok-4.6` 等文本模型 |
 | `grok_image_aspect_ratio` | string | `"1:1"` | Grok 默认比例，支持 auto、1:1、3:2、2:3、4:3、3:4、16:9、9:16、21:9、5:2 |
 | `grok_image_resolution` | string | `"1k"` | Grok 图片分辨率，可选 1k、2k |
 | `grok_image_timeout` | int | `180` | Grok SDK 总超时，范围 1 至 600 秒，不进行自动重试或跨后端回退 |
-| `image_tool_backend` | string | `"codex_oauth"` | 图片工具后端，可选 `codex_oauth` 或 `stepfun`。新安装默认使用 Codex OAuth |
+| `image_tool_backend` | string | `"codex_oauth"` | 旧版本兼容字段，不再决定群聊绘图路由 |
 | `image_tool_backend_config_version` | int | `0` | 内部兼容标记。`0` 表示首次构造时执行迁移，迁移完成后写为 `1`；无需手动修改 |
-| `codex_oauth_image_provider_id` | string | `"openai_oauth/gpt-5.6-sol"` | Codex OAuth 图片 Provider ID。文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit` |
-| `codex_oauth_image_model` | string | `"gpt-5.6-sol"` | 传给 Provider 的 Codex 主模型 |
+| `codex_oauth_image_provider_id` | string | `"openai_oauth/gpt-5.6-sol"` | 旧版本兼容 Provider ID；群聊绘图使用实际调用者。文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit` |
+| `codex_oauth_image_model` | string | `"gpt-5.6-sol"` | 旧版本兼容模型字段；群聊绘图使用实际调用 Provider 的当前模型 |
 | `codex_oauth_image_default_size` | string | `"1024x1024"` | Codex OAuth 默认尺寸，采用 `width x height`（宽x高）；可选 `1024x1024`、`1536x1024`、`1024x1536` |
 | `codex_oauth_image_timeout` | int | `300` | Codex OAuth 调用超时，允许 30 至 900 秒 |
 | `step_image_provider_id` | string | `""` | StepFun 图片模型 Provider ID。留空时按 `step_image_model` 自动查找 |
@@ -156,7 +156,9 @@ StepImage 工具可见性：模型推理前，私聊和未授权群聊的 `Provi
 | `platform_image_caption_fast_check_count` | int | `10` | 快速检查次数 |
 | `probability_filter_cache_delay` | int | `10000` | 概率过滤缓存延迟（毫秒） |
 
-新安装会从 schema 取得 `image_tool_backend=codex_oauth`。内部字段 `image_tool_backend_config_version` 默认值为 `0`：首次构造时，`config.first_deploy=True` 表示新安装并保留 Codex OAuth；没有首次部署标记的现有配置选择 `stepfun`。迁移完成后写为 `1` 并立即保存，后续显式选择 Codex OAuth 或 StepFun 时均保留配置值。保存失败不会改变当前运行期选定的后端。设置 `image_tool_backend=stepfun` 可以切换回 StepFun。
+群聊图片工具根据实际发起工具调用的正式回复模型路由：Codex OAuth 使用 Codex，Grok OAuth 使用 Grok Imagine。路由绑定 AstrBot 回退后的 Provider 实例，并按事件和异步执行上下文隔离。无法确定调用模型时拒绝请求；旧的规划 Provider 与后端字段留空不会转入 Codex。`image_tool_backend_config_version` 继续作为旧配置迁移标记保留，旧字段不再控制群聊图片工具。
+
+插件停用或重载时撤销调用身份，取消并等待本插件的在途图片任务。群聊进度采用通用文本，避免在工具规划完成前猜测后端。
 
 Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超时。Provider 负责 OAuth 凭据以及 `image_generation` 请求，插件通过公共 `generate_image()` 接口取得结果。Codex OAuth 尺寸采用 `width x height`（宽x高），StepFun 尺寸继续采用 `height x width`（高x宽）。`httpx` 只供 StepFun HTTP 请求使用，Codex OAuth 后端不会新增运行时依赖。
 
@@ -164,7 +166,7 @@ Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超�
 
 插件调用前检查 `generate_image()` 签名。支持可选 `timeout` 参数或 `**kwargs` 的 Provider 会收到与 `codex_oauth_image_timeout` 相同的单次超时值，外层 `asyncio.wait_for` 继续提供相同数值的最大等待保护。旧 Provider 不接收该关键字，仅受插件外层最大等待限制，实际请求仍可能受 Provider 自身 HTTP 超时约束。签名读取异常时按旧 Provider 处理，调用只执行一次。
 
-内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`。工具只在启用本插件的群聊正式回复阶段开放：文生图使用主模型整理后的图像提示词和尺寸参数；修图要求图片与编辑指令位于同一条消息。命中工具后，插件发送随当前后端变化的自然语言进度文本和一次图片结果，随后主模型根据安全摘要与当前群人格生成自然语言收尾。群聊内容不会包含工具协议、参数、Provider ID、文件路径或凭据。
+内部 LLM 工具名保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`。工具只在启用本插件的群聊正式回复阶段开放：文生图使用主模型整理后的图像提示词和尺寸参数；修图要求图片与编辑指令位于同一条消息。命中工具后，插件发送通用自然语言进度文本和一次图片结果，随后主模型根据安全摘要与当前群人格生成自然语言收尾。群聊内容不会包含工具协议、参数、Provider ID、文件路径或凭据。
 
 主流程只在当前处理期间临时构造交错工具记录。`ContextManager.save_bot_message()` 保存前清除工具协议块，自定义历史与官方会话写入清理后的文本。后续格式化为模型上下文时再次过滤旧数据或外部数据，群聊输出不包含工具协议块。图片安全摘要只包含操作类型、成功或失败状态和安全消息，不包含后端显示名。Provider ID、凭据、API 地址、原始响应和文件路径不会进入安全摘要或群聊文本。
 

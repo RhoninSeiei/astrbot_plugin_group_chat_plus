@@ -217,7 +217,8 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             raise_early("session")
             return dashboard_session
 
-        def resolve_timeout(config):
+        def resolve_timeout(config, *, actual_planner=False):
+            self.assertTrue(actual_planner)
             events.append("resolve-timeout")
             return 300
 
@@ -247,6 +248,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                 ),
                 "GroupImageService": FakeGroupImageService,
                 "resolve_group_image_tool_timeout": resolve_timeout,
+                "install_image_planner_context": lambda: SimpleNamespace(close=lambda: None),
                 "install_group_image_tool_timeout_override": (
                     install_timeout_override
                 ),
@@ -270,6 +272,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             proactive_enabled=proactive_enabled,
             step_image_config={"image_tool_backend": "codex_oauth"},
             _group_image_tool_timeout_override_handle=None,
+            _image_planner_context_handle=None,
             _compute_session_integrity=compute_session_integrity,
             _emit_session_metadata=emit_session_metadata,
             _build_proactive_config=lambda: {},
@@ -290,6 +293,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "_build_step_image_tool_result_text",
             "_send_step_image_progress",
             "_send_step_image_image_result",
+            "_run_step_image_operation",
             "gcp_step_image_generate",
             "gcp_step_image_edit",
         )
@@ -312,6 +316,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         ast.fix_missing_locations(module)
         logger = RecordingLogger()
         namespace = {
+            "asyncio": asyncio,
             "GroupImageUserError": GroupImageUserError,
             "GroupImageConfigError": GroupImageConfigError,
             "GroupImageProviderError": GroupImageProviderError,
@@ -466,7 +471,9 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         )
         harness._append_step_image_pending_progress = lambda event, text: None
         harness._cleanup_step_image_outputs = lambda: facade.order.append("cleanup")
-        harness._get_step_image_service = lambda: facade
+        harness._get_step_image_service = lambda event: facade
+        harness._image_operation_tasks = set()
+        harness._image_tools_terminated = False
         harness._get_step_image_group_id = lambda event: "group-1"
 
         async def extract_current_image(event):
@@ -844,7 +851,8 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                 "GroupImageService": SimpleNamespace(
                     is_enabled=lambda config: True
                 ),
-                "resolve_group_image_tool_timeout": lambda config: 300,
+                "resolve_group_image_tool_timeout": lambda config, **kwargs: 300,
+                "install_image_planner_context": lambda: SimpleNamespace(close=lambda: None),
                 "install_group_image_tool_timeout_override": (
                     install_timeout_override
                 ),
@@ -858,6 +866,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             proactive_enabled=True,
             step_image_config={"image_tool_backend": "codex_oauth"},
             _group_image_tool_timeout_override_handle=None,
+            _image_planner_context_handle=None,
             _compute_session_integrity=lambda seed: "session-sig",
             _emit_session_metadata=lambda: None,
             _build_proactive_config=lambda: {},
@@ -1015,7 +1024,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         )
         self.assertNotIn("reply_text", append_source)
 
-    def test_progress_text_uses_dynamic_backend_display_name(self):
+    def test_preplanning_progress_does_not_guess_a_backend(self):
         class FakeService:
             @staticmethod
             def display_name():
@@ -1033,11 +1042,11 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
         self.assertEqual(
             build_progress_text(plugin),
-            "正在用 OpenAI Codex 图像生成服务生成图片，稍等一下。",
+            "正在生成图片，稍等一下。",
         )
         self.assertEqual(
             build_progress_text(plugin, "edit"),
-            "正在用 OpenAI Codex 图像生成服务编辑这张图，稍等一下。",
+            "正在编辑这张图，稍等一下。",
         )
 
     def test_tool_uses_current_message_image_for_editing(self):
@@ -1433,7 +1442,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            method_source.count(
+            self._method_source("_run_step_image_operation").count(
                 "await self._send_step_image_image_result(event, result.path)"
             ),
             1,
@@ -1702,7 +1711,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         method_source = self._method_source("gcp_step_image_edit")
         self._assert_group_image_error_branches("gcp_step_image_edit")
         self.assertEqual(
-            method_source.count(
+            self._method_source("_run_step_image_operation").count(
                 "await self._send_step_image_image_result(event, result.path)"
             ),
             1,
@@ -1722,6 +1731,98 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("根据工具结果", self.main_source)
         self.assertIn("自然语言", self.main_source)
         self.assertNotIn("工具会发送进度提示和图片结果。", self.main_source)
+
+
+    def test_terminate_cancels_and_awaits_inflight_image_without_sending(self):
+        async def scenario():
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+            class BlockingFacade(RecordingFacade):
+                async def generate(self, **kwargs):
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+            facade = BlockingFacade([])
+            harness, _ = self._make_tool_harness(facade)
+            event = FakeEvent([])
+            harness.proactive_enabled = False
+            harness._idle_flush_tasks = {}
+            harness._idle_flush_meta = {}
+            closed = []
+            harness._image_planner_context_handle = SimpleNamespace(close=lambda: closed.append(True))
+            terminate = self._compile_unbound_method("terminate", {"asyncio": asyncio})
+            task = asyncio.create_task(harness._run_step_image_operation(event, "generate", prompt="cat"))
+            await started.wait()
+            sent_before_terminate = copy.deepcopy(event.sent)
+            await terminate(harness)
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(cancelled.is_set())
+            self.assertEqual(closed, [True])
+            self.assertEqual(event.sent, sent_before_terminate)
+            self.assertFalse(any(kind == "image" for chain in event.sent for kind, _ in chain))
+            self.assertEqual(harness._image_operation_tasks, set())
+            with self.assertRaises(GroupImageConfigError):
+                await harness._run_step_image_operation(event, "generate", prompt="cat")
+        asyncio.run(scenario())
+
+    def test_tool_service_factory_requires_current_event_planner(self):
+        calls = []
+        get_service = self._compile_unbound_method(
+            "_get_step_image_service",
+            {"AstrMessageEvent": object, "GroupImageService": lambda **kwargs: calls.append(kwargs)},
+        )
+        event, provider = object(), object()
+        plugin = SimpleNamespace(
+            context=object(), step_image_config={"image_tool_backend": "codex_oauth"},
+            step_image_output_dir=None,
+            _image_planner_context_handle=SimpleNamespace(provider_for=lambda candidate: provider if candidate is event else None),
+        )
+        get_service(plugin, event)
+        self.assertTrue(calls[-1]["require_planner"])
+        self.assertIs(calls[-1]["planner_provider"], provider)
+        get_service(plugin, object())
+        self.assertIsNone(calls[-1]["planner_provider"])
+        self.assertTrue(calls[-1]["require_planner"])
+
+    def test_terminate_during_reference_read_or_progress_cancels_whole_tool(self):
+        async def scenario(stage):
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+            facade = RecordingFacade([])
+            harness, _ = self._make_tool_harness(facade)
+            event = FakeEvent([])
+            async def blocked(*args):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            if stage == "reference":
+                harness._extract_first_current_image_path = blocked
+            else:
+                event.send = blocked
+            harness.proactive_enabled = False
+            harness._idle_flush_tasks = {}
+            harness._idle_flush_meta = {}
+            terminate = self._compile_unbound_method("terminate", {"asyncio": asyncio})
+            async def invoke():
+                return [value async for value in harness.gcp_step_image_edit(event, prompt="change")]
+            tool_task = asyncio.create_task(invoke())
+            await started.wait()
+            self.assertEqual(len(harness._image_operation_tasks), 1)
+            await terminate(harness)
+            with self.assertRaises(asyncio.CancelledError):
+                await tool_task
+            self.assertTrue(cancelled.is_set())
+            self.assertEqual(facade.calls, [])
+            self.assertEqual(event.sent, [])
+            self.assertEqual(harness._image_operation_tasks, set())
+        for stage in ("reference", "progress"):
+            with self.subTest(stage=stage):
+                asyncio.run(scenario(stage))
 
 
 if __name__ == "__main__":

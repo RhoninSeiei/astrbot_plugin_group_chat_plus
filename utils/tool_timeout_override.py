@@ -120,8 +120,10 @@ def _rewire_outer_timeout_wrapper(
     return False
 
 
-def resolve_group_image_tool_timeout(config: Mapping[str, Any]) -> int | float:
-    if str(config.get("image_planner_provider_id") or "").strip():
+def resolve_group_image_tool_timeout(
+    config: Mapping[str, Any], *, actual_planner: bool = False
+) -> int | float:
+    if actual_planner or str(config.get("image_planner_provider_id") or "").strip():
         # Core initializes providers after plugins. Cover either OAuth backend
         # without looking up a provider during plugin initialization. The active
         # adapter still validates and enforces its own request timeout.

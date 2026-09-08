@@ -165,6 +165,7 @@ from .utils.tool_timeout_override import (
     remove_group_image_tool_timeout_override,
     resolve_group_image_tool_timeout,
 )
+from .utils.image_planner_context import install_image_planner_context
 from .utils.tool_call_leakage_guard import sanitize_tool_call_markup
 from .utils.llm_runtime_guard import (
     DEFAULT_PERSONA_FAILURE_REPLY,
@@ -750,6 +751,9 @@ class ChatPlus(Star):
             "step_image_text_mode": config.get("step_image_text_mode", True),
         }
         self._group_image_tool_timeout_override_handle = None
+        self._image_planner_context_handle = None
+        self._image_operation_tasks = set()
+        self._image_tools_terminated = False
         self.step_image_default_size = config.get(
             "step_image_default_size", DEFAULT_GENERATION_SIZE
         )
@@ -2562,6 +2566,7 @@ class ChatPlus(Star):
 
         启动主动对话功能的后台任务
         """
+        self._image_tools_terminated = False
         self.dashboard_http_session = aiohttp.ClientSession()
         # 生成运行时签名，用于追踪插件实例状态
         self._session_sig = self._compute_session_integrity("init")
@@ -2589,7 +2594,11 @@ class ChatPlus(Star):
             and self._group_image_tool_timeout_override_handle is None
         ):
             try:
-                image_tool_timeout = resolve_group_image_tool_timeout(self.step_image_config)
+                if self._image_planner_context_handle is None:
+                    self._image_planner_context_handle = install_image_planner_context()
+                image_tool_timeout = resolve_group_image_tool_timeout(
+                    self.step_image_config, actual_planner=True
+                )
                 self._group_image_tool_timeout_override_handle = (
                     install_group_image_tool_timeout_override(image_tool_timeout)
                 )
@@ -2609,6 +2618,17 @@ class ChatPlus(Star):
 
         停止主动对话功能的后台任务并保存状态
         """
+        self._image_tools_terminated = True
+        planner_handle = getattr(self, "_image_planner_context_handle", None)
+        if planner_handle is not None:
+            planner_handle.close()
+            self._image_planner_context_handle = None
+        image_tasks = tuple(getattr(self, "_image_operation_tasks", ()))
+        for task in image_tasks:
+            task.cancel()
+        if image_tasks:
+            await asyncio.gather(*image_tasks, return_exceptions=True)
+
         timeout_override_handle = getattr(
             self, "_group_image_tool_timeout_override_handle", None
         )
@@ -8635,6 +8655,8 @@ class ChatPlus(Star):
         )
 
     def _step_image_guard(self, event: AstrMessageEvent) -> Optional[str]:
+        if getattr(self, "_image_tools_terminated", False):
+            return "图片工具实例已停用。"
         if not GroupImageService.is_enabled(self.step_image_config):
             return "图片生成工具未启用。"
         if not self._can_expose_step_image_tools(event):
@@ -8661,12 +8683,46 @@ class ChatPlus(Star):
                     exc.__class__.__name__,
                 )
 
-    def _get_step_image_service(self) -> GroupImageService:
+    def _get_step_image_service(self, event: AstrMessageEvent) -> GroupImageService:
+        handle = getattr(self, "_image_planner_context_handle", None)
+        provider = handle.provider_for(event) if handle is not None else None
         return GroupImageService(
             context=self.context,
             config=self.step_image_config,
             output_dir=self.step_image_output_dir,
+            planner_provider=provider,
+            require_planner=True,
         )
+
+    async def _run_step_image_operation(self, event, action, **kwargs):
+        if getattr(self, "_image_tools_terminated", False):
+            raise GroupImageConfigError("图片工具实例已停用。")
+        service = self._get_step_image_service(event)
+
+        async def execute_and_send():
+            if action == "edit":
+                image_path = await self._extract_first_current_image_path(event)
+                if not image_path:
+                    raise GroupImageUserError(
+                        "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
+                    )
+                kwargs["image_path"] = image_path
+            if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
+                await self._send_step_image_progress(event, action)
+            self._cleanup_step_image_outputs()
+            operation = service.edit if action == "edit" else service.generate
+            result = await operation(**kwargs)
+            if self._image_tools_terminated:
+                raise asyncio.CancelledError
+            await self._send_step_image_image_result(event, result.path)
+            return result
+
+        task = asyncio.create_task(execute_and_send())
+        self._image_operation_tasks.add(task)
+        try:
+            return await task
+        finally:
+            self._image_operation_tasks.discard(task)
 
     def _has_current_image_component(self, event: AstrMessageEvent) -> bool:
         try:
@@ -8728,9 +8784,8 @@ class ChatPlus(Star):
         return None
 
     def _build_step_image_progress_text(self, action: Optional[str] = None) -> str:
-        backend_name = self._get_step_image_service().display_name()
         verb = "编辑这张图" if action == "edit" else "生成图片"
-        return f"正在用 {backend_name}{verb}，稍等一下。"
+        return f"正在{verb}，稍等一下。"
 
     def _mark_step_image_progress_sent(
         self,
@@ -9032,14 +9087,11 @@ class ChatPlus(Star):
             return
 
         try:
-            if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
-                await self._send_step_image_progress(event, "generate")
-            self._cleanup_step_image_outputs()
-            result = await self._get_step_image_service().generate(
+            await self._run_step_image_operation(
+                event, "generate",
                 prompt=prompt,
                 size=str(size or "").strip(),
             )
-            await self._send_step_image_image_result(event, result.path)
             success_message = "图片已经发送到群聊。"
             self._mark_step_image_tool_result(
                 event,
@@ -9150,31 +9202,11 @@ class ChatPlus(Star):
             )
             return
 
-        image_path = await self._extract_first_current_image_path(event)
-        if not image_path:
-            message = "未检测到可编辑图片，请把图片和编辑要求放在同一条消息里。"
-            self._mark_step_image_tool_result(
-                event,
-                action="edit",
-                status="failed",
-                message=message,
-            )
-            yield self._build_step_image_tool_result_text(
-                action="edit",
-                status="failed",
-                message=message,
-            )
-            return
-
         try:
-            if not event.get_extra(PLUGIN_STEP_IMAGE_PROGRESS_SENT, False):
-                await self._send_step_image_progress(event, "edit")
-            self._cleanup_step_image_outputs()
-            result = await self._get_step_image_service().edit(
+            await self._run_step_image_operation(
+                event, "edit",
                 prompt=prompt,
-                image_path=image_path,
             )
-            await self._send_step_image_image_result(event, result.path)
             success_message = "图片已经发送到群聊。"
             self._mark_step_image_tool_result(
                 event,

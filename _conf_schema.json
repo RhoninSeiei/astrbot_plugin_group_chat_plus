@@ -289,7 +289,7 @@
         "description": "🖼️ 群聊图片后端",
         "type": "string",
         "options": ["codex_oauth", "stepfun"],
-        "hint": "仅在图片规划 Provider 留空时使用。新安装默认 Codex OAuth；旧配置继续使用原后端。选择图片规划 Provider 后，按提供商类型自动路由，无需群聊用户点名后端。",
+        "hint": "旧版本兼容字段。群聊图片工具根据实际发起工具调用的规划模型选择后端，此字段不再决定群聊绘图路由。",
         "default": "codex_oauth"
     },
     "image_tool_backend_config_version": {
@@ -301,14 +301,14 @@
     "codex_oauth_image_provider_id": {
         "description": "🖼️ Codex OAuth 图片 Provider",
         "type": "string",
-        "hint": "兼容旧配置。图片规划 Provider 留空时使用；填写图片规划 Provider 后由其覆盖。",
+        "hint": "旧版本兼容字段。群聊绘图使用实际发起工具调用的 Codex OAuth Provider。",
         "default": "openai_oauth/gpt-5.6-sol",
         "_special": "select_provider"
     },
     "image_planner_provider_id": {
-        "description": "图片规划 Provider",
+        "description": "旧版本图片规划 Provider",
         "type": "string",
-        "hint": "选择 Codex OAuth 模型时使用 Codex 绘图后端；选择 Grok OAuth 模型时使用 Grok Imagine 后端。无需群聊用户点名工具或后端。留空沿用现有图片后端配置。",
+        "hint": "旧版本兼容字段。群聊绘图自动跟随实际调用工具的规划模型，包含 AstrBot 回退后的模型；留空不会默认切换到 Codex。",
         "default": "",
         "_special": "select_provider"
     },

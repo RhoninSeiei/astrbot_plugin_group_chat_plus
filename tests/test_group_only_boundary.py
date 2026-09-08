@@ -178,36 +178,25 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
 
     def test_group_image_backend_documentation_contract(self):
         for marker in (
-            "新安装在配置 schema 中默认使用 `image_tool_backend=codex_oauth`",
-            "`image_tool_backend_config_version` 是内部兼容标记",
-            "`config.first_deploy=True`",
-            "现有旧配置会选择 `stepfun`",
-            "迁移选择会立即写入配置",
-            "保存失败时当前运行期仍使用本次选定的后端",
-            "设置 `image_tool_backend=stepfun`",
-            "Provider 负责保存 OAuth 凭据并执行 `image_generation` 请求",
-            "Codex OAuth 尺寸采用 `width x height`（宽x高）",
-            "StepFun 继续采用 `height x width`（高x宽）",
+            "根据实际发起工具调用的正式回复模型选择后端",
+            "选择发生在 AstrBot 模型回退之后",
+            "无法确认调用模型或模型类型不受支持时，拒绝绘图",
+            "留空也不会默认转入 Codex",
             "`gcp_step_image_generate` 与 `gcp_step_image_edit`",
-            "随后端变化的进度文本、一次图片结果和主模型按当前人格生成的自然语言收尾",
+            "通用进度文本、一次图片结果",
+            "取消、等待本插件尚未完成的图片请求",
         ):
             self.assertIn(marker, self.readme_source)
 
         for marker in (
-            "新安装会从 schema 取得 `image_tool_backend=codex_oauth`",
-            "`image_tool_backend_config_version`",
-            "默认值为 `0`",
-            "`config.first_deploy=True`",
-            "现有配置选择 `stepfun`",
-            "迁移完成后写为 `1` 并立即保存",
-            "保存失败不会改变当前运行期选定的后端",
-            "设置 `image_tool_backend=stepfun` 可以切换回 StepFun",
+            "根据实际发起工具调用的正式回复模型路由",
+            "路由绑定 AstrBot 回退后的 Provider 实例",
+            "无法确定调用模型时拒绝请求",
+            "后端字段留空不会转入 Codex",
             "文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit`",
             "Provider 负责 OAuth 凭据以及 `image_generation` 请求",
-            "Codex OAuth 尺寸采用 `width x height`（宽x高）",
-            "StepFun 尺寸继续采用 `height x width`（高x宽）",
             "`gcp_step_image_generate` 与 `gcp_step_image_edit`",
-            "随当前后端变化的自然语言进度文本和一次图片结果",
+            "通用自然语言进度文本和一次图片结果",
             "当前群人格生成自然语言收尾",
         ):
             self.assertIn(marker, self.config_reference_source)
