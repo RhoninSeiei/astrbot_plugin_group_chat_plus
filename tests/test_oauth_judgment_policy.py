@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 
 import test_provider_selection_compatibility as selection_tests
+from test_judgment_prompts import prompts as judgment_prompts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +62,8 @@ class OAuthJudgmentPolicyTest(unittest.TestCase):
                 )
                 provider = HostedSearchProvider()
                 namespace = dict(provider=provider, full_prompt="judge", prompt="judge",
-                                 image_urls=[], persona_prompt="persona")
+                                 image_urls=[], persona_prompt="persona",
+                                 build_judgment_system=judgment_prompts.build_judgment_system)
                 module = ast.fix_missing_locations(ast.Module(
                     body=[copy.deepcopy(method)], type_ignores=[]))
                 exec(compile(module, "decision_ai.py", "exec"), namespace)

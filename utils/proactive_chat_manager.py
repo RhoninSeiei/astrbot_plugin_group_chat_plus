@@ -28,6 +28,10 @@ from pathlib import Path
 import json
 
 from astrbot import logger
+from .judgment_prompts import (
+    PROACTIVE_JUDGMENT_PROMPT, build_proactive_judgment_messages, format_proactive_contexts,
+    add_judgment_memories,
+)
 from astrbot.core.platform import AstrMessageEvent
 from astrbot.core.star import Context
 from astrbot.core.message.message_event_result import MessageChain
@@ -4277,10 +4281,14 @@ class ProactiveChatManager:
                 except Exception:
                     pass
 
-            formatted_context = await ContextManager.format_context_for_ai(
+            formatted_context, judgment_context = await format_proactive_contexts(
+                ContextManager.format_context_for_ai,
                 history_messages,
                 proactive_system_prompt,
                 self_id or "",
+                need_judgment=cls._enable_proactive_ai_judge,
+                normalizer=ContextManager.normalize_message_content,
+                stripper=ContextManager.strip_tool_call_record_blocks,
                 include_timestamp=cls._include_timestamp,
                 include_sender_info=cls._include_sender_info,
                 window_buffered_messages=window_buffered_msgs,
@@ -4326,6 +4334,10 @@ class ProactiveChatManager:
                             final_message = MemoryInjector.inject_memories_to_message(
                                 final_message, memories
                             )
+                            if cls._enable_proactive_ai_judge:
+                                judgment_context = add_judgment_memories(
+                                    judgment_context, memories
+                                )
                             if debug_mode:
                                 logger.info(
                                     f"[主动对话] 已注入记忆内容({memory_mode}模式)，长度增加: {len(final_message) - old_len} 字符"
@@ -4366,20 +4378,7 @@ class ProactiveChatManager:
                     )
 
                     # 构建判断AI的提示词（静态部分在前，利于缓存命中）
-                    default_judge_prompt = (
-                        "你是一个对话场景判断助手。你当前扮演的人格信息已通过系统提示词提供，请以该人格的视角进行判断。\n\n"
-                        "你的任务是根据以下对话上下文，判断当前是否适合以你的人格身份主动发起一条新消息。\n\n"
-                        "判断标准：\n"
-                        "1. 对话氛围是否适合你插入新话题（如果大家正在热聊某个与你无关的话题，可能不适合打断）\n"
-                        "2. 是否有你可以自然接入的话题点或未回应的内容\n"
-                        "3. 距离你上次发言是否已经过了合理的时间间隔\n"
-                        "4. 当前时间段是否适合主动发言（深夜可能不太合适）\n"
-                        "5. 结合你的人格特点，判断你这个角色在当前情境下是否会主动说话\n\n"
-                        "请只回答 yes 或 no：\n"
-                        "- yes = 适合现在主动发起对话\n"
-                        "- no = 现在不适合，跳过这次\n\n"
-                        "只需回答 yes 或 no，不要解释原因。"
-                    )
+                    default_judge_prompt = PROACTIVE_JUDGMENT_PROMPT
 
                     judge_prompt_text = (
                         cls._proactive_ai_judge_prompt.strip()
@@ -4398,20 +4397,9 @@ class ProactiveChatManager:
                         )
                     )
 
-                    # 拼接：静态判断提示词 + 动态上下文（缓存友好：静态在前）
-                    judge_full_prompt = (
-                        judge_prompt_text
-                        + "\n\n=== 以下是当前对话上下文 ===\n"
-                        + saved_final_message
+                    judge_full_prompt, judge_system_prompt = build_proactive_judgment_messages(
+                        judgment_context, judge_persona_prompt, judge_prompt_text
                     )
-
-                    # 构建中性的系统提示词（不偏离人格判断）
-                    judge_system_prompt = ""
-                    if judge_persona_prompt:
-                        judge_system_prompt = (
-                            "你当前扮演的人格设定如下，请以此人格的视角进行判断：\n\n"
-                            + judge_persona_prompt
-                        )
 
                     # 获取AI提供商（复用读空气AI的配置）
                     judge_provider = None

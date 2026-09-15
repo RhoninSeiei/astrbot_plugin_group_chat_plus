@@ -15,6 +15,7 @@ import inspect
 import re
 
 from astrbot.api.all import *
+from .judgment_prompts import build_judgment_system
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
 from .ai_error_formatter import format_ai_error
@@ -255,12 +256,15 @@ class ReplyHandler:
     MAIN_MODEL_FINAL_GATE_PROMPT = f"""
 
 [最终回复判断]
-你现在处于第二阶段。前一道读空气粗筛已经放行，但这不代表必须回复。
+前一道读空气判断已经放行。现在只检查是否存在具体阻止回复的原因，不重复评估时段、间隔、频率或话题是否足够重要。
+如果能够自然接话、回答问题、补充信息或作出简短轻松互动，且没有明确阻止原因，继续回复。
+只有明确拒绝继续交流、明显重复、无任何可回应内容、必要信息无法可靠理解或明确私人交流边界时才停止。
+未被点名、别人正在普通群聊、人格偏克制，都不能单独作为停止理由。
 这一步只做内部控制判断，不生成面向群聊的回复文本。
 
 输出要求：
 - 如果当前新消息值得由最终模型生成回复，只输出：{MAIN_MODEL_FINAL_GATE_REPLY}
-- 如果当前新消息其实不值得出手，只输出：{MAIN_MODEL_FINAL_GATE_NO_REPLY}
+- 如果存在上述具体阻止回复的原因，只输出：{MAIN_MODEL_FINAL_GATE_NO_REPLY}
 - 禁止输出解释、理由、标签、引号、代码块或任何额外文字
 - 这是内部 gate 请求，结果不会发送到群聊
 """
@@ -841,7 +845,7 @@ class ReplyHandler:
             session_id=event.session_id,
             image_urls=image_urls or [],
             contexts=[],
-            system_prompt=system_prompt,
+            system_prompt=build_judgment_system(system_prompt),
         )
 
         try:
