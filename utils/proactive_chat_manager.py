@@ -2957,13 +2957,12 @@ class ProactiveChatManager:
                                 context, config, plugin_instance, chat_key
                             )
                         else:
-                            # 如果概率判断失败，重置计时器
+                            # 筛选未通过不代表机器人发过言；保留真实沉默起点，
+                            # 让下一检查周期继续判断，而不是重新等待完整沉默阈值。
                             if "概率判断失败" in reason:
-                                state = cls.get_chat_state(chat_key)
-                                state["last_bot_reply_time"] = time.time()
                                 if cls._debug_mode:
                                     logger.info(
-                                        f"[主动对话检查] 群{chat_key} - {reason}，重置计时器"
+                                        f"[主动对话检查] 群{chat_key} - {reason}，保持沉默计时"
                                     )
 
                     except Exception as e:
@@ -4476,12 +4475,10 @@ class ProactiveChatManager:
                         )
 
                     if not judge_pass:
-                        # AI判断不通过 → 不触发冷却，重置计时器（与概率筛选失败一致）
+                        # AI否决本次发言，但没有实际回复，不能改写沉默起点。
                         logger.info(
                             f"[主动对话-AI预判断] 群{chat_key} - AI判断当前不适合主动对话，跳过本次触发"
                         )
-                        state = cls.get_chat_state(chat_key)
-                        state["last_bot_reply_time"] = time.time()
                         return
 
                     logger.info(
