@@ -16,6 +16,8 @@ _TOOLS = frozenset({"gcp_step_image_generate", "gcp_step_image_edit", "gcp_grok_
 
 
 class ImagePlannerContextHandle:
+    tool_filter = None
+
     def __init__(self, runner_cls, state, tool_filter=None):
         self.runner_cls = runner_cls
         self.state = state
@@ -60,6 +62,15 @@ def install_image_planner_context(runner_cls=None, *, tool_filter=None):
         raise TypeError("AstrBot does not expose per-provider tool selection")
     state = runner_cls.__dict__.get(_STATE_ATTR)
     if state is not None:
+        # Shared state can still contain active handles from older module
+        # generations. Preserve their context ownership. A class default also
+        # protects retained old filter closures and subsequently created legacy
+        # handles; instance-specific callbacks remain unchanged.
+        for handle in tuple(state["handles"]):
+            if not hasattr(type(handle), "tool_filter"):
+                type(handle).tool_filter = None
+            if not getattr(handle, "active", False):
+                state["handles"].discard(handle)
         # A pre-upgrade wrapper may remain underneath another plugin's wrapper.
         # Its closure reads the old module's _TOOLS global; extend only that
         # plugin-owned set so the retained context binding recognizes new names.
@@ -116,8 +127,9 @@ def install_image_planner_context(runner_cls=None, *, tool_filter=None):
             event = getattr(context, "event", None)
             provider = getattr(runner, "provider", None)
             for handle in tuple(state["handles"]):
-                if handle.active and handle.tool_filter is not None:
-                    selected = handle.tool_filter(event, provider, selected)
+                callback = getattr(handle, "tool_filter", None)
+                if getattr(handle, "active", False) and callable(callback):
+                    selected = callback(event, provider, selected)
             return selected
 
         state["filter_wrapper"] = with_image_tool_visibility

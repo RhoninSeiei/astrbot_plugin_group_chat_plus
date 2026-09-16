@@ -14,6 +14,47 @@ def load_module():
 
 
 class ImagePlannerContextTest(unittest.IsolatedAsyncioTestCase):
+    async def test_active_legacy_handles_survive_upgrade_and_retained_filter(self):
+        module = load_module()
+        class Runner:
+            def _func_tool_for_provider(self):
+                return ["grok", "gpt", "search"]
+            async def _handle_function_tools(self, req, response):
+                yield 1
+        class LegacyHandle:
+            def __init__(self, state):
+                self.active = True
+                state["handles"].add(self)
+        first = module.install_image_planner_context(Runner)
+        state = first.state
+        legacy = LegacyHandle(state)
+        # Match the already-deployed unsafe wrapper, including an outer hook.
+        original_filter = Runner._func_tool_for_provider
+        def old_filter(runner):
+            selected = original_filter(runner)
+            for handle in tuple(state["handles"]):
+                if handle.active and handle.tool_filter is not None:
+                    selected = handle.tool_filter(None, runner.provider, selected)
+            return selected
+        state["original_filter"] = original_filter
+        state["filter_wrapper"] = old_filter
+        Runner._func_tool_for_provider = lambda runner: old_filter(runner)
+        first.close()
+        replacement = load_module().install_image_planner_context(
+            Runner, tool_filter=lambda e, p, t: [n for n in t if n in {p, "search"}]
+        )
+        runner = Runner()
+        runner.provider = "grok"
+        self.assertEqual(runner._func_tool_for_provider(), ["grok", "search"])
+        self.assertIn(legacy, state["handles"])
+        self.assertTrue(legacy.active)
+        late_legacy = LegacyHandle(state)
+        runner.provider = "gpt"
+        self.assertEqual(runner._func_tool_for_provider(), ["gpt", "search"])
+        replacement.close()
+        self.assertEqual(runner._func_tool_for_provider(), ["grok", "gpt", "search"])
+        legacy.active = late_legacy.active = False
+
     async def test_upgrade_retained_legacy_wrapper_recognizes_new_names(self):
         legacy = load_module()
         legacy._TOOLS = frozenset({"gcp_step_image_generate", "gcp_step_image_edit"})
