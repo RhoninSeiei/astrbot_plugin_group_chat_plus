@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 
 GROUP_IMAGE_TOOL_NAMES = frozenset(
-    {"gcp_step_image_generate", "gcp_step_image_edit"}
+    {"gcp_step_image_generate", "gcp_step_image_edit", "gcp_grok_image", "gcp_gpt_image"}
 )
 _STATE_ATTR = "_gcp_image_tool_timeout_override_state"
 _LOCK_ATTR = "_gcp_image_tool_timeout_override_lock"

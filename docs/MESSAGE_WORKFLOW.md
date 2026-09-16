@@ -378,9 +378,9 @@ OAuth 接口适配：读空气、通用判断和最终判断请求显式使用 `
 
 插件构造阶段使用内部标记 `image_tool_backend_config_version` 处理 AstrBot schema 自动补齐带来的兼容差异。新安装保留 Codex OAuth 默认值，现有配置首次迁移时选择 StepFun；选定值用于本次运行，并立即尝试写入迁移标记。
 
-群聊图片工具的内部 LLM 名称保持为 `gcp_step_image_generate` 与 `gcp_step_image_edit`。工具命中后的消息顺序固定为：插件先发送一次随后端变化的进度文本，图片后端执行生成或编辑，插件发送一次图片结果，工具向 Agent 返回安全摘要，主模型再结合当前群人格生成自然语言收尾。Codex OAuth 进度文本使用“OpenAI Codex 图像生成服务”，StepFun 进度文本使用“阶跃星辰 Step Image Edit 2”。
+群聊图片工具注册为 `gcp_grok_image` 与 `gcp_gpt_image`。普通成员在实际模型请求前只看到匹配接口，模型回退后重新筛选；管理员可明确指定另一接口。主模型调用前自然说明所选接口，工具每轮只提交一次并发送一次图片，随后返回安全摘要，由主模型按当前人格收尾。插件不替换模型文字，也不发送固定进度正文。
 
-图片提示词上限随后端分别校验：Codex OAuth 最多 2048 个字符，StepFun 最多 512 个字符。
+Codex OAuth 提示词最多 2048 字符，Grok 默认 9216 字符、可配置至 32000。Grok 编辑单独保留完整用户原文及模型辅助理解，最多五张原图；超限拒绝提交，不截断要求。
 
 Codex OAuth 适配器在调用前读取 `generate_image()` 签名。支持显式 `timeout` 或 `**kwargs` 时，单次 Provider 超时与外层最大等待值一致；旧签名省略该关键字，无法读取签名时按旧 Provider 处理。能力判断发生在调用前，适配器每次工具执行只调用一次 `generate_image()`，不会因签名兼容问题重复调用；Provider 内部仍可执行鉴权刷新和 HTTP 重试。旧 Provider 的实际请求还可能受自身 HTTP 超时约束，生产 Codex OAuth Provider 已支持单次超时参数。
 

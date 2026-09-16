@@ -1,16 +1,18 @@
 import asyncio
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
-import sys
-import tempfile
+from types import ModuleType, SimpleNamespace
 import unittest
+import uuid
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "gcp_grok_image_service_test", ROOT / "utils/grok_oauth_image_service.py"
-)
+package = ModuleType("gcp_grok_adapter_test")
+package.__path__ = [str(ROOT / "utils")]
+package.__spec__ = importlib.util.spec_from_loader("gcp_grok_adapter_test", loader=None, is_package=True)
+sys.modules[package.__name__] = package
+spec = importlib.util.spec_from_file_location("gcp_grok_adapter_test.grok_oauth_image_service", ROOT / "utils/grok_oauth_image_service.py")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
@@ -35,9 +37,8 @@ class Provider:
 
 class GrokImageServiceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / "image.png"
+        self.path = ROOT / "tests" / f"_grok_test_{uuid.uuid4().hex}.png"
+        self.addCleanup(self.path.unlink, missing_ok=True)
         self.path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
         self.provider = Provider(str(self.path))
         self.config = {"image_planner_provider_id": "grok_oauth/grok-4.6"}
@@ -116,7 +117,7 @@ class GrokImageServiceTest(unittest.IsolatedAsyncioTestCase):
                 await self.service().generate(prompt="cat")
             self.assertEqual(len(self.provider.calls), 1)
             self.assertNotIn("SECRET", str(caught.exception))
-            self.assertIsNone(caught.exception.__context__)
+            self.assertTrue(caught.exception.__suppress_context__)
 
     async def test_cancellation_propagates(self):
         async def cancel(**kwargs):
@@ -125,20 +126,18 @@ class GrokImageServiceTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.service().generate(prompt="cat")
 
-    async def test_timeout_cancels_single_request(self):
-        cancelled = []
+    async def test_provider_owns_deadline_and_outcome_unknown_survives(self):
         async def wait(**kwargs):
             self.provider.calls.append(kwargs)
-            try:
-                await asyncio.sleep(10)
-            finally:
-                cancelled.append(True)
+            await asyncio.sleep(1.05)
+            raise type("OutcomeUnknown", (Exception,), {"code": "OutcomeUnknown", "request_id": "safe-123"})("secret")
         self.provider.generate_image = wait
         with self.assertRaises(module.GrokOAuthImageProviderError) as caught:
             await self.service(grok_image_timeout=1).generate(prompt="cat")
-        self.assertEqual(caught.exception.reason_code, "provider_timeout")
+        self.assertEqual(caught.exception.reason_code, "outcome_unknown")
+        self.assertEqual(caught.exception.request_id, "safe-123")
         self.assertEqual(len(self.provider.calls), 1)
-        self.assertEqual(cancelled, [True])
+        self.assertEqual(self.provider.calls[0]["timeout"], 1)
 
     async def test_concurrent_requests_keep_independent_geometry(self):
         config_before = dict(self.config)
@@ -149,12 +148,92 @@ class GrokImageServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.config, config_before)
 
     async def test_invalid_prompt_and_timeout_do_not_call_provider(self):
-        for prompt, config in (("", {}), ("x" * 2049, {}), ("cat", {"grok_image_timeout": 601}),
+        for prompt, config in (("", {}), ("x" * 9217, {}), ("cat", {"grok_image_timeout": 601}),
                                ("cat", {"grok_image_timeout": float("inf")})):
             with self.subTest(length=len(prompt), config=config):
                 with self.assertRaises((module.GrokOAuthImageUserError, module.GrokOAuthImageConfigError)):
                     await self.service(**config).generate(prompt=prompt)
         self.assertEqual(self.provider.calls, [])
+
+    async def test_prompt_budget_default_and_override(self):
+        await self.service().generate(prompt="x" * 9216)
+        await self.service(grok_image_prompt_max_chars=2048).generate(prompt="x" * 2048)
+        with self.assertRaises(module.GrokOAuthImageUserError):
+            await self.service(grok_image_prompt_max_chars=2048).generate(prompt="x" * 2049)
+        for invalid in (2047, 32001, True, "bad"):
+            with self.subTest(invalid=invalid), self.assertRaises(module.GrokOAuthImageConfigError):
+                await self.service(grok_image_prompt_max_chars=invalid).generate(prompt="cat")
+        self.assertEqual(len(self.provider.calls), 2)
+
+    async def test_native_size_and_compatibility_aliases(self):
+        for size, ratio, resolution in (("auto", "auto", "1k"), ("3:2@2k", "3:2", "2k"),
+                                        ("1080p", "16:9", "1k"), ("2048x2048", "1:1", "2k")):
+            with self.subTest(size=size):
+                await self.service().generate(prompt="cat", size=size)
+                call = self.provider.calls[-1]
+                self.assertEqual((call["aspect_ratio"], call["resolution"]), (ratio, resolution))
+
+    async def test_multiple_references_and_total_limit(self):
+        other = self.path.with_suffix(".webp")
+        self.addCleanup(other.unlink, missing_ok=True)
+        other.write_bytes(b"RIFF\x04\x00\x00\x00WEBP")
+        await self.service().edit(prompt="combine", image_paths=[str(self.path), str(other)], size="9:16@2k")
+        call = self.provider.calls[-1]
+        self.assertEqual(len(call["reference_images"]), 2)
+        self.assertTrue(call["reference_images"][1].startswith("data:image/webp;base64,"))
+        self.assertEqual((call["aspect_ratio"], call["resolution"]), ("9:16", "2k"))
+        with self.assertRaises(module.GrokOAuthImageUserError):
+            await self.service().edit(prompt="cat", image_paths=[str(self.path)] * 6)
+
+    async def test_total_reference_bytes_rejected_before_sdk(self):
+        service = self.service()
+        service._reference = lambda _: ("data:image/png;base64,AA==", 20 * 1024 * 1024)
+        with self.assertRaises(module.GrokOAuthImageUserError):
+            await service.edit(prompt="cat", image_paths=[str(self.path)] * 5)
+        self.assertEqual(self.provider.calls, [])
+
+    async def test_reference_rejects_symlink_gif_and_non_regular(self):
+        link = self.path.with_suffix(".link")
+        self.addCleanup(link.unlink, missing_ok=True)
+        try:
+            link.symlink_to(self.path)
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            with self.assertRaises(module.GrokOAuthImageUserError):
+                await self.service().edit(prompt="cat", image_path=str(link))
+        self.path.write_bytes(b"GIF89a_data")
+        with self.assertRaises(module.GrokOAuthImageUserError):
+            await self.service().edit(prompt="cat", image_path=str(self.path))
+        self.assertEqual(self.provider.calls, [])
+
+    async def test_typed_provider_error_retains_safe_assets(self):
+        async def fail(**kwargs):
+            self.provider.calls.append(kwargs)
+            error = type("Busy", (Exception,), {"code": "Busy", "partial": True,
+                       "assets": [SimpleNamespace(path=str(self.path), mime_type="image/png")],
+                       "request_id": "unsafe/token"})("credential")
+            raise error
+        self.provider.generate_image = fail
+        with self.assertRaises(module.GrokOAuthImageProviderError) as caught:
+            await self.service().generate(prompt="cat")
+        error = caught.exception
+        self.assertEqual(error.reason_code, "busy")
+        self.assertTrue(error.partial)
+        self.assertEqual(error.assets[0].path, str(self.path))
+        self.assertEqual(error.request_id, "")
+        self.assertNotIn("credential", str(error))
+        self.assertEqual(len(self.provider.calls), 1)
+
+    async def test_multiple_outputs_are_error_with_valid_assets(self):
+        async def many(**kwargs):
+            return [SimpleNamespace(path=str(self.path), mime_type="image/png"),
+                    SimpleNamespace(path="missing", mime_type="image/png")]
+        self.provider.generate_image = many
+        with self.assertRaises(module.GrokOAuthImageProviderError) as caught:
+            await self.service().generate(prompt="cat")
+        self.assertEqual(caught.exception.reason_code, "invalid_result")
+        self.assertEqual([a.path for a in caught.exception.assets], [str(self.path)])
 
     async def test_missing_output_and_source_fail_without_exposing_paths(self):
         self.provider.path = str(self.path.parent / "missing.png")

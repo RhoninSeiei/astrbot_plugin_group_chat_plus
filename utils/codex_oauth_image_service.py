@@ -107,7 +107,7 @@ class CodexOAuthImageService:
             action="generate",
         )
 
-    async def edit(self, *, prompt: str, image_path: str) -> CodexOAuthImageResult:
+    async def edit(self, *, prompt: str, image_path: str, size: str = "") -> CodexOAuthImageResult:
         source = None
         source_is_file = False
         source_error = None
@@ -125,7 +125,7 @@ class CodexOAuthImageService:
             raise CodexOAuthImageUserError("未找到可用于编辑的图片。")
         return await self._execute(
             prompt=prompt,
-            size=self.config.get("codex_oauth_image_default_size", DEFAULT_CODEX_SIZE),
+            size=size or self.config.get("codex_oauth_image_default_size", DEFAULT_CODEX_SIZE),
             reference_images=[str(source)],
             action="edit",
         )

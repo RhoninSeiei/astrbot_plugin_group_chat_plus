@@ -100,10 +100,11 @@ class FakeStepImageVisibilityEvent:
 
 
 class FakeEvent:
-    def __init__(self, order):
+    def __init__(self, order, message_text=""):
         self.extras = {}
         self.order = order
         self.sent = []
+        self.message_text = message_text
 
     def get_extra(self, key, default=None):
         return self.extras.get(key, default)
@@ -113,6 +114,9 @@ class FakeEvent:
             self.extras.pop(key, None)
         else:
             self.extras[key] = value
+
+    def get_message_str(self):
+        return self.message_text
 
     async def send(self, chain):
         payload = list(chain.chain)
@@ -132,6 +136,9 @@ class RecordingFacade:
         if self.error is not None:
             raise self.error
         return SimpleNamespace(path="generated.png")
+
+    def backend_name(self):
+        return "codex_oauth"
 
     async def edit(self, **kwargs):
         self.calls.append(("edit", kwargs))
@@ -248,7 +255,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                 ),
                 "GroupImageService": FakeGroupImageService,
                 "resolve_group_image_tool_timeout": resolve_timeout,
-                "install_image_planner_context": lambda: SimpleNamespace(close=lambda: None),
+                "install_image_planner_context": lambda **kwargs: SimpleNamespace(close=lambda: None),
                 "install_group_image_tool_timeout_override": (
                     install_timeout_override
                 ),
@@ -276,6 +283,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             _compute_session_integrity=compute_session_integrity,
             _emit_session_metadata=emit_session_metadata,
             _build_proactive_config=lambda: {},
+            _filter_image_tools_for_provider=lambda *args: None,
         )
         state = SimpleNamespace(
             events=events,
@@ -294,6 +302,10 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "_send_step_image_progress",
             "_send_step_image_image_result",
             "_run_step_image_operation",
+            "_image_provider_failure_message",
+            "_run_named_image_tool",
+            "gcp_grok_image",
+            "gcp_gpt_image",
             "gcp_step_image_generate",
             "gcp_step_image_edit",
         )
@@ -324,6 +336,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             "MessageEventResult": FakeMessageEventResult,
             "Path": Path,
             "logger": logger,
+            "is_image_admin": lambda event: False,
             "sanitize_tool_call_markup": lambda value: SimpleNamespace(
                 sanitized_text=str(value or "")
             ),
@@ -374,6 +387,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         namespace = {
             "GroupImageService": FakeGroupImageService,
             "STEP_IMAGE_TOOL_NAMES": STEP_IMAGE_TOOL_NAMES,
+            "LEGACY_IMAGE_TOOLS": frozenset({"gcp_step_image_generate", "gcp_step_image_edit"}),
             "ToolPolicy": ToolPolicy,
         }
         exec(compile(module, "main.py", "exec"), namespace)
@@ -388,6 +402,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         harness.enable_group_chat = enable_group_chat
         harness.step_image_config = {"image_tool_backend": "codex_oauth"}
         harness.enabled_groups = list(enabled_groups or ["10001"])
+        harness._image_planner_context_handle = object()
         return harness
 
     def _make_guard_harness(
@@ -460,9 +475,9 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             pass
 
         for name, value in namespace.items():
-            if name.startswith("_") or name.startswith("gcp_step_image_"):
+            if name.startswith("_") or name.startswith("gcp_"):
                 if callable(value):
-                    setattr(ToolHarness, name, value)
+                    setattr(ToolHarness, name, staticmethod(value) if name == "_image_provider_failure_message" else value)
 
         harness = ToolHarness()
         harness._step_image_guard = lambda event: None
@@ -471,7 +486,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         )
         harness._append_step_image_pending_progress = lambda event, text: None
         harness._cleanup_step_image_outputs = lambda: facade.order.append("cleanup")
-        harness._get_step_image_service = lambda event: facade
+        harness._get_step_image_service = lambda event, backend=None: facade
         harness._image_operation_tasks = set()
         harness._image_tools_terminated = False
         harness._get_step_image_group_id = lambda event: "group-1"
@@ -480,6 +495,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             return current_image
 
         harness._extract_first_current_image_path = extract_current_image
+        harness._extract_current_image_paths = lambda event: asyncio.sleep(0, result=[current_image] if current_image else [])
         return harness, logger
 
     @staticmethod
@@ -512,6 +528,8 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         original = FakeToolContainer(
             [
                 "normal_search",
+                "gcp_grok_image",
+                "gcp_gpt_image",
                 "gcp_step_image_generate",
                 "astrbot_plugin_imgflow_generate_image",
                 "gcp_step_image_edit",
@@ -522,14 +540,15 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             event, original
         )
 
-        self.assertIs(filtered, original)
-        self.assertEqual(removed, [])
+        self.assertIsNot(filtered, original)
+        self.assertEqual([tool.name for tool in filtered.tools], ["normal_search", "gcp_grok_image", "gcp_gpt_image", "astrbot_plugin_imgflow_generate_image"])
+        self.assertEqual(removed, ["gcp_step_image_generate", "gcp_step_image_edit"])
 
     def test_planner_routing_hides_native_grok_tools_without_mutating_registry(self):
         harness = self._make_visibility_harness()
         harness.step_image_config["image_planner_provider_id"] = "selected/planner"
         event = FakeStepImageVisibilityEvent("aiocqhttp:GroupMessage:10001", is_private=False)
-        names = ["normal_search", "gcp_step_image_generate", "gcp_step_image_edit",
+        names = ["normal_search", "gcp_grok_image", "gcp_gpt_image", "gcp_step_image_generate", "gcp_step_image_edit",
                  "grok_image_generate", "grok_image_edit"]
         original = FakeToolContainer(names)
         filtered, removed = harness._filter_step_image_tools_for_request(event, original)
@@ -725,14 +744,16 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
     def test_main_registers_guarded_step_image_tools(self):
         self.assertIn(
-            '@filter.llm_tool(name="gcp_step_image_generate")', self.main_source
+            '@filter.llm_tool(name="gcp_grok_image")', self.main_source
         )
-        self.assertIn('@filter.llm_tool(name="gcp_step_image_edit")', self.main_source)
+        self.assertIn('@filter.llm_tool(name="gcp_gpt_image")', self.main_source)
+        self.assertEqual(self._method_node("gcp_step_image_generate").decorator_list, [])
+        self.assertEqual(self._method_node("gcp_step_image_edit").decorator_list, [])
         self.assertIn(
             "GroupImageService.is_enabled(self.step_image_config)", self.main_source
         )
         self.assertIn("self._is_step_image_enabled_for_event(event)", self.main_source)
-        self.assertIn("await self._send_step_image_progress", self.main_source)
+        self.assertNotIn("await self._send_step_image_progress(event", self._method_source("_run_step_image_operation"))
         self.assertIn("await self._send_step_image_image_result", self.main_source)
 
     def test_group_image_tool_timeout_override_is_lifecycle_scoped(self):
@@ -852,7 +873,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     is_enabled=lambda config: True
                 ),
                 "resolve_group_image_tool_timeout": lambda config, **kwargs: 300,
-                "install_image_planner_context": lambda: SimpleNamespace(close=lambda: None),
+                "install_image_planner_context": lambda **kwargs: SimpleNamespace(close=lambda: None),
                 "install_group_image_tool_timeout_override": (
                     install_timeout_override
                 ),
@@ -870,6 +891,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             _compute_session_integrity=lambda seed: "session-sig",
             _emit_session_metadata=lambda: None,
             _build_proactive_config=lambda: {},
+            _filter_image_tools_for_provider=lambda *args: None,
         )
 
         asyncio.run(initialize(plugin))
@@ -958,7 +980,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
         self.assertIn("群聊图片工具", self.main_source)
         self.assertIn("自然语言", self.main_source)
-        self.assertIn("先提交工具参数并等待工具结果", self.main_source)
+        self.assertIn("每轮只提交一次并等待完成", self.main_source)
         self.assertIn("成功时图片由工具发送一次", self.main_source)
         self.assertIn("禁止输出工具协议、参数、Provider ID", self.main_source)
         self.assertIn(
@@ -1009,20 +1031,14 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertIn("def _sanitize_step_image_stale_text", self.main_source)
         self.assertIn("历史中的图片能力拒绝说法属于过期记录", self.main_source)
 
-    def test_intermediate_step_image_text_becomes_progress_message(self):
+    def test_intermediate_step_image_text_keeps_model_notice(self):
         replace_source = self._method_source(
             "_maybe_replace_step_image_intermediate_text"
         )
-        append_source = self._method_source("_append_step_image_pending_progress")
-
-        self.assertIn("self._infer_step_image_action(event)", replace_source)
-        self.assertIn("self._build_step_image_progress_text(action)", replace_source)
-        self.assertIn("PLUGIN_STEP_IMAGE_PROGRESS_SENT", replace_source)
-        self.assertIn(
-            "pending_replies[-1] != progress_text",
-            append_source,
-        )
-        self.assertNotIn("reply_text", append_source)
+        self.assertIn("return None", replace_source)
+        self.assertNotIn("self._build_step_image_progress_text", replace_source)
+        method = self._compile_unbound_method("_maybe_replace_step_image_intermediate_text", {"AstrMessageEvent": object})
+        self.assertIsNone(method(object(), FakeEvent([]), "message-id", "正在使用 Grok Imagine 2.0。"))
 
     def test_preplanning_progress_does_not_guess_a_backend(self):
         class FakeService:
@@ -1460,16 +1476,14 @@ class StepImageToolIntegrationTest(unittest.TestCase):
 
         self.assertEqual(
             order,
-            ["text", "cleanup", "facade_generate", "image"],
+            ["cleanup", "facade_generate", "image"],
         )
         self.assertEqual(
             facade.calls,
             [("generate", {"prompt": "orange cat", "size": ""})],
         )
-        self.assertEqual(len(event.sent), 2)
-        self.assertEqual(event.sent[0], [("text", "progress:generate")])
-        self.assertEqual(event.sent[1], [("image", "generated.png")])
-        self.assertTrue(event.extras["progress_sent"])
+        self.assertEqual(event.sent, [[("image", "generated.png")]])
+        self.assertNotIn("progress_sent", event.extras)
         self.assertTrue(event.extras["image_sent"])
         self.assertTrue(event.extras["tool_hit"])
         self.assertEqual(event.extras["action"], "generate")
@@ -1492,7 +1506,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             harness.gcp_step_image_edit(event, prompt="change the sky")
         )
 
-        self.assertEqual(order, ["text", "cleanup", "facade_edit", "image"])
+        self.assertEqual(order, ["cleanup", "facade_edit", "image"])
         self.assertEqual(
             facade.calls,
             [
@@ -1501,11 +1515,12 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     {
                         "prompt": "change the sky",
                         "image_path": "current-source.png",
+                        "size": "",
                     },
                 )
             ],
         )
-        self.assertEqual(len(event.sent), 2)
+        self.assertEqual(len(event.sent), 1)
         self.assertEqual(event.extras["action"], "edit")
         self.assertEqual(event.extras["tool_status"], "success")
         self.assertEqual(
@@ -1526,7 +1541,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                 GroupImageProviderError(
                     "provider exposed sensitive-token-value at /private/provider.json"
                 ),
-                "图片生成失败，稍后再试。",
+                "图片生成失败，本轮未重试。",
             ),
             (
                 RuntimeError(
@@ -1546,8 +1561,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     harness.gcp_step_image_generate(event, prompt="cat", size="")
                 )
 
-                self.assertEqual(len(event.sent), 1)
-                self.assertEqual(event.sent[0][0][0], "text")
+                self.assertEqual(len(event.sent), 0)
                 self.assertFalse(any(item[0][0] == "image" for item in event.sent))
                 self.assertEqual(event.extras["tool_status"], "failed")
                 self.assertEqual(event.extras["tool_message"], expected_message)
@@ -1568,7 +1582,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             ),
             (
                 GroupImageProviderError("sensitive-token-value"),
-                "图片编辑失败，稍后再试。",
+                "图片编辑失败，本轮未重试。",
             ),
             (RuntimeError("sensitive-token-value"), "图片编辑失败，稍后再试。"),
         )
@@ -1583,7 +1597,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     harness.gcp_step_image_edit(event, prompt="change")
                 )
 
-                self.assertEqual(len(event.sent), 1)
+                self.assertEqual(len(event.sent), 0)
                 self.assertFalse(any(item[0][0] == "image" for item in event.sent))
                 self.assertEqual(event.extras["tool_status"], "failed")
                 self.assertEqual(event.extras["tool_message"], expected_message)
@@ -1663,7 +1677,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             ],
         )
 
-    def test_progress_and_image_markers_prevent_duplicate_sends(self):
+    def test_per_turn_claim_prevents_duplicate_submissions(self):
         order = []
         facade = RecordingFacade(order)
         harness, _logger = self._make_tool_harness(facade)
@@ -1677,9 +1691,56 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         )
 
         sent_kinds = [payload[0][0] for payload in event.sent]
-        self.assertEqual(sent_kinds.count("text"), 1)
+        self.assertEqual(sent_kinds.count("text"), 0)
         self.assertEqual(sent_kinds.count("image"), 1)
-        self.assertEqual(len(facade.calls), 2)
+        self.assertEqual(len(facade.calls), 1)
+
+    def test_public_tools_select_backend_and_reject_second_submission(self):
+        for method_name, backend in (("gcp_grok_image", "grok_oauth"), ("gcp_gpt_image", "codex_oauth")):
+            with self.subTest(method_name=method_name):
+                order = []
+                facade = RecordingFacade(order)
+                harness, _ = self._make_tool_harness(facade)
+                selected = []
+                harness._get_step_image_service = lambda event, backend=None: (selected.append(backend), facade)[1]
+                event = FakeEvent(order)
+                tool = getattr(harness, method_name)
+                first = self._collect_tool_results(tool(event, prompt="cat", size="1:1"))
+                second = self._collect_tool_results(tool(event, prompt="cat", size="1:1"))
+                self.assertEqual(selected, [backend])
+                self.assertEqual(facade.calls, [("generate", {"prompt": "cat", "size": "1:1"})])
+                self.assertEqual(event.sent, [[("image", "generated.png")]])
+                self.assertIn("成功", first[0])
+                self.assertEqual(second, ["本轮已有图片任务，不会重复提交或切换接口。"])
+
+    def test_grok_edit_preserves_raw_request_and_all_current_references(self):
+        order = []
+        facade = RecordingFacade(order)
+        facade.backend_name = lambda: "grok_oauth"
+        harness, _ = self._make_tool_harness(facade)
+        harness._extract_current_image_paths = lambda event: asyncio.sleep(0, result=["one.png", "two.png"])
+        event = FakeEvent(order, message_text="只改第二张的天空，保留人物")
+        result = self._collect_tool_results(harness.gcp_grok_image(event, prompt="改成蓝天", action="edit", size="16:9@2k"))
+        self.assertIn("成功", result[0])
+        self.assertEqual(len(facade.calls), 1)
+        action, kwargs = facade.calls[0]
+        self.assertEqual(action, "edit")
+        self.assertEqual(kwargs["image_paths"], ["one.png", "two.png"])
+        self.assertEqual(kwargs["size"], "16:9@2k")
+        self.assertIn("只改第二张的天空，保留人物", kwargs["prompt"])
+        self.assertIn("改成蓝天", kwargs["prompt"])
+
+    def test_unknown_provider_outcome_has_safe_notice_and_no_retry(self):
+        order = []
+        error = GroupImageProviderError("token=SECRET", reason_code="outcome_unknown", backend="grok_oauth")
+        facade = RecordingFacade(order, error=error)
+        harness, logger = self._make_tool_harness(facade)
+        event = FakeEvent(order)
+        result = self._collect_tool_results(harness.gcp_grok_image(event, prompt="cat"))
+        self.assertEqual(len(facade.calls), 1)
+        self.assertEqual(event.sent, [])
+        self.assertIn("结果尚未确认", result[0])
+        self.assertNotIn("SECRET", repr((result, logger.records, event.extras)))
 
     def test_image_tool_exception_logs_use_fixed_operation_codes(self):
         method_names = (
@@ -1772,7 +1833,12 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         calls = []
         get_service = self._compile_unbound_method(
             "_get_step_image_service",
-            {"AstrMessageEvent": object, "GroupImageService": lambda **kwargs: calls.append(kwargs)},
+            {"AstrMessageEvent": object, "GroupImageService": lambda **kwargs: calls.append(kwargs),
+             "ImageToolRoutingError": ValueError,
+             "GroupImageUserError": GroupImageUserError,
+             "resolve_image_tool_route": lambda event, provider, backend, context, config: (
+                 SimpleNamespace(provider=provider) if provider is not None else (_ for _ in ()).throw(ValueError("missing planner"))
+             )},
         )
         event, provider = object(), object()
         plugin = SimpleNamespace(
@@ -1783,11 +1849,12 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         get_service(plugin, event)
         self.assertTrue(calls[-1]["require_planner"])
         self.assertIs(calls[-1]["planner_provider"], provider)
-        get_service(plugin, object())
-        self.assertIsNone(calls[-1]["planner_provider"])
+        with self.assertRaises(GroupImageUserError):
+            get_service(plugin, object())
+        self.assertIs(calls[-1]["planner_provider"], provider)
         self.assertTrue(calls[-1]["require_planner"])
 
-    def test_terminate_during_reference_read_or_progress_cancels_whole_tool(self):
+    def test_terminate_during_reference_read_or_image_send_cancels_whole_tool(self):
         async def scenario(stage):
             started = asyncio.Event()
             cancelled = asyncio.Event()
@@ -1817,10 +1884,10 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await tool_task
             self.assertTrue(cancelled.is_set())
-            self.assertEqual(facade.calls, [])
+            self.assertEqual(len(facade.calls), 0 if stage == "reference" else 1)
             self.assertEqual(event.sent, [])
             self.assertEqual(harness._image_operation_tasks, set())
-        for stage in ("reference", "progress"):
+        for stage in ("reference", "image_send"):
             with self.subTest(stage=stage):
                 asyncio.run(scenario(stage))
 

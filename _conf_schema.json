@@ -301,7 +301,7 @@
     "codex_oauth_image_provider_id": {
         "description": "🖼️ Codex OAuth 图片 Provider",
         "type": "string",
-        "hint": "旧版本兼容字段。群聊绘图使用实际发起工具调用的 Codex OAuth Provider。",
+        "hint": "管理员从其他规划模型明确指定 GPT Image 时使用；默认绘图仍绑定实际规划 Provider。",
         "default": "openai_oauth/gpt-5.6-sol",
         "_special": "select_provider"
     },
@@ -311,6 +311,19 @@
         "hint": "旧版本兼容字段。群聊绘图自动跟随实际调用工具的规划模型，包含 AstrBot 回退后的模型；留空不会默认切换到 Codex。",
         "default": "",
         "_special": "select_provider"
+    },
+    "grok_image_provider_id": {
+        "description": "管理员指定 Grok 图片接口的 Provider",
+        "type": "string",
+        "hint": "仅用于管理员跨接口指定 Grok；默认绘图绑定实际规划 Provider。",
+        "default": "grok_oauth/grok-4.6",
+        "_special": "select_provider"
+    },
+    "grok_image_prompt_max_chars": {
+        "description": "Grok 图片提示词字符预算",
+        "type": "int",
+        "hint": "范围 2048 至 32000，包含编辑原文和辅助理解。超出时拒绝提交，不截断要求。",
+        "default": 9216
     },
     "grok_image_model": {
         "description": "Grok Imagine 图片模型",

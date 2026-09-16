@@ -4,13 +4,24 @@ import sys
 import types
 import traceback
 import unittest
-import tempfile
+from contextlib import contextmanager
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_PACKAGE = "group_image_service_test_utils"
+
+
+@contextmanager
+def workspace_image_file():
+    path = REPO_ROOT / "tests" / f"_group_image_{uuid.uuid4().hex}.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\noriginal")
+    try:
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _load_service_module():
@@ -88,9 +99,7 @@ def raising_factory(error):
 class GroupImageServiceTest(unittest.TestCase):
     def test_actual_caller_drives_real_adapters_for_generation_and_editing(self):
         for backend in ("grok_oauth", "codex_oauth"):
-            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmpdir:
-                path = Path(tmpdir) / "result.png"
-                path.write_bytes(b"\x89PNG\r\n\x1a\noriginal")
+            with self.subTest(backend=backend), workspace_image_file() as path:
                 calls = []
                 async def generate_image(**kwargs):
                     calls.append(kwargs)
@@ -169,7 +178,7 @@ class GroupImageServiceTest(unittest.TestCase):
         self.assertEqual(result.backend, "grok_oauth")
         self.assertEqual(backend.calls, [("generate", {"prompt": "cat", "size": "16:9"})])
         asyncio.run(service.edit(prompt="change subject", image_path="original.png"))
-        self.assertEqual(backend.calls[-1], ("edit", {"prompt": "change subject", "image_path": "original.png"}))
+        self.assertEqual(backend.calls[-1], ("edit", {"prompt": "change subject", "image_paths": ["original.png"], "size": ""}))
 
     def test_codex_planner_uses_selected_provider_and_model(self):
         seen = []
@@ -319,12 +328,23 @@ class GroupImageServiceTest(unittest.TestCase):
 
         self.assertEqual(
             codex.calls,
-            [("edit", {"prompt": "blue sky", "image_path": "input.png"})],
+            [("edit", {"prompt": "blue sky", "image_path": "input.png", "size": ""})],
         )
         self.assertEqual(result.path, "result.png")
         self.assertEqual(result.mode, "edit")
         self.assertEqual(result.media_type, "image/webp")
         self.assertEqual(result.revised_prompt, "revised")
+
+    def test_edit_forwards_backend_specific_size_and_references(self):
+        grok = RecordingBackend("grok_oauth")
+        grok_service = self.planner_service("grok_oauth_chat_completion", grok=grok)
+        asyncio.run(grok_service.edit(prompt="keep face", image_paths=["a.png", "b.png"], size="16:9@2k"))
+        self.assertEqual(grok.calls, [("edit", {"prompt": "keep face", "image_paths": ["a.png", "b.png"], "size": "16:9@2k"})])
+
+        codex = RecordingBackend("codex_oauth")
+        codex_service = self.make_service(config={"image_tool_backend": "codex_oauth"}, codex=codex)
+        asyncio.run(codex_service.edit(prompt="keep face", image_path="a.png", size="1536x1024"))
+        self.assertEqual(codex.calls, [("edit", {"prompt": "keep face", "image_path": "a.png", "size": "1536x1024"})])
 
     def test_stepfun_result_keeps_legacy_defaults(self):
         class LegacyStepBackend:

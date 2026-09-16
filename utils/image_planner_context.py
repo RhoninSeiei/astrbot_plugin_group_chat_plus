@@ -12,14 +12,15 @@ import inspect
 
 
 _STATE_ATTR = "_gcp_image_planner_context_state"
-_TOOLS = frozenset({"gcp_step_image_generate", "gcp_step_image_edit"})
+_TOOLS = frozenset({"gcp_step_image_generate", "gcp_step_image_edit", "gcp_grok_image", "gcp_gpt_image"})
 
 
 class ImagePlannerContextHandle:
-    def __init__(self, runner_cls, state):
+    def __init__(self, runner_cls, state, tool_filter=None):
         self.runner_cls = runner_cls
         self.state = state
         self.active = True
+        self.tool_filter = tool_filter
         state["handles"].add(self)
 
     def provider_for(self, event):
@@ -37,19 +38,35 @@ class ImagePlannerContextHandle:
         self.state["handles"].discard(self)
         if self.state["handles"]:
             return
-        # Preserve a wrapper another plugin installed after this one. Our
-        # remaining wrapper is inert and can be reused on the next initialize.
-        if self.runner_cls.__dict__.get("_handle_function_tools") is self.state["wrapper"]:
-            setattr(self.runner_cls, "_handle_function_tools", self.state["original"])
-            if self.runner_cls.__dict__.get(_STATE_ATTR) is self.state:
-                delattr(self.runner_cls, _STATE_ATTR)
+        filter_wrapper = self.state.get("filter_wrapper")
+        # Restore both hooks together. If an outer wrapper owns either method,
+        # keep both inert hooks and their shared state reusable across reload.
+        if self.runner_cls.__dict__.get("_handle_function_tools") is not self.state["wrapper"]:
+            return
+        if filter_wrapper is not None and self.runner_cls.__dict__.get("_func_tool_for_provider") is not filter_wrapper:
+            return
+        if filter_wrapper is not None:
+            setattr(self.runner_cls, "_func_tool_for_provider", self.state["original_filter"])
+        setattr(self.runner_cls, "_handle_function_tools", self.state["original"])
+        if self.runner_cls.__dict__.get(_STATE_ATTR) is self.state:
+            delattr(self.runner_cls, _STATE_ATTR)
 
 
-def install_image_planner_context(runner_cls=None):
+def install_image_planner_context(runner_cls=None, *, tool_filter=None):
     if runner_cls is None:
         module = importlib.import_module("astrbot.core.agent.runners.tool_loop_agent_runner")
         runner_cls = module.ToolLoopAgentRunner
+    if tool_filter is not None and not callable(getattr(runner_cls, "_func_tool_for_provider", None)):
+        raise TypeError("AstrBot does not expose per-provider tool selection")
     state = runner_cls.__dict__.get(_STATE_ATTR)
+    if state is not None:
+        # A pre-upgrade wrapper may remain underneath another plugin's wrapper.
+        # Its closure reads the old module's _TOOLS global; extend only that
+        # plugin-owned set so the retained context binding recognizes new names.
+        wrapper_globals = getattr(state.get("wrapper"), "__globals__", {})
+        old_names = wrapper_globals.get("_TOOLS")
+        if isinstance(old_names, frozenset):
+            wrapper_globals["_TOOLS"] = old_names | _TOOLS
     if state is None:
         original = runner_cls.__dict__.get("_handle_function_tools")
         if not inspect.isasyncgenfunction(original):
@@ -90,4 +107,19 @@ def install_image_planner_context(runner_cls=None):
         state["wrapper"] = with_image_planner
         setattr(runner_cls, _STATE_ATTR, state)
         setattr(runner_cls, "_handle_function_tools", with_image_planner)
-    return ImagePlannerContextHandle(runner_cls, state)
+    if tool_filter is not None and "filter_wrapper" not in state:
+        state["original_filter"] = runner_cls._func_tool_for_provider
+
+        def with_image_tool_visibility(runner):
+            selected = state["original_filter"](runner)
+            context = getattr(getattr(runner, "run_context", None), "context", None)
+            event = getattr(context, "event", None)
+            provider = getattr(runner, "provider", None)
+            for handle in tuple(state["handles"]):
+                if handle.active and handle.tool_filter is not None:
+                    selected = handle.tool_filter(event, provider, selected)
+            return selected
+
+        state["filter_wrapper"] = with_image_tool_visibility
+        setattr(runner_cls, "_func_tool_for_provider", with_image_tool_visibility)
+    return ImagePlannerContextHandle(runner_cls, state, tool_filter)

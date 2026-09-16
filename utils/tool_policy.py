@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
-STEP_IMAGE_TOOL_NAMES = frozenset({"gcp_step_image_generate", "gcp_step_image_edit"})
+STEP_IMAGE_TOOL_NAMES = frozenset({"gcp_step_image_generate", "gcp_step_image_edit", "gcp_grok_image", "gcp_gpt_image"})
+
+
+def _expand_image_aliases(names):
+    result = set(_normalize_names(names))
+    if result & {"gcp_step_image_generate", "gcp_step_image_edit"}:
+        result.update({"gcp_grok_image", "gcp_gpt_image"})
+    return frozenset(result)
 
 
 @dataclass(frozen=True)
@@ -37,8 +44,8 @@ class ToolPolicy:
         tool_call_timeout: float = 0.0,
     ) -> "ToolPolicy":
         return cls(
-            allowed_tool_names=_normalize_names(tool_names),
-            denied_tool_names=_normalize_names(denied_tool_names),
+            allowed_tool_names=_expand_image_aliases(tool_names),
+            denied_tool_names=_expand_image_aliases(denied_tool_names),
             allowed_plugin_names=_normalize_names(allowed_plugin_names),
             max_steps=max(0, int(max_steps or 0)),
             tool_call_timeout=max(0.0, float(tool_call_timeout or 0.0)),

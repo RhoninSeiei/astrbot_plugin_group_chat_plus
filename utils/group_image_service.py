@@ -40,6 +40,9 @@ class GroupImageProviderError(Exception):
         *,
         reason_code: str = "provider_call_failed",
         backend: str = "unknown",
+        partial: bool = False,
+        assets=(),
+        request_id: str = "",
     ) -> None:
         super().__init__(message)
         self.reason_code = (
@@ -53,10 +56,16 @@ class GroupImageProviderError(Exception):
                 "result_read_failed",
                 "empty_result",
                 "result_file_missing",
+                "outcome_unknown", "payment_required", "rate_limited", "busy",
+                "permission_denied", "reauthorization_required", "request_rejected",
+                "invalid_result", "unexpected_asset_count",
             }
             else "provider_call_failed"
         )
         self.backend = backend if backend in {"stepfun", "codex_oauth", "grok_oauth"} else "unknown"
+        self.partial = bool(partial)
+        self.assets = tuple(assets)
+        self.request_id = request_id
 
 
 @dataclass(frozen=True)
@@ -158,7 +167,14 @@ class GroupImageService:
 
     def max_prompt_chars(self) -> int:
         if self.backend_name() == self.BACKEND_GROK_OAUTH:
-            return GrokOAuthImageService.MAX_PROMPT_CHARS
+            raw = self.config.get("grok_image_prompt_max_chars", GrokOAuthImageService.MAX_PROMPT_CHARS)
+            try:
+                budget = int(raw)
+            except (ValueError, TypeError, OverflowError):
+                raise GroupImageConfigError("Grok 图片提示词预算无效。") from None
+            if isinstance(raw, bool) or str(raw).strip() != str(budget) or not 2048 <= budget <= 32000:
+                raise GroupImageConfigError("Grok 图片提示词预算必须在 2048 至 32000 字符之间。")
+            return budget
         if self.backend_name() == self.BACKEND_CODEX_OAUTH:
             return CodexOAuthImageService.MAX_PROMPT_CHARS
         return StepImageService.MAX_PROMPT_CHARS
@@ -239,6 +255,7 @@ class GroupImageService:
             provider_error = GroupImageProviderError(
                 "图片服务调用失败。", reason_code=exc.reason_code,
                 backend=self.BACKEND_GROK_OAUTH,
+                partial=exc.partial, assets=exc.assets, request_id=exc.request_id,
             )
         except CodexOAuthImageProviderError as exc:
             provider_error = GroupImageProviderError(
@@ -250,12 +267,17 @@ class GroupImageService:
             raise provider_error from None
         return self._convert_result(result)
 
-    async def edit(self, *, prompt: str, image_path: str) -> GroupImageResult:
+    async def edit(self, *, prompt: str, image_path: str = "", image_paths=None, size: str = "") -> GroupImageResult:
         self._validate_prompt(prompt)
         provider_error = None
         try:
             backend = self._backend()
-            result = await backend.edit(prompt=prompt, image_path=image_path)
+            if self.backend_name() == self.BACKEND_GROK_OAUTH:
+                result = await backend.edit(prompt=prompt, image_paths=image_paths if image_paths is not None else [image_path], size=size)
+            elif self.backend_name() == self.BACKEND_CODEX_OAUTH:
+                result = await backend.edit(prompt=prompt, image_path=image_path, size=size)
+            else:
+                result = await backend.edit(prompt=prompt, image_path=image_path)
         except (StepImageUserError, CodexOAuthImageUserError, GrokOAuthImageUserError) as exc:
             raise GroupImageUserError(str(exc)) from None
         except (StepImageConfigError, CodexOAuthImageConfigError, GrokOAuthImageConfigError):
@@ -269,6 +291,7 @@ class GroupImageService:
             provider_error = GroupImageProviderError(
                 "图片服务调用失败。", reason_code=exc.reason_code,
                 backend=self.BACKEND_GROK_OAUTH,
+                partial=exc.partial, assets=exc.assets, request_id=exc.request_id,
             )
         except CodexOAuthImageProviderError as exc:
             provider_error = GroupImageProviderError(
