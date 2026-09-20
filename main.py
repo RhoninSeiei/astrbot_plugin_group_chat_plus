@@ -371,7 +371,7 @@ class ChatPlus(Star):
         )  # 回复AI提示词模式
         self.enable_main_model_final_decision = config.get(
             "enable_main_model_final_decision", True
-        )  # 主模型最终判断开关（第一层读空气放行后再做一次最终是否出手判断）
+        )  # 兼容旧键：一次完成是否接话和回复篇幅分类，不再串行复判。
 
         # === 消息格式配置 ===
         self.include_timestamp = config.get("include_timestamp", True)  # 包含时间戳
@@ -4431,6 +4431,7 @@ class ChatPlus(Star):
             True=应该回复, False=不回复
         """
         # v1.1.2: 检查关键词智能模式（使用已提取的实例变量）
+        DecisionAI.clear_reply_classification(event)
         keyword_smart_mode = self.keyword_smart_mode
 
         # 获取会话信息
@@ -4732,10 +4733,9 @@ class ChatPlus(Star):
                 conversation_fatigue_info=conversation_fatigue_info,
                 # 🆕 v1.2.1: 传递回复密度提示
                 reply_density_hint=reply_density_hint,
-                # 🆕 v1.3.1: 第一层读空气作为宽松粗筛，主模型后续再做最终判断
-                is_preliminary_filter=(
-                    self.enable_main_model_final_decision and should_do_ai_decision
-                ),
+                # 一次完成参与和篇幅判断，不再等待正式模型二次否决。
+                is_preliminary_filter=False,
+                select_reply_mode=self.enable_main_model_final_decision,
                 enable_reasoning=self.enable_decision_ai_reasoning,
                 reasoning_log_enabled=self.decision_ai_reasoning_log,
                 reasoning_log_mode=self.decision_ai_reasoning_log_mode,
@@ -4744,6 +4744,14 @@ class ChatPlus(Star):
                 include_persona=self.decision_ai_include_persona,
                 configured_persona_name=self.decision_ai_persona_name,
             )
+            if self.enable_main_model_final_decision:
+                classification = DecisionAI.get_reply_classification(event)
+                logger.info(
+                    "GCP_REPLY_CLASSIFIED mode=%s status=%s elapsed_ms=%s",
+                    classification.get("reply_mode") or "none",
+                    classification.get("status", "unavailable"),
+                    classification.get("elapsed_ms", 0),
+                )
             # 🐛 修复：不要在这里删除缓存！
             # pre_decision 模式下，缓存的上下文（已植入记忆）需要在生成回复时使用
             # 缓存会在 _generate_and_send_reply 中使用 .pop() 时自动删除
@@ -4877,25 +4885,12 @@ class ChatPlus(Star):
                     message_preview = (
                         formatted_context[:50] if formatted_context else ""
                     )
-                    if self.enable_main_model_final_decision and should_do_ai_decision:
-                        event.set_extra(
-                            PLUGIN_PENDING_MAIN_MODEL_DECISION,
-                            {
-                                "chat_key": chat_key,
-                                "message_preview": message_preview,
-                            },
-                        )
-                        if self.debug_mode:
-                            logger.info(
-                                "[拟人增强] 已延后记录回复决策，等待主模型最终判断"
-                            )
-                    else:
-                        await HumanizeModeManager.record_decision(
-                            chat_key=chat_key,
-                            decision=True,
-                            reason="AI判断应该回复",
-                            message_preview=message_preview,
-                        )
+                    event.set_extra(
+                        PLUGIN_PENDING_MAIN_MODEL_DECISION,
+                        {"chat_key": chat_key, "message_preview": message_preview},
+                    )
+                    if self.debug_mode:
+                        logger.info("[拟人增强] 判断通过，等待实际回复后记录")
                 except Exception as e:
                     logger.warning(f"[拟人增强] 记录决策失败: {e}")
 
@@ -4925,17 +4920,15 @@ class ChatPlus(Star):
                     if self.debug_mode:
                         logger.warning(f"[对话疲劳] 获取疲劳信息失败: {e}")
 
-            # 🆕 v1.2.0: 拟人增强模式 - 被@或触发关键词时也记录决策（作为回复）
+            # 直接触发只登记待发送状态，不能把尚未发出的回复记为成功。
             if self.humanize_mode_enabled:
                 try:
                     message_preview = (
                         formatted_context[:50] if formatted_context else ""
                     )
-                    await HumanizeModeManager.record_decision(
-                        chat_key=chat_key,
-                        decision=True,
-                        reason="被@或触发关键词，必定回复",
-                        message_preview=message_preview,
+                    event.set_extra(
+                        PLUGIN_PENDING_MAIN_MODEL_DECISION,
+                        {"chat_key": chat_key, "message_preview": message_preview},
                     )
                 except Exception as e:
                     logger.warning(f"[拟人增强] 记录决策失败: {e}")
@@ -5917,42 +5910,10 @@ class ChatPlus(Star):
         if image_urls is None:
             image_urls = []
 
-        enable_final_decision_gate = (
-            self.enable_main_model_final_decision
-            and not is_at_message
-            and (not has_trigger_keyword or self.keyword_smart_mode)
-        )
-        if enable_final_decision_gate:
-            should_generate_reply = await ReplyHandler.run_final_decision_gate(
-                event=event,
-                context=self.context,
-                formatted_message=formatted_context,
-                image_urls=image_urls,
-                include_sender_info=self.include_sender_info,
-                conversation_fatigue_info=conversation_fatigue_info,
-            )
-            if not should_generate_reply:
-                logger.info(
-                    "[主模型最终判断] 当前消息无需回复，跳过正式回复扩展与生成"
-                )
-                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
-                ckey = ProbabilityManager.get_chat_key(
-                    platform_name, is_private, chat_id
-                )
-                self._clear_pre_decision_state(ckey)
-                await self._handle_main_model_final_decline(
-                    event=event,
-                    formatted_context=formatted_context,
-                    platform_name=platform_name,
-                    is_private=is_private,
-                    chat_id=chat_id,
-                    current_message_cache=current_message_cache,
-                    message_id_for_reply=message_id_for_reply,
-                )
-                return
-            logger.info(
-                "[主模型最终判断] 当前消息值得回复，开始构造正式回复上下文"
-            )
+        # DecisionAI has already made the participation decision for this event.
+        # Direct mentions/non-smart keywords have no classification and retain
+        # the normal persona-driven reply policy without another model round.
+        reply_mode = DecisionAI.get_reply_mode(event)
 
         # 注入记忆
         final_message = formatted_context
@@ -6129,6 +6090,7 @@ class ChatPlus(Star):
                 history_messages=history_messages,  # 🔧 修复：传递历史消息用于构建contexts
                 conversation_fatigue_info=conversation_fatigue_info,  # 🆕 v1.2.0: 传递疲劳信息
                 enable_final_decision_gate=False,
+                reply_mode=reply_mode,
             )
         except Exception as e:
             ai_error_flag = True
@@ -6162,7 +6124,7 @@ class ChatPlus(Star):
 
         _elapsed = time.time() - _start_time
         if self.debug_mode:
-            logger.info(f"【步骤13】AI回复生成完成，耗时: {_elapsed:.2f}秒")
+            logger.info(f"【步骤13】正式回复请求构造完成，耗时: {_elapsed:.2f}秒")
         elif _elapsed > self.reply_generation_timeout_warning:
             logger.warning(
                 f"⚠️ AI回复生成耗时异常: {_elapsed:.2f}秒（超过{self.reply_generation_timeout_warning}秒）"
@@ -8266,6 +8228,14 @@ class ChatPlus(Star):
             "- 直接自然回应当前发送者，不要解释你为什么会回复。\n"
         )
 
+    def _mark_reply_generation_failed(self, event, message_id):
+        event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
+        event.set_extra(PLUGIN_REPLY_EFFECT_CONTEXT, None)
+        if message_id in self.processing_sessions:
+            if not hasattr(self, "_ai_error_message_ids"):
+                self._ai_error_message_ids = set()
+            self._ai_error_message_ids.add(message_id)
+
     async def _try_recover_empty_llm_reply(
         self, event: AstrMessageEvent, message_id: str
     ) -> bool:
@@ -8304,6 +8274,14 @@ class ChatPlus(Star):
         if not llm_resp:
             return False
 
+        if (
+            str(getattr(llm_resp, "role", "")).lower() in {"err", "error"}
+            or str(getattr(llm_resp, "status_code", None)) == "429"
+        ):
+            self._mark_reply_generation_failed(event, message_id)
+            logger.warning("[空回复兜底] Provider 返回错误状态，不作为成功回复")
+            return False
+
         fallback_text = ""
         result_chain = getattr(llm_resp, "result_chain", None)
         if result_chain and getattr(result_chain, "chain", None):
@@ -8317,6 +8295,11 @@ class ChatPlus(Star):
         completion_text = (getattr(llm_resp, "completion_text", "") or "").strip()
         if not fallback_text and completion_text:
             fallback_text = completion_text
+
+        if classify_raw_llm_failure(fallback_text):
+            self._mark_reply_generation_failed(event, message_id)
+            logger.warning("[空回复兜底] Provider 返回错误文本，不作为成功回复")
+            return False
 
         if self.debug_mode:
             logger.info(
@@ -9964,6 +9947,7 @@ class ChatPlus(Star):
             ).strip()
             failure_reason = classify_raw_llm_failure(reply_text)
             if failure_reason and self._group_llm_runtime_guard_enabled(event):
+                self._mark_reply_generation_failed(event, message_id)
                 source = (
                     "plugin"
                     if message_id in self.processing_sessions
@@ -10330,8 +10314,13 @@ class ChatPlus(Star):
                     is_llm_result = False
 
             ai_error_flag = (
-                hasattr(self, "_ai_error_message_ids")
-                and message_id in self._ai_error_message_ids
+                (
+                    hasattr(self, "_ai_error_message_ids")
+                    and message_id in self._ai_error_message_ids
+                )
+                # Core may invoke this hook after a failed platform send.
+                # aiocqhttp sets this marker only after send_message returns.
+                or getattr(event, "_has_send_oper", None) is False
             )
 
             # 🔧 重复消息拦截时，跳过LLM结果检查，直接进入用户消息保存流程
@@ -10344,7 +10333,7 @@ class ChatPlus(Star):
             original_bot_reply_text = ""
             bot_reply_to_save = None  # 🔧 初始化为None，重复拦截时不保存AI消息
 
-            if is_llm_result and not is_duplicate_blocked:
+            if is_llm_result and not is_duplicate_blocked and not ai_error_flag:
                 # 🔧 多轮工具调用支持：使用累积的所有回复文本，而不是仅当前一段
                 accumulated_texts = self._pending_bot_replies.pop(message_id, [])
                 # 清理 raw_reply_cache（不再需要）
@@ -10376,7 +10365,7 @@ class ChatPlus(Star):
                     return
 
             # 🔧 只在非重复拦截时保存AI消息
-            if is_llm_result and not is_duplicate_blocked:
+            if is_llm_result and not is_duplicate_blocked and not ai_error_flag:
                 if self.debug_mode:
                     logger.info(
                         f"【消息发送后】会话 {chat_id} - 保存AI回复，长度: {len(original_bot_reply_text)} 字符"
@@ -10688,7 +10677,7 @@ class ChatPlus(Star):
                 logger.info(
                     f"[消息发送后] 准备保存: 缓存{len(cached_messages_to_convert)}条 + 当前用户消息（跳过AI回复，重复消息已拦截）"
                 )
-            elif not is_llm_result and ai_error_flag:
+            elif ai_error_flag:
                 bot_to_save = None
                 logger.info(
                     f"[消息发送后] 准备保存: 缓存{len(cached_messages_to_convert)}条 + 当前用户消息（跳过AI回复，AI调用错误）"
@@ -10775,7 +10764,7 @@ class ChatPlus(Star):
                         await HumanizeModeManager.record_decision(
                             chat_key=pending_chat_key,
                             decision=True,
-                            reason="主模型最终判断并实际回复",
+                            reason="统一回复判断通过并实际回复",
                             message_preview=pending_final_decision.get(
                                 "message_preview", ""
                             ),

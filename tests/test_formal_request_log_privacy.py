@@ -55,6 +55,7 @@ def _load_generate_reply(logger):
         "Context": object,
         "ProviderRequest": object,
         "ReplyHandler": FakeReplyHandler,
+        "build_reply_mode_instruction": lambda mode: f"mode-guidance:{mode}",
         "ToolPolicy": SimpleNamespace(clone_tool_container=lambda value: value),
         "resolve_session_persona": resolve_session_persona,
         "_expand_event_plugins_name_for_tool_access": lambda *_args: None,
@@ -104,6 +105,30 @@ class FakeEvent:
 
 
 class FormalRequestLogPrivacyTest(unittest.TestCase):
+    def test_preselected_modes_keep_persona_tools_and_skip_second_judgment(self):
+        for mode in ("brief", "full"):
+            with self.subTest(mode=mode):
+                handler = _load_generate_reply(RecordingLogger())
+                async def unexpected_gate(**kwargs):
+                    self.fail("A selected reply must not be judged again")
+                handler._run_final_decision_gate = unexpected_gate
+                event = FakeEvent()
+                tool = SimpleNamespace(name="grok_usage_status")
+                tools = SimpleNamespace(tools=[tool])
+                context = SimpleNamespace(get_llm_tool_manager=lambda: tools)
+                result = asyncio.run(handler.generate_reply(
+                    event, context, "当前消息及追加消息", "自定义回复要求", image_urls=["reference.png"],
+                    reply_mode=mode, enable_final_decision_gate=True,
+                ))
+                self.assertIsInstance(result, dict)
+                self.assertIn("当前消息及追加消息", event.extras["prompt"])
+                self.assertIn("自定义回复要求", event.extras["prompt"])
+                self.assertIn(f"mode-guidance:{mode}", event.extras["prompt"])
+                self.assertEqual(result["prompt"], event.get_message_str())
+                self.assertEqual(result["system_prompt"], "persona")
+                self.assertEqual(result["image_urls"], ["reference.png"])
+                self.assertIn(tool, result["tool_set"].tools)
+
     def test_formal_request_passes_images_without_logging_addresses(self):
         logger = RecordingLogger()
         reply_handler = _load_generate_reply(logger)

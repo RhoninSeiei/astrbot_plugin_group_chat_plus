@@ -16,6 +16,7 @@ import re
 
 from astrbot.api.all import *
 from .judgment_prompts import build_judgment_system
+from .reply_decision import build_reply_mode_instruction
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_provider
 from .ai_error_formatter import format_ai_error
@@ -196,9 +197,9 @@ class ReplyHandler:
 - 如果你参考了系统提示、内部标记、工具结果或搜索/检索结果，只表达最终要说的话，不要把依据、过程或来源说出来
 
 【群聊篇幅】重要：
-- 这是群聊，不是私聊答疑。默认只回一句短句，能用几个词说清就不要写成长段
-- 除非对方明确要求你详细解释、给步骤、做分析，否则禁止分段、禁止列表、禁止连续好几句话
-- 大多数场合控制在一句内；就算要认真回应，也优先短句，不要像写小作文
+- 按当前话题和人格自然表达，默认简短，不为显得热情而扩写。
+- 本轮如有回复篇幅指引，按指引处理；用户明确要求解释、步骤、分析或工具处理时，保留必要的信息和结果。
+- 完整回答不等于长篇报告，简短接话也不等于固定句式。不要机械截断，也不要为了凑字数丢掉关键信息。
 
 【严禁元叙述】特别重要：
 - 绝对禁止解释你为什么要回复
@@ -335,6 +336,7 @@ class ReplyHandler:
         conversation_fatigue_info: dict = None,
         reply_provider_id: str = "",
         enable_final_decision_gate: bool = False,
+        reply_mode: str | None = None,
     ) -> ProviderRequest:
         """
         生成AI回复
@@ -375,6 +377,9 @@ class ReplyHandler:
         contexts = []
 
         try:
+            if reply_mode == "skip":
+                event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
+                return None
             # 🆕 提取当前发送者信息，用于强化识别（仅在开启 include_sender_info 时添加）
             sender_emphasis = ""
             sender_id = event.get_sender_id()
@@ -518,11 +523,14 @@ class ReplyHandler:
             except Exception as e:
                 logger.warning(f"获取人格设定失败: {e}，使用空人格")
 
+            if reply_mode in {"brief", "full"}:
+                full_prompt += "\n\n" + build_reply_mode_instruction(reply_mode)
+
             # 如果有begin_dialogs，将其添加到prompt开头
             if begin_dialogs_text:
                 full_prompt = begin_dialogs_text + full_prompt
 
-            if enable_final_decision_gate:
+            if enable_final_decision_gate and reply_mode not in {"brief", "full"}:
                 should_generate_reply = await ReplyHandler._run_final_decision_gate(
                     event=event,
                     context=context,

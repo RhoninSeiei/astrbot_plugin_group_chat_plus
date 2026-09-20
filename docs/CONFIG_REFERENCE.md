@@ -584,7 +584,7 @@ Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超�
 | `enable_tools_reminder` | bool | `false` | 在回复提示词中告知AI当前可用的工具（如搜索、画图等） |
 | `tools_reminder_persona_filter` | bool | `false` | 根据当前AI人格过滤工具列表 |
 
-工具执行边界：读空气判断 AI 与主模型最终判断均使用无工具调用方式，避免判断阶段产生外部副作用；正式回复生成交由 AstrBot 原生 LLM 请求流程处理，当前会话可见的搜索、MCP、知识库、沙箱和其他 `@llm_tool` 工具会随 `req.func_tool` 进入工具循环。
+工具执行边界：统一参与与篇幅判断使用无工具调用方式，避免判断阶段产生外部副作用；正式回复生成交由 AstrBot 原生 LLM 请求流程处理，当前会话可见的搜索、MCP、知识库、沙箱和其他 `@llm_tool` 工具会随 `req.func_tool` 进入工具循环。
 
 ---
 
@@ -628,3 +628,8 @@ Codex OAuth 相关配置只保存 Provider ID、Codex 主模型、尺寸和超�
 ---
 
 [← 返回 README](../README.md) | [深度指南与常见问题](ARCHITECTURE.md) | [消息工作流程 →](MESSAGE_WORKFLOW.md) | [项目结构 →](PROJECT_STRUCTURE.md)
+
+
+### 统一回复判断兼容配置
+
+`enable_main_model_final_decision=true` 现在表示一次 skip/brief/full 分类，使用现有 `decision_ai_provider_id` 和决策人格配置，不再先粗筛再调用正式回复模型复判。false 保留一次 yes/no 判断。该重构不修改已有模型、关键词智能模式或等待窗口配置。分类控制参与和篇幅，正式生成保持会话人格、上下文及正常工具能力；brief 不使用硬截断。模型失败不记为人格拒绝，正向状态仅在实际发送成功后更新。

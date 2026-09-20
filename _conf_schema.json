@@ -224,9 +224,9 @@
         "promptDataRef": "reply-ai"
     },
     "enable_main_model_final_decision": {
-        "description": "启用主模型最终判断",
+        "description": "启用统一参与与篇幅判断",
         "type": "bool",
-        "hint": "开启后，第一阶段读空气AI放行后，回复模型会先执行一次短协议内部判断。该判断只输出内部标记，不进入正式回复提示词，可减少边界消息误回复。",
+        "hint": "沿用旧配置键。开启后，由当前决策AI一次判断不接话、简短接话或完整回复，正式回复模型不再二次判断。关闭时保留一次 yes/no 判断。人格、兴趣、疲劳与上下文继续生效；@和非智能关键词沿用跳过判断的规则。",
         "default": true
     },
     "enable_tools_reminder": {

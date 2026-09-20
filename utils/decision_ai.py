@@ -15,6 +15,7 @@
 
 import asyncio
 from datetime import datetime
+import time
 from typing import List, Optional, Dict, Any
 from astrbot.api.all import *
 from .judgment_prompts import build_judgment_system
@@ -22,6 +23,15 @@ from .ai_response_filter import AIResponseFilter
 from .ai_error_formatter import format_ai_error
 from ._session_guard import sample_guard
 from .session_preferences import get_session_provider, resolve_session_persona
+from .reply_decision import (
+    REPLY_MODE_BRIEF,
+    REPLY_MODE_DECISION_PROMPT,
+    REPLY_MODE_FULL,
+    REPLY_MODES,
+    REPLY_MODE_SKIP,
+    build_authoritative_reply_mode_protocol,
+    parse_reply_mode,
+)
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -36,6 +46,12 @@ class DecisionAI:
     2. 调用AI分析是否应该回复
     3. 解析yes/no结果
     """
+
+    REPLY_MODE_SKIP = REPLY_MODE_SKIP
+    REPLY_MODE_BRIEF = REPLY_MODE_BRIEF
+    REPLY_MODE_FULL = REPLY_MODE_FULL
+    REPLY_MODES = REPLY_MODES
+    DECISION_REPLY_CLASSIFICATION_KEY = "_group_chat_plus_decision_reply_classification"
 
     # 系统判断提示词模板（积极参与模式）
     # 🔧 v1.2.0: 调整提示词位置引用（从"上方"改为"下方"），配合缓存友好的拼接顺序
@@ -350,6 +366,7 @@ class DecisionAI:
         # 判断型AI人格配置
         include_persona: bool = True,
         configured_persona_name: str = "",
+        select_reply_mode: bool = False,
     ) -> bool:
         """
         调用AI判断是否应该回复
@@ -369,12 +386,16 @@ class DecisionAI:
             time_period_info: 动态时间段配置信息
             humanize_mode_enabled: 是否开启拟人增强模式
             conversation_fatigue_info: 对话疲劳信息（连续对话轮次等）
+            select_reply_mode: 是否用同一次调用分类为 skip/brief/full
 
         Returns:
             True=应该回复，False=不回复
         """
-        sample_guard("decision")
+        DecisionAI.clear_reply_classification(event)
+        started_at = time.perf_counter()
+        classification_provider_id = str(provider_id or "")
         try:
+            sample_guard("decision")
             if hasattr(event, "_decision_ai_error"):
                 try:
                     delattr(event, "_decision_ai_error")
@@ -395,7 +416,18 @@ class DecisionAI:
                     event._decision_ai_error = True
                 except Exception:
                     pass
+                if select_reply_mode:
+                    DecisionAI._record_reply_classification(
+                        event, mode=None, status="provider_unavailable",
+                        provider_id=provider_id, started_at=started_at,
+                    )
                 return False
+
+            classification_provider_id = str(
+                (getattr(provider, "provider_config", {}) or {}).get("id", "")
+                or provider_id
+                or ""
+            )
 
             persona_result = await DecisionAI.resolve_judgment_persona(
                 context=context,
@@ -570,7 +602,7 @@ class DecisionAI:
                 enhanced_context += reply_density_hint
 
             # 🆕 v1.3.1: 第一层粗筛模式提示
-            if is_preliminary_filter:
+            if is_preliminary_filter and not select_reply_mode:
                 enhanced_context += (
                     "\n\n[系统信息-两阶段回复流程]\n"
                     "你现在是第一道宽松筛选，只负责筛掉明显不需要回复的消息。\n"
@@ -585,13 +617,17 @@ class DecisionAI:
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
             # 即使AI服务商不支持前缀缓存，此顺序调整也不影响功能。
             if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
-                static_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
-                    extra_prompt.strip(),
-                    enable_reasoning,
-                    reasoning_start_marker,
-                    reasoning_end_marker,
-                    allowed_answers=["yes", "no"],
-                )
+                override_prompt = extra_prompt.strip()
+                if select_reply_mode:
+                    static_prompt = override_prompt
+                else:
+                    static_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
+                        override_prompt,
+                        enable_reasoning,
+                        reasoning_start_marker,
+                        reasoning_end_marker,
+                        allowed_answers=["yes", "no"],
+                    )
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
                 # 🔧 v1.3.0: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前发送者身份
@@ -609,7 +645,11 @@ class DecisionAI:
                     )
             else:
                 # 拼接模式（默认）：系统提示词（静态）在前，动态内容在后
-                full_prompt = DecisionAI.SYSTEM_DECISION_PROMPT
+                full_prompt = (
+                    REPLY_MODE_DECISION_PROMPT
+                    if select_reply_mode
+                    else DecisionAI.SYSTEM_DECISION_PROMPT
+                )
 
                 # 如果有用户自定义提示词,紧跟在系统提示词后面（也是相对静态的）
                 if extra_prompt and extra_prompt.strip():
@@ -620,13 +660,14 @@ class DecisionAI:
                         )
 
                 # 添加结束指令（静态）
-                full_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
-                    full_prompt,
-                    enable_reasoning,
-                    reasoning_start_marker,
-                    reasoning_end_marker,
-                    allowed_answers=["yes", "no"],
-                )
+                if not select_reply_mode:
+                    full_prompt, _reasoning_added = DecisionAI._ensure_reasoning_protocol(
+                        full_prompt,
+                        enable_reasoning,
+                        reasoning_start_marker,
+                        reasoning_end_marker,
+                        allowed_answers=["yes", "no"],
+                    )
                 full_prompt += DecisionAI.SYSTEM_DECISION_PROMPT_ENDING
 
                 # 动态内容放在最后
@@ -637,6 +678,17 @@ class DecisionAI:
                     + formatted_message
                     + proactive_hint
                     + enhanced_context
+                )
+
+            if select_reply_mode:
+                full_prompt = (
+                    full_prompt.rstrip()
+                    + "\n\n"
+                    + build_authoritative_reply_mode_protocol(
+                        enable_reasoning,
+                        reasoning_start_marker,
+                        reasoning_end_marker,
+                    )
                 )
 
             logger.info(
@@ -665,6 +717,15 @@ class DecisionAI:
                 reasoning_start_marker if enable_reasoning else "",
                 reasoning_end_marker if enable_reasoning else "",
             )
+            reply_mode = None
+            if select_reply_mode:
+                reply_mode = parse_reply_mode(
+                    ai_response,
+                    reasoning_start_marker if enable_reasoning else "",
+                    reasoning_end_marker if enable_reasoning else "",
+                )
+                parse_result["normalized_answer"] = reply_mode
+                parse_result["protocol_followed"] = reply_mode is not None
             DecisionAI.log_reasoning_output(
                 "[决策AI]",
                 ai_response,
@@ -672,14 +733,36 @@ class DecisionAI:
                 reasoning_log_enabled,
                 reasoning_log_mode,
             )
-            parsed_answer = (parse_result.get("normalized_answer") or "").lower()
-            if parsed_answer in ("yes", "y", "是", "应该", "回复", "适合"):
-                decision = True
-            elif parsed_answer in ("no", "n", "否", "不应该", "不回复", "不适合"):
-                decision = False
+            if select_reply_mode:
+                if reply_mode is None:
+                    try:
+                        event._decision_ai_error = True
+                    except Exception:
+                        pass
+                    DecisionAI._record_reply_classification(
+                        event, mode=None, status="protocol_failed",
+                        provider_id=classification_provider_id, started_at=started_at,
+                    )
+                    logger.warning("决策AI统一分类响应未遵循协议")
+                    return False
+                try:
+                    event._decision_ai_error = False
+                except Exception:
+                    pass
+                DecisionAI._record_reply_classification(
+                    event, mode=reply_mode, status="parsed",
+                    provider_id=classification_provider_id, started_at=started_at,
+                )
+                decision = reply_mode != REPLY_MODE_SKIP
             else:
-                filtered_text = parse_result.get("filtered_text") or ""
-                decision = DecisionAI._parse_decision(filtered_text)
+                parsed_answer = (parse_result.get("normalized_answer") or "").lower()
+                if parsed_answer in ("yes", "y", "是", "应该", "回复", "适合"):
+                    decision = True
+                elif parsed_answer in ("no", "n", "否", "不应该", "不回复", "不适合"):
+                    decision = False
+                else:
+                    filtered_text = parse_result.get("filtered_text") or ""
+                    decision = DecisionAI._parse_decision(filtered_text)
 
             if decision:
                 logger.info("决策AI判断: 应该回复这条消息 (yes)")
@@ -696,6 +779,11 @@ class DecisionAI:
                 event._decision_ai_error = True
             except Exception:
                 pass
+            if select_reply_mode:
+                DecisionAI._record_reply_classification(
+                    event, mode=None, status="timeout", provider_id=classification_provider_id,
+                    started_at=started_at,
+                )
             return False
         except Exception as e:
             logger.error(format_ai_error(e, "读空气判断"))
@@ -703,7 +791,58 @@ class DecisionAI:
                 event._decision_ai_error = True
             except Exception:
                 pass
+            if select_reply_mode:
+                DecisionAI._record_reply_classification(
+                    event, mode=None, status="failed", provider_id=classification_provider_id,
+                    started_at=started_at,
+                )
             return False
+
+    @staticmethod
+    def _record_reply_classification(
+        event: AstrMessageEvent,
+        *,
+        mode: str | None,
+        status: str,
+        provider_id: str,
+        started_at: float,
+    ) -> None:
+        metadata = {
+            "reply_mode": mode if mode in REPLY_MODES else None,
+            "status": str(status or "failed"),
+            "provider_id": str(provider_id or ""),
+            "elapsed_ms": max(0, round((time.perf_counter() - started_at) * 1000)),
+        }
+        try:
+            event.set_extra(DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY, metadata)
+        except Exception:
+            try:
+                setattr(event, DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY, metadata)
+            except Exception:
+                pass
+
+    @staticmethod
+    def get_reply_classification(event: AstrMessageEvent) -> dict:
+        try:
+            value = event.get_extra(DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY, {})
+        except Exception:
+            value = getattr(event, DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def get_reply_mode(event: AstrMessageEvent) -> str | None:
+        mode = DecisionAI.get_reply_classification(event).get("reply_mode")
+        return mode if mode in REPLY_MODES else None
+
+    @staticmethod
+    def clear_reply_classification(event: AstrMessageEvent) -> None:
+        try:
+            event.set_extra(DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY, None)
+        except Exception:
+            try:
+                delattr(event, DecisionAI.DECISION_REPLY_CLASSIFICATION_KEY)
+            except (AttributeError, TypeError):
+                pass
 
     @staticmethod
     async def call_decision_ai(

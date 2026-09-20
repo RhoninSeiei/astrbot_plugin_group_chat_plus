@@ -52,30 +52,23 @@ class MainReplyDeclineCacheTest(unittest.TestCase):
         self.assertIn("source=\"主模型最终判断过滤\"", function_source)
         self.assertNotIn("if cached_message_data:", function_source)
 
-    def test_final_gate_runs_before_optional_context_injections(self):
+    def test_generation_consumes_classification_without_another_gate(self):
         source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
         start = source.index("    async def _generate_and_send_reply")
         end = source.index("    async def _do_poke_after_reply")
         function_source = source[start:end]
 
-        gate_pos = function_source.index("ReplyHandler.run_final_decision_gate")
+        mode_pos = function_source.index("DecisionAI.get_reply_mode(event)")
         memory_pos = function_source.index("# 注入记忆")
         tool_pos = function_source.index("# 注入工具信息")
         mood_pos = function_source.index("# 🆕 v1.0.2: 注入情绪状态")
 
-        self.assertLess(gate_pos, memory_pos)
-        self.assertLess(gate_pos, tool_pos)
-        self.assertLess(gate_pos, mood_pos)
-        self.assertIn("formatted_message=formatted_context", function_source)
+        self.assertLess(mode_pos, memory_pos)
+        self.assertLess(mode_pos, tool_pos)
+        self.assertLess(mode_pos, mood_pos)
+        self.assertNotIn("ReplyHandler.run_final_decision_gate", function_source)
         self.assertIn("enable_final_decision_gate=False", function_source)
-        decline_pos = function_source.index("if not should_generate_reply:")
-        cleanup_pos = function_source.index(
-            "self._clear_pre_decision_state(ckey)", decline_pos
-        )
-        decline_handler_pos = function_source.index(
-            "await self._handle_main_model_final_decline", decline_pos
-        )
-        self.assertLess(cleanup_pos, decline_handler_pos)
+        self.assertIn("reply_mode=reply_mode", function_source)
 
 
 if __name__ == "__main__":
