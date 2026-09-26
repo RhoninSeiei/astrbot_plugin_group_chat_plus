@@ -3192,9 +3192,6 @@ class ContextManager:
             )
 
             if success:
-                # 计算实际转正的缓存数量
-                cache_converted = added_count
-
                 logger.info(f"=" * 60)
                 logger.info(f"✅✅✅ [官方保存+缓存转正] 保存成功！")
                 logger.info(f"  对话ID: {curr_cid}")

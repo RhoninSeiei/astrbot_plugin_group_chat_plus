@@ -134,6 +134,39 @@ def _load_context_manager_module():
 
 
 class MultimodalHistoryContentTest(unittest.TestCase):
+    def test_save_status_matches_write_for_empty_and_nonempty_cache(self):
+        for cached, fail in (([], False), ([{"content": "old"}, {"content": "new"}], False), ([], True)):
+            with self.subTest(cached=cached, fail=fail):
+                conversation = types.SimpleNamespace(content=[{"role": "user", "content": "old"}])
+                class Manager:
+                    calls = 0
+                    async def get_curr_conversation_id(self, origin):
+                        return "conversation-1"
+                    async def get_conversation(self, *args, **kwargs):
+                        return conversation
+                    async def update_conversation(self, origin, *, conversation_id, history):
+                        self.calls += 1
+                        if fail:
+                            raise OSError("planned save failure")
+                        conversation.content = history
+                manager = Manager()
+                result = asyncio.run(self.ContextManager.save_to_official_conversation_with_cache(
+                    types.SimpleNamespace(unified_msg_origin="origin-1"), cached,
+                    "current", "reply", types.SimpleNamespace(conversation_manager=manager),
+                ))
+                self.assertEqual(manager.calls, 1)
+                if fail:
+                    self.assertFalse(result)
+                    self.assertEqual(conversation.content, [{"role": "user", "content": "old"}])
+                else:
+                    self.assertEqual(conversation.content[-2:], [
+                        {"role": "user", "content": "current"},
+                        {"role": "assistant", "content": "reply"},
+                    ])
+                    self.assertEqual(sum(item["content"] == "old" for item in conversation.content), 1)
+                    self.assertEqual(len(conversation.content), 4 if cached else 3)
+                    self.assertTrue(result, "The successful write must not be reported as a failure")
+
     @classmethod
     def setUpClass(cls):
         cls.context_module = _load_context_manager_module()
