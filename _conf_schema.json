@@ -295,7 +295,7 @@
     "image_group_backends": {
         "description": "群默认绘图接口设置",
         "type": "text",
-        "hint": "由群内管理员命令 /gcp_image_backend 管理的 JSON 映射，按完整群会话标识隔离。未设置的群跟随聊天模型；管理员单次指定接口仍有效。",
+        "hint": "由群内管理员命令 /image_default 管理的 JSON 映射，按完整群会话标识隔离。未设置的群跟随聊天模型；管理员单次指定接口仍有效。",
         "default": "{}"
     },
     "image_tool_backend_config_version": {

@@ -3118,8 +3118,8 @@ class ChatPlus(Star):
                 logger.warning("【重启指令】%s 被拒绝", command_name)
         return allowed
 
-    @filter.command("gcp_image_backend")
-    async def gcp_image_backend(self, event: AstrMessageEvent, backend: str = ""):
+    @filter.command("image_default")
+    async def image_default(self, event: AstrMessageEvent, backend: str = ""):
         """管理员查询或切换当前群默认绘图接口：grok、gpt，auto 恢复跟随聊天模型。"""
         if not is_image_admin(event):
             yield event.plain_result("仅 AstrBot 管理员可以查询或切换群默认绘图接口。")
@@ -3131,7 +3131,7 @@ class ChatPlus(Star):
         value = str(backend or "").strip().lower()
         aliases = {"grok": "grok_oauth", "gpt": "codex_oauth", "auto": None}
         if value and value not in aliases:
-            yield event.plain_result("用法：/gcp_image_backend [grok|gpt|auto]；不带参数查询。")
+            yield event.plain_result("用法：/image_default [grok|gpt|auto]；不带参数查询。")
             return
         if value:
             if not hasattr(self, "_image_backend_config_lock"):

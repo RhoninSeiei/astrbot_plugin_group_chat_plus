@@ -169,10 +169,10 @@
 
 | 命令 | 功能 |
 | --- | --- |
-| `/gcp_image_backend` | 查询当前群默认绘图接口 |
-| `/gcp_image_backend grok` | 默认使用 Grok |
-| `/gcp_image_backend gpt` | 默认使用 GPT |
-| `/gcp_image_backend auto` | 恢复跟随实际聊天模型，包含模型回退后的选择 |
+| `/image_default` | 查询当前群默认绘图接口 |
+| `/image_default grok` | 默认使用 Grok |
+| `/image_default gpt` | 默认使用 GPT |
+| `/image_default auto` | 恢复跟随实际聊天模型，包含模型回退后的选择 |
 
 未设置的群保持原行为：Codex OAuth 模型使用 GPT Image，Grok OAuth 模型使用 Grok Imagine。普通成员只能调用当前群默认接口；管理员仍可在单次请求中明确指定另一接口，例如默认 GPT 时要求“用 Grok 画图”。权限依据 AstrBot 管理员身份判断，聊天中自称管理员不会获得权限。
 

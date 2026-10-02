@@ -23,14 +23,14 @@ class ImageBackendCommandTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         source = ast.parse((Path(__file__).parents[1] / 'main.py').read_text(encoding='utf-8'))
         cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == 'ChatPlus')
-        node = copy.deepcopy(next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'gcp_image_backend'))
+        node = copy.deepcopy(next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'image_default'))
         node.decorator_list = []
         namespace = dict(asyncio=asyncio, json=json, AstrMessageEvent=object,
                          is_image_admin=routing.is_image_admin,
                          group_image_backends=routing.group_image_backends,
                          planner_backend=routing.planner_backend)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), 'main.py', 'exec'), namespace)
-        self.command = namespace['gcp_image_backend']
+        self.command = namespace['image_default']
         self.plugin = SimpleNamespace(config=Config(), step_image_config={},
                                       context=SimpleNamespace(get_using_provider=lambda **kw: provider('grok_oauth')))
         self.event = SimpleNamespace(is_admin=lambda: True, is_private_chat=lambda: False,
