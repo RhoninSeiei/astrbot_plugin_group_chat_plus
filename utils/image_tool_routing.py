@@ -1,5 +1,6 @@
 """Authorize backend-specific image tools using the actual planning Provider."""
 from dataclasses import dataclass
+import json
 
 
 IMAGE_TOOLS = {"grok_oauth": "gcp_grok_image", "codex_oauth": "gcp_gpt_image"}
@@ -28,12 +29,25 @@ def planner_backend(provider):
         return None
 
 
-def visible_image_tools(event, provider):
+def group_image_backends(config):
+    try:
+        values = json.loads((config or {}).get("image_group_backends", "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return {k: v for k, v in values.items() if isinstance(k, str) and isinstance(v, str) and v in IMAGE_TOOLS} if isinstance(values, dict) else {}
+
+
+def default_image_backend(event, provider, config=None):
+    key = str(getattr(event, "unified_msg_origin", "") or "")
+    return group_image_backends(config).get(key) or planner_backend(provider)
+
+
+def visible_image_tools(event, provider, config=None):
     if provider is None:
         return frozenset()
     if is_image_admin(event):
         return PUBLIC_IMAGE_TOOLS
-    tool = IMAGE_TOOLS.get(planner_backend(provider))
+    tool = IMAGE_TOOLS.get(default_image_backend(event, provider, config))
     return frozenset({tool}) if tool else frozenset()
 
 
@@ -47,15 +61,15 @@ def resolve_image_tool_route(event, caller, requested_backend, context, config):
     if caller is None:
         raise ImageToolRoutingError("无法确定本次图片规划模型。")
     actual = planner_backend(caller)
-    requested = requested_backend or actual
+    default = default_image_backend(event, caller, config)
+    requested = requested_backend or default
     if requested not in IMAGE_TOOLS:
         raise ImageToolRoutingError("当前规划模型没有对应的图片工具。")
+    # Enforce the group default before even returning the current provider.
+    if requested != default and not is_image_admin(event):
+        raise ImageToolRoutingError("普通成员只能使用当前群默认的图片接口。")
     if requested == actual:
         return ImageToolRoute(requested, caller)
-    # Check before any lookup. Neither model arguments nor chat text can grant
-    # permission to cross from the actual planner to another image backend.
-    if not is_image_admin(event):
-        raise ImageToolRoutingError("普通成员只能使用当前规划模型对应的图片工具。")
     key = "grok_image_provider_id" if requested == "grok_oauth" else "codex_oauth_image_provider_id"
     default = "grok_oauth/grok-4.6" if requested == "grok_oauth" else "openai_oauth/gpt-5.6-sol"
     try:

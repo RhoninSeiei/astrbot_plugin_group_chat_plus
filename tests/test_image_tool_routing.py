@@ -53,6 +53,23 @@ class ImageToolRoutingTest(unittest.TestCase):
             self.assertEqual(looked_up, ["chosen/provider"])
             self.assertEqual(routing.visible_image_tools(event, provider(actual)), routing.PUBLIC_IMAGE_TOOLS)
 
+    def test_group_default_overrides_planner_for_members_and_survives_reload(self):
+        event = SimpleNamespace(is_admin=lambda: False, unified_msg_origin="bot:GroupMessage:42")
+        chosen = provider("codex_oauth")
+        context = SimpleNamespace(get_provider_by_id=lambda _: chosen)
+        config = {"image_group_backends": '{"bot:GroupMessage:42":"codex_oauth"}'}
+        self.assertEqual(routing.visible_image_tools(event, provider("grok_oauth"), config), {"gcp_gpt_image"})
+        route = routing.resolve_image_tool_route(event, provider("grok_oauth"), None, context, config)
+        self.assertIs(route.provider, chosen)
+        with self.assertRaises(routing.ImageToolRoutingError):
+            routing.resolve_image_tool_route(event, provider("grok_oauth"), "grok_oauth", context, config)
+        event.is_admin = lambda: True
+        caller = provider("grok_oauth")
+        self.assertIs(routing.resolve_image_tool_route(event, caller, "grok_oauth", context, config).provider, caller)
+        event.is_admin = lambda: False
+        event.unified_msg_origin = "other:GroupMessage:42"
+        self.assertEqual(routing.visible_image_tools(event, caller, config), {"gcp_grok_image"})
+
     def test_permission_revocation_and_wrong_provider_fail_closed(self):
         event = SimpleNamespace(is_admin=lambda: True)
         context = SimpleNamespace(get_provider_by_id=lambda _: provider("other"))

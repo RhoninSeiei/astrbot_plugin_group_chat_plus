@@ -1727,8 +1727,24 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         self.assertEqual(action, "edit")
         self.assertEqual(kwargs["image_paths"], ["one.png", "two.png"])
         self.assertEqual(kwargs["size"], "16:9@2k")
-        self.assertIn("只改第二张的天空，保留人物", kwargs["prompt"])
-        self.assertIn("改成蓝天", kwargs["prompt"])
+        self.assertEqual("只改第二张的天空，保留人物", kwargs["prompt"])
+
+    def test_both_backends_generate_and_edit_with_original_request(self):
+        for backend, method in (("grok_oauth", "gcp_grok_image"), ("codex_oauth", "gcp_gpt_image")):
+            for action in ("generate", "edit"):
+                with self.subTest(backend=backend, action=action):
+                    order = []
+                    facade = RecordingFacade(order)
+                    facade.backend_name = lambda: backend
+                    harness, _ = self._make_tool_harness(facade)
+                    harness._extract_current_image_paths = lambda event: asyncio.sleep(0, result=["one.png"])
+                    harness._extract_first_current_image_path = lambda event: asyncio.sleep(0, result="one.png")
+                    raw = "只画一朵蓝花。文字：原样保留\n不要添加背景"
+                    event = FakeEvent(order, message_text=raw)
+                    result = self._collect_tool_results(getattr(harness, method)(event, prompt="model added elaborate scenery", action=action))
+                    self.assertIn("成功", result[0])
+                    self.assertEqual(facade.calls[0][1]["prompt"], raw)
+                    self.assertEqual(len(facade.calls), 1)
 
     def test_unknown_provider_outcome_has_safe_notice_and_no_retry(self):
         order = []
@@ -1778,14 +1794,10 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             1,
         )
 
-    def test_tool_description_requires_model_refined_prompt(self):
-        self.assertIn("正式回复模型整理后的图像提示词", self.main_source)
-        self.assertEqual(
-            self.main_source.count("OAuth 后端最多 2048 个字符"), 2
-        )
-        self.assertEqual(
-            self.main_source.count("StepFun 后端最多 512 个字符"), 2
-        )
+    def test_tool_description_requires_original_prompt(self):
+        for name in ("gcp_grok_image", "gcp_gpt_image"):
+            self.assertIn("逐字传递", self._method_source(name))
+        self.assertIn("不进行额外规划", self._method_source("_build_step_image_tool_directive"))
         self.assertIn("1080p", self.main_source)
         self.assertIn("16:9", self.main_source)
         self.assertIn("工具返回结果后", self.main_source)

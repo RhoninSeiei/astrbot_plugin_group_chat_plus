@@ -292,6 +292,12 @@
         "hint": "旧版本兼容字段。群聊图片工具根据实际发起工具调用的规划模型选择后端，此字段不再决定群聊绘图路由。",
         "default": "codex_oauth"
     },
+    "image_group_backends": {
+        "description": "群默认绘图接口设置",
+        "type": "text",
+        "hint": "由群内管理员命令 /gcp_image_backend 管理的 JSON 映射，按完整群会话标识隔离。未设置的群跟随聊天模型；管理员单次指定接口仍有效。",
+        "default": "{}"
+    },
     "image_tool_backend_config_version": {
         "description": "⚙️ 群聊图片后端内部兼容标记",
         "type": "int",
@@ -301,7 +307,7 @@
     "codex_oauth_image_provider_id": {
         "description": "🖼️ Codex OAuth 图片 Provider",
         "type": "string",
-        "hint": "管理员从其他规划模型明确指定 GPT Image 时使用；默认绘图仍绑定实际规划 Provider。",
+        "hint": "群默认或管理员单次指定 GPT Image，且聊天模型不是 GPT 时使用。",
         "default": "openai_oauth/gpt-5.6-sol",
         "_special": "select_provider"
     },
@@ -315,7 +321,7 @@
     "grok_image_provider_id": {
         "description": "管理员指定 Grok 图片接口的 Provider",
         "type": "string",
-        "hint": "仅用于管理员跨接口指定 Grok；默认绘图绑定实际规划 Provider。",
+        "hint": "群默认或管理员单次指定 Grok，且聊天模型不是 Grok 时使用。",
         "default": "grok_oauth/grok-4.6",
         "_special": "select_provider"
     },

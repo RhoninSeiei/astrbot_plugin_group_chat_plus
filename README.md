@@ -165,9 +165,20 @@
 
 #### 群聊图片后端配置
 
-群聊图片工具根据实际发起工具调用的正式回复模型选择后端：Codex OAuth 模型使用 GPT Image，Grok OAuth 模型使用 Grok Imagine。选择发生在 AstrBot 模型回退之后，并绑定当前请求的 Provider 实例。普通成员只看到并能调用对应接口的工具；管理员可在当前请求中明确指定另一接口。权限依据 AstrBot 的管理员身份判断，聊天中自称管理员不会获得权限。无法确认调用模型时拒绝绘图。
+群聊图片工具提供 Grok Imagine 和 GPT Image 两个后端。管理员可在群内使用以下命令，设置按完整群会话标识持久保存，不影响其他群：
 
-例如，正式回复由 `grok_oauth/grok-4.6` 规划时，图片接口使用 `grok_image_model=grok-imagine-image-2.0`。`grok-4.6` 不会被传入 Imagine 图片模型字段。Codex 调用使用对应 Provider 的当前模型。管理员跨接口选择分别使用 `grok_image_provider_id` 或 `codex_oauth_image_provider_id`；这些字段不覆盖普通调用的实际规划模型。插件不修改 AstrBot 模型配置或 Grok 插件配置。
+| 命令 | 功能 |
+| --- | --- |
+| `/gcp_image_backend` | 查询当前群默认绘图接口 |
+| `/gcp_image_backend grok` | 默认使用 Grok |
+| `/gcp_image_backend gpt` | 默认使用 GPT |
+| `/gcp_image_backend auto` | 恢复跟随实际聊天模型，包含模型回退后的选择 |
+
+未设置的群保持原行为：Codex OAuth 模型使用 GPT Image，Grok OAuth 模型使用 Grok Imagine。普通成员只能调用当前群默认接口；管理员仍可在单次请求中明确指定另一接口，例如默认 GPT 时要求“用 Grok 画图”。权限依据 AstrBot 管理员身份判断，聊天中自称管理员不会获得权限。
+
+当默认接口或管理员指定接口与当前聊天模型不同，分别使用 `grok_image_provider_id` 或 `codex_oauth_image_provider_id`。相同后端继续绑定本轮实际 Provider 实例。插件不修改 AstrBot 聊天模型配置或 Grok 插件配置。
+
+生成和编辑优先把当前消息原文直接交给绘图 Provider，不再添加模型辅助描述，不要求额外规划、润色、翻译或扩写。无当前文本时使用工具传入的绘图要求。正常聊天的工具调用判断与人格回复仍保留；尺寸、图片引用和长度校验也保持有效。这不代表上游绘图服务内部没有处理提示词。
 
 Grok 默认比例为 `1:1`、分辨率为 `1k`，可配置 `grok_image_aspect_ratio`、`grok_image_resolution` 和 `grok_image_timeout`。比例支持 `auto`、`1:1`、`3:2`、`2:3`、`4:3`、`3:4`、`16:9`、`9:16`、`21:9`、`5:2`；分辨率支持 `1k`、`2k`。超时默认 180 秒，允许 1 至 600 秒。上层工具超时始终覆盖 Codex 和 Grok 两者的预算，并为 Grok 预留 10 秒本地处理与发送时间；实际 SDK 请求仍使用所选后端自己的超时。启动时不依赖 Provider 加载顺序。
 
