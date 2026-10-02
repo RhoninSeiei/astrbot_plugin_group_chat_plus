@@ -3121,6 +3121,10 @@ class ChatPlus(Star):
     @filter.command("image_default")
     async def image_default(self, event: AstrMessageEvent, backend: str = ""):
         """管理员查询或切换当前群默认绘图接口：grok、gpt，auto 恢复跟随聊天模型。"""
+        # Commands share names with other plugins; reject out-of-scope events
+        # before permissions, replies, or configuration writes.
+        if not self.enable_group_chat or not self._is_enabled(event):
+            return
         if not is_image_admin(event):
             yield event.plain_result("仅 AstrBot 管理员可以查询或切换群默认绘图接口。")
             return

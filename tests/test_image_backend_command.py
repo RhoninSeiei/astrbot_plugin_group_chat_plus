@@ -3,7 +3,7 @@ import asyncio
 import copy
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace, MethodType
 import unittest
 
 from tests.test_image_tool_routing import routing, provider
@@ -31,10 +31,16 @@ class ImageBackendCommandTest(unittest.IsolatedAsyncioTestCase):
                          planner_backend=routing.planner_backend)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), 'main.py', 'exec'), namespace)
         self.command = namespace['image_default']
+        enabled = copy.deepcopy(next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_is_enabled'))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[enabled], type_ignores=[])), 'main.py', 'exec'), namespace)
+        self.is_enabled = namespace['_is_enabled']
         self.plugin = SimpleNamespace(config=Config(), step_image_config={},
+                                      enable_group_chat=True, enabled_groups=["42", "43"], debug_mode=False,
                                       context=SimpleNamespace(get_using_provider=lambda **kw: provider('grok_oauth')))
         self.event = SimpleNamespace(is_admin=lambda: True, is_private_chat=lambda: False,
                                      unified_msg_origin='bot:GroupMessage:42', plain_result=lambda s: s)
+        self.event.get_group_id = lambda: self.event.unified_msg_origin.rsplit(':', 1)[-1]
+        self.plugin._is_enabled = MethodType(self.is_enabled, self.plugin)
 
     async def run_command(self, value=''):
         return [s async for s in self.command(self.plugin, self.event, value)]
@@ -57,7 +63,7 @@ class ImageBackendCommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('仅 AstrBot 管理员', (await self.run_command('gpt'))[0])
         self.event.is_admin = lambda: True
         self.event.is_private_chat = lambda: True
-        self.assertIn('群内', (await self.run_command('gpt'))[0])
+        self.assertEqual(await self.run_command('gpt'), [])
         self.event.is_private_chat = lambda: False
         self.assertIn('用法', (await self.run_command('other'))[0])
         self.assertIsNone(self.plugin.config.saved)
@@ -92,3 +98,20 @@ class ImageBackendCommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routing.group_image_backends(json.loads(self.plugin.config.saved)),
                          routing.group_image_backends(self.plugin.step_image_config))
         self.assertIn('：GPT。', (await self.run_command())[0])
+
+    async def test_unowned_group_is_silent_for_all_parameters_and_roles(self):
+        self.event.unified_msg_origin = 'qq2:GroupMessage:947135267'
+        for admin in (True, False):
+            self.event.is_admin = lambda: admin
+            for value in ('', 'gpt', 'grok', 'auto', 'invalid'):
+                self.assertEqual(await self.run_command(value), [])
+                self.assertIsNone(self.plugin.config.saved)
+                self.assertEqual(self.plugin.step_image_config, {})
+
+    async def test_disabled_plugin_ignores_command_and_empty_allowlist_allows_groups(self):
+        self.plugin.enable_group_chat = False
+        self.assertEqual(await self.run_command('gpt'), [])
+        self.assertIsNone(self.plugin.config.saved)
+        self.plugin.enable_group_chat = True
+        self.plugin.enabled_groups = []
+        self.assertIn('：GPT。', (await self.run_command('gpt'))[0])
