@@ -1113,7 +1113,11 @@ class ReplyHandler:
         if explicit_long_form:
             max_chars = ReplyHandler.BRIEF_REPLY_MAX_CHARS_EXPLICIT
 
-        shortened = ReplyHandler._take_leading_sentences(reply_text, max_sentences)
+        normalized = ReplyHandler._collapse_reply_text(reply_text)
+        if len(normalized) <= max_chars:
+            return normalized
+
+        shortened = ReplyHandler._take_leading_sentences(normalized, max_sentences)
         shortened = ReplyHandler._trim_reply_by_clause(shortened, max_chars)
         return shortened.strip()
 
