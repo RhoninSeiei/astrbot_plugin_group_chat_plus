@@ -82,3 +82,31 @@ class ImageSubjectContextTest(unittest.TestCase):
         event.get_message_str = lambda: '画一只猫'
         cat = ns['_filter_image_tools_for_provider'](plugin, event, provider('grok_oauth'), tools)
         self.assertTrue(all(self.definition not in t.description for t in cat.tools))
+
+    def test_subject_guidance_is_in_request_prompt_only_for_eligible_requests(self):
+        from tests.test_image_tool_routing import routing
+        tree = ast.parse((Path(__file__).parents[1] / 'main.py').read_text(encoding='utf-8'))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'ChatPlus')
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_build_step_image_tool_directive')
+        ns = dict(PUBLIC_IMAGE_TOOLS=routing.PUBLIC_IMAGE_TOOLS, subject_tool_hint=subject.subject_tool_hint,
+                  GroupImageService=SimpleNamespace(is_enabled=lambda cfg: True))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), 'main.py', 'exec'), ns)
+        build = ns['_build_step_image_tool_directive']
+        plugin = SimpleNamespace(step_image_config=self.config, _can_expose_step_image_tools=lambda e: True)
+        event = self.event()
+        event.get_message_str = lambda: '机器人画一张死库水tn'
+        baseline = build(plugin, {'gcp_grok_image'})
+        prompt = build(plugin, {'gcp_grok_image'}, event=event)
+        self.assertIn(self.definition, prompt)
+        self.assertIn('区分非性化的游泳服饰描绘与性化呈现', prompt)
+        self.assertIn('不能仅凭服饰名称或别名断言违法', prompt)
+        self.assertIn('具体请求仍须遵守适用的内容限制', prompt)
+        self.assertEqual(build(plugin, {'search'}, event=event), '')
+        event.unified_msg_origin = 'default:GroupMessage:764968756'
+        self.assertEqual(build(plugin, {'gcp_grok_image'}, event=event), baseline)
+        event.unified_msg_origin = self.umo
+        event.get_message_str = lambda: '画一只猫'
+        self.assertEqual(build(plugin, {'gcp_grok_image'}, event=event), baseline)
+        event.get_message_str = lambda: '画tn'
+        plugin._can_expose_step_image_tools = lambda e: False
+        self.assertEqual(build(plugin, {'gcp_grok_image'}, event=event), baseline)

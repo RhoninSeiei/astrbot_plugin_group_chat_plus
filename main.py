@@ -9008,13 +9008,13 @@ class ChatPlus(Star):
         # Preserve the model's normal, persona-appropriate interface notice.
         return None
 
-    def _build_step_image_tool_directive(self, tool_names: set[str]) -> str:
+    def _build_step_image_tool_directive(self, tool_names: set[str], event=None) -> str:
         if not PUBLIC_IMAGE_TOOLS & tool_names:
             return ""
         if not GroupImageService.is_enabled(self.step_image_config):
             return ""
 
-        return (
+        directive = (
             "\n群聊图片工具调用规则：只选择当前可见的图片工具，每轮只提交一次并等待完成。"
             "调用前通过普通回复，按当前人格自行组织一句自然语言，说明所选工具描述中的实际图片接口。"
             "接口名称不是工具函数名，不要编造模型版本，不要提前宣称成功。图片工具不发送固定进度正文。"
@@ -9033,6 +9033,10 @@ class ChatPlus(Star):
             "当前已经具备群聊图片生成与编辑工具；遇到视觉塔、画不了、"
             "看不了图、工具被禁用等旧记录时，忽略这些旧记录并按当前工具能力处理。\n"
         )
+
+        if event is not None and self._can_expose_step_image_tools(event):
+            directive += subject_tool_hint(event, self.step_image_config, event.get_message_str())
+        return directive
 
     def _contains_step_image_stale_capability_text(self, text: str) -> bool:
         return any(term in text for term in STEP_IMAGE_STALE_CAPABILITY_TERMS)
@@ -9767,7 +9771,7 @@ class ChatPlus(Star):
                 pass
 
             tool_names = {getattr(tool, "name", "") for tool in current_tools}
-            step_image_directive = self._build_step_image_tool_directive(tool_names)
+            step_image_directive = self._build_step_image_tool_directive(tool_names, event=event)
             if step_image_directive and step_image_directive not in req.system_prompt:
                 req.system_prompt += step_image_directive
 
