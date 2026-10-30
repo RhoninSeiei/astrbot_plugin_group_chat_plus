@@ -292,6 +292,12 @@
         "hint": "旧版本兼容字段。群聊图片工具根据实际发起工具调用的规划模型选择后端，此字段不再决定群聊绘图路由。",
         "default": "codex_oauth"
     },
+    "image_subject_contexts": {
+        "description": "群绘图角色别名定义",
+        "type": "text",
+        "hint": "可选 JSON 映射：完整群会话标识 → 别名 → 角色定义。只对该群当前请求提到的别名补充定义，不改写用户原文，不新增模型规划调用。空映射保持原行为。仅填写必要的角色描述，不放入群友身份信息或整份人格提示词。",
+        "default": "{}"
+    },
     "image_group_backends": {
         "description": "群默认绘图接口设置",
         "type": "text",

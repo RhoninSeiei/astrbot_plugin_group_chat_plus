@@ -166,6 +166,7 @@ from .utils.tool_timeout_override import (
     resolve_group_image_tool_timeout,
 )
 from .utils.image_planner_context import install_image_planner_context
+from .utils.image_subject_context import append_subject_definitions, subject_tool_hint
 from .utils.image_tool_routing import (
     ALL_IMAGE_TOOLS, PUBLIC_IMAGE_TOOLS, LEGACY_IMAGE_TOOLS,
     ImageToolRoutingError, is_image_admin, planner_backend,
@@ -728,6 +729,7 @@ class ChatPlus(Star):
             "enable_step_image_tools": config.get("enable_step_image_tools", False),
             "image_tool_backend": runtime_image_tool_backend,
             "image_group_backends": config.get("image_group_backends", "{}"),
+            "image_subject_contexts": config.get("image_subject_contexts", "{}"),
             "image_planner_provider_id": config.get("image_planner_provider_id", ""),
             "grok_image_model": config.get("grok_image_model", "grok-imagine-image-2.0"),
             "grok_image_aspect_ratio": config.get("grok_image_aspect_ratio", "1:1"),
@@ -8654,11 +8656,12 @@ class ChatPlus(Star):
         actual = default_image_backend(event, provider, self.step_image_config)
         default_name = {"grok_oauth": "Grok Imagine 2.0", "codex_oauth": "GPT Image（Codex OAuth 订阅绘图）"}.get(actual, "管理员指定的接口")
         default_hint = f"未指定后端时，本轮默认绘图接口为{default_name}。管理员本轮明确指定 GPT 或 Codex 时必须选择 gcp_gpt_image，指定 Grok 时必须选择 gcp_grok_image；不得自行改用默认接口或另一接口。"
+        subject_hint = subject_tool_hint(event, self.step_image_config, event.get_message_str())
         tools = []
         for tool in ToolPolicy._get_container_tools(filtered):
             if getattr(tool, "name", "") in PUBLIC_IMAGE_TOOLS:
                 tool = copy.copy(tool)
-                tool.description = str(getattr(tool, "description", "") or "") + "\n" + default_hint
+                tool.description = str(getattr(tool, "description", "") or "") + "\n" + default_hint + subject_hint
             tools.append(tool)
         if hasattr(filtered, "tools"):
             filtered.tools = tools
@@ -8778,6 +8781,9 @@ class ChatPlus(Star):
             raw = str(event.get_message_str() or "")
             if raw.strip():
                 kwargs["prompt"] = raw
+            kwargs["prompt"] = append_subject_definitions(
+                event, getattr(self, "step_image_config", {}), raw, kwargs.get("prompt", "")
+            )
             if action == "edit":
                 if service.backend_name() == "grok_oauth":
                     paths = await self._extract_current_image_paths(event)

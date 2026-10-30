@@ -20,6 +20,9 @@ assert TOOL_POLICY_SPEC.loader is not None
 TOOL_POLICY_MODULE = importlib.util.module_from_spec(TOOL_POLICY_SPEC)
 sys.modules[TOOL_POLICY_SPEC.name] = TOOL_POLICY_MODULE
 TOOL_POLICY_SPEC.loader.exec_module(TOOL_POLICY_MODULE)
+SUBJECT_SPEC = importlib.util.spec_from_file_location("subject_context_test", REPO_ROOT / "utils/image_subject_context.py")
+SUBJECT_MODULE = importlib.util.module_from_spec(SUBJECT_SPEC)
+SUBJECT_SPEC.loader.exec_module(SUBJECT_MODULE)
 STEP_IMAGE_TOOL_NAMES = TOOL_POLICY_MODULE.STEP_IMAGE_TOOL_NAMES
 ToolPolicy = TOOL_POLICY_MODULE.ToolPolicy
 
@@ -329,6 +332,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         logger = RecordingLogger()
         namespace = {
             "asyncio": asyncio,
+            "append_subject_definitions": SUBJECT_MODULE.append_subject_definitions,
             "GroupImageUserError": GroupImageUserError,
             "GroupImageConfigError": GroupImageConfigError,
             "GroupImageProviderError": GroupImageProviderError,
@@ -1745,6 +1749,26 @@ class StepImageToolIntegrationTest(unittest.TestCase):
                     self.assertIn("成功", result[0])
                     self.assertEqual(facade.calls[0][1]["prompt"], raw)
                     self.assertEqual(len(facade.calls), 1)
+
+    def test_group_subject_definition_reaches_both_image_backends(self):
+        for backend, method in (("grok_oauth", "gcp_grok_image"), ("codex_oauth", "gcp_gpt_image")):
+            for action in ("generate", "edit"):
+                order = []
+                facade = RecordingFacade(order)
+                facade.backend_name = lambda: backend
+                harness, _ = self._make_tool_harness(facade)
+                harness.step_image_config = {"image_subject_contexts": json.dumps({
+                    "default:GroupMessage:905956314": {"tn": "本群对可爱娇小二次元女孩的泛称。"}})}
+                harness._extract_current_image_paths = lambda event: asyncio.sleep(0, result=["one.png"])
+                harness._extract_first_current_image_path = lambda event: asyncio.sleep(0, result="one.png")
+                event = FakeEvent(order, message_text="画一张tn，无文字")
+                event.unified_msg_origin = "default:GroupMessage:905956314"
+                result = self._collect_tool_results(getattr(harness, method)(event, prompt="irrelevant expansion", action=action))
+                self.assertIn("成功", result[0])
+                prompt = facade.calls[0][1]["prompt"]
+                self.assertTrue(prompt.startswith("画一张tn，无文字"))
+                self.assertIn("本群对可爱娇小二次元女孩的泛称。", prompt)
+                self.assertNotIn("irrelevant expansion", prompt)
 
     def test_unknown_provider_outcome_has_safe_notice_and_no_retry(self):
         order = []
