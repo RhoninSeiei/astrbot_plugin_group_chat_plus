@@ -512,6 +512,24 @@
         "hint": "【v1.2.0新增·仅QQ平台】当原始概率已经低于此值时，不再对表情包应用衰减。这是为了避免在概率本身就很低的情况下进一步降低，导致表情包完全无法触发回复。建议设置为0.05-0.15之间。⚠️ 此功能仅在QQ平台生效",
         "default": 0.1
     },
+    "compatibility_groups": {
+        "description": "保留第三方请求补充的会话白名单",
+        "type": "list",
+        "hint": "填写完整会话ID，例如 default:GroupMessage:905956314。仅在本插件发起的请求中保留第三方新增内容，不重复引入平台历史。留空关闭。",
+        "default": []
+    },
+    "native_memory_groups": {
+        "description": "使用 LivingMemory 原生临时注入的会话白名单",
+        "type": "list",
+        "hint": "填写完整会话ID，同时加入 compatibility_groups。原生插件完成初始化且在当前会话启用时，普通回复使用其原生作用域和临时内容，不再手工重复检索。不可用时保留原兼容流程，主动对话维持原流程。留空关闭。",
+        "default": []
+    },
+    "static_prompt_groups": {
+        "description": "拆分静态回复规则的会话白名单",
+        "type": "list",
+        "hint": "填写完整会话ID。将固定回复规则和预设对话从用户上下文移入系统提示词一次，保留人格原文及动态群聊历史。留空维持现有顺序。",
+        "default": []
+    },
     "enable_memory_injection": {
         "description": "启用强制记忆植入",
         "type": "bool",

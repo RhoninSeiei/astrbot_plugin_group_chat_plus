@@ -1,5 +1,7 @@
 # 项目结构说明
 
+`utils/request_compatibility.py` 管理请求局部快照、第三方新增上下文、原生记忆选择和静态提示词拆分；`utils/reply_chain_utils.py` 共用引用链遍历。两者由群聊入口调用，兼容开关按完整会话 ID 配置。旧图片配置迁移继续由 `main.py` 通过 `image_tool_backend_config_version` 记录，新图片接口路由位于 `utils/image_tool_routing.py`。
+
 > 本文档详细描述了群聊增强插件的完整文件结构及每个文件的职责。
 
 [← 返回 README](../README.md) | [深度指南与常见问题](ARCHITECTURE.md) | [消息工作流程](MESSAGE_WORKFLOW.md) | [配置项参考](CONFIG_REFERENCE.md)

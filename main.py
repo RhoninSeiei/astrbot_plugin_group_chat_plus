@@ -87,6 +87,15 @@ from typing import List, Optional
 from collections import OrderedDict
 import aiohttp
 from astrbot.api import logger
+from .utils.request_compatibility import (
+    BASELINE as REQUEST_BASELINE,
+    STATIC_INSTRUCTIONS,
+    capture_baseline,
+    enabled_for,
+    merge_request,
+    native_memory_available,
+    split_static_instructions,
+)
 
 
 from astrbot.api.all import *
@@ -4522,6 +4531,10 @@ class ChatPlus(Star):
         if (
             self.enable_memory_injection
             and self.memory_insertion_timing == "pre_decision"
+            and not native_memory_available(
+                self.context, event, self.config, MemoryInjector,
+                self.memory_plugin_mode, self.livingmemory_version,
+            )
         ):
             memory_mode = self.memory_plugin_mode
             livingmemory_top_k = self.livingmemory_top_k
@@ -5979,6 +5992,10 @@ class ChatPlus(Star):
             if (
                 self.enable_memory_injection
                 and self.memory_insertion_timing == "pre_decision"
+                and not native_memory_available(
+                    self.context, event, self.config, MemoryInjector,
+                    self.memory_plugin_mode, self.livingmemory_version,
+                )
             ):
                 if (
                     hasattr(self, "_pre_decision_context_by_chat")
@@ -6007,6 +6024,10 @@ class ChatPlus(Star):
         if (
             self.enable_memory_injection
             and self.memory_insertion_timing == "post_decision"
+            and not native_memory_available(
+                self.context, event, self.config, MemoryInjector,
+                self.memory_plugin_mode, self.livingmemory_version,
+            )
         ):
             if self.debug_mode:
                 logger.info("【步骤11】注入记忆内容")
@@ -6145,6 +6166,7 @@ class ChatPlus(Star):
                 conversation_fatigue_info=conversation_fatigue_info,  # 🆕 v1.2.0: 传递疲劳信息
                 enable_final_decision_gate=False,
                 reply_mode=reply_mode,
+                compatibility_config=self.config,
             )
         except Exception as e:
             ai_error_flag = True
@@ -9550,6 +9572,12 @@ class ChatPlus(Star):
             len(references),
         )
 
+    @filter.on_llm_request(priority=1000001)
+    async def snapshot_request_compatibility(self, event: AstrMessageEvent, req: ProviderRequest):
+        from .utils.reply_handler import PLUGIN_REQUEST_MARKER, PLUGIN_CUSTOM_CONTEXTS, PLUGIN_IMAGE_URLS
+        if event.get_extra(PLUGIN_REQUEST_MARKER, False) and enabled_for(event, self.config):
+            capture_baseline(event, req, event.get_extra(PLUGIN_CUSTOM_CONTEXTS, []), event.get_extra(PLUGIN_IMAGE_URLS, []))
+
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """
@@ -9608,6 +9636,15 @@ class ChatPlus(Star):
         plugin_system_prompt = event.get_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, "")
         plugin_prompt = event.get_extra(PLUGIN_CUSTOM_PROMPT, "")
         plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])
+        static_instructions = ''
+        if enabled_for(event, self.config, 'static_prompt_groups'):
+            plugin_prompt, static_instructions = split_static_instructions(
+                plugin_prompt, event.get_extra(STATIC_INSTRUCTIONS, '') or ''
+            )
+        if enabled_for(event, self.config):
+            plugin_contexts, plugin_prompt, plugin_image_urls = merge_request(
+                event, req, plugin_contexts, plugin_prompt, plugin_image_urls
+            )
         step_image_action = self._infer_step_image_action(event)
 
         if step_image_action:
@@ -9629,6 +9666,9 @@ class ChatPlus(Star):
             merged_system_prompt = self._sanitize_step_image_stale_text(
                 merged_system_prompt
             )
+            static_instructions = self._sanitize_step_image_stale_text(static_instructions)
+        if static_instructions:
+            merged_system_prompt += '\n\n[群聊回复规则]\n' + static_instructions
         if self.debug_mode:
             logger.info(
                 f"  system_prompt重写策略: {rewrite_result.strategy}, "
@@ -9800,6 +9840,8 @@ class ChatPlus(Star):
             event.set_extra(PLUGIN_CUSTOM_CONTEXTS, None)
             event.set_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, None)
             event.set_extra(PLUGIN_CUSTOM_PROMPT, None)
+            event.set_extra(REQUEST_BASELINE, None)
+            event.set_extra(STATIC_INSTRUCTIONS, None)
             event.set_extra(PLUGIN_IMAGE_URLS, None)
             event.set_extra(PLUGIN_FUNC_TOOL, None)
             event.set_extra(PLUGIN_CURRENT_MESSAGE, None)

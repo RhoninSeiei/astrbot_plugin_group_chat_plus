@@ -74,9 +74,11 @@ class ImageHandler:
             return []
         seen_urls = set(seen_urls or ())
         reply_seen = set()
+        from .reply_chain_utils import iter_reply_chain
+
         embedded = [
             item
-            for item in (getattr(reply, "chain", None) or [])
+            for item in iter_reply_chain([reply], Reply)
             if isinstance(item, Image)
         ]
         embedded_results = []
@@ -441,21 +443,11 @@ class ImageHandler:
         Returns:
             (是否有图片, 是否有文字, 图片组件列表)
         """
-        has_image = False
-        has_text = False
-        image_components = []
+        from .reply_chain_utils import analyze_chain
 
-        for component in message_chain:
-            if isinstance(component, Image):
-                has_image = True
-                image_components.append(component)
-            elif isinstance(component, Plain):
-                # 检查是否有非空白文字
-                if component.text and component.text.strip():
-                    has_text = True
-            elif isinstance(component, Reply):
-                # 引用消息也视为有文字内容，防止「引用+图片」的消息被当作纯图片丢弃
-                has_text = True
+        has_image, has_text, image_components = analyze_chain(
+            message_chain, image_type=Image, plain_type=Plain, reply_type=Reply,
+        )
 
         # 限制单条消息处理的图片数量，防止恶意刷图
         if len(image_components) > max_images:
@@ -499,6 +491,14 @@ class ImageHandler:
                 message_content = getattr(component, "message_str", None) or getattr(
                     component, "message", None
                 )
+                if getattr(component, "chain", None):
+                    from .reply_chain_utils import resolve_reply_content
+
+                    # Converted quote images are appended separately with descriptions.
+                    message_content = resolve_reply_content(
+                        component, image_type=Image, plain_type=Plain,
+                        reply_type=Reply, at_type=At, image_placeholder="",
+                    ) or message_content
                 sender_nickname = getattr(
                     component, "sender_nickname", None
                 ) or getattr(component, "sender_name", None)

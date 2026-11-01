@@ -496,6 +496,14 @@ class MessageCleaner:
             elif hasattr(reply_component, "message"):
                 message_content = reply_component.message
 
+            if getattr(reply_component, "chain", None):
+                from .reply_chain_utils import resolve_reply_content
+
+                message_content = resolve_reply_content(
+                    reply_component, image_type=Image, plain_type=Plain,
+                    reply_type=Reply, at_type=At,
+                ) or message_content
+
             # 🆕 构建引用消息格式（与其他消息格式保持一致：发送者名字(ID:xxx)）
             if sender_nickname and sender_id and message_content:
                 # 完整格式：[引用 发送者名字(ID:xxx): 消息内容]

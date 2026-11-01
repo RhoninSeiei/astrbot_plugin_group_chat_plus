@@ -22,6 +22,7 @@ from astrbot.core.astr_main_agent import _get_fallback_chat_providers, _select_p
 from .ai_error_formatter import format_ai_error
 from .session_preferences import resolve_session_persona
 from .tool_policy import ToolPolicy
+from .request_compatibility import STATIC_INSTRUCTIONS, enabled_for
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
 DEBUG_MODE: bool = False
@@ -337,6 +338,7 @@ class ReplyHandler:
         reply_provider_id: str = "",
         enable_final_decision_gate: bool = False,
         reply_mode: str | None = None,
+        compatibility_config: dict | None = None,
     ) -> ProviderRequest:
         """
         生成AI回复
@@ -425,6 +427,7 @@ class ReplyHandler:
             # 动态内容（对话上下文、发送者信息、疲劳提示）放在后面。
             # 这样AI服务商的前缀缓存（prefix caching）可以命中静态部分，降低调用成本。
             if prompt_mode == "override" and extra_prompt and extra_prompt.strip():
+                static_instructions = extra_prompt.strip()
                 # 覆盖模式：用户自定义提示词在前（静态），动态内容在后
                 # 🔧 v1.3.0: sender_emphasis 提前到 formatted_message 之前，
                 # 让 AI 在阅读历史消息前就明确当前对话对象，避免被历史/窗口缓冲消息干扰
@@ -453,6 +456,7 @@ class ReplyHandler:
 
                 # 添加结束指令（静态）
                 full_prompt += ReplyHandler.SYSTEM_REPLY_PROMPT_ENDING
+                static_instructions = full_prompt
 
                 # 动态内容放在最后
                 # 🔧 v1.3.0: sender_emphasis 提前到 formatted_message 之前
@@ -529,6 +533,14 @@ class ReplyHandler:
             # 如果有begin_dialogs，将其添加到prompt开头
             if begin_dialogs_text:
                 full_prompt = begin_dialogs_text + full_prompt
+                static_instructions = begin_dialogs_text + static_instructions
+
+            event.set_extra(
+                STATIC_INSTRUCTIONS,
+                static_instructions
+                if enabled_for(event, compatibility_config, 'static_prompt_groups')
+                else None,
+            )
 
             if enable_final_decision_gate and reply_mode not in {"brief", "full"}:
                 should_generate_reply = await ReplyHandler._run_final_decision_gate(

@@ -19,6 +19,11 @@ TOOL_POLICY_MODULE = importlib.util.module_from_spec(TOOL_POLICY_SPEC)
 sys.modules[TOOL_POLICY_SPEC.name] = TOOL_POLICY_MODULE
 TOOL_POLICY_SPEC.loader.exec_module(TOOL_POLICY_MODULE)
 ToolPolicy = TOOL_POLICY_MODULE.ToolPolicy
+COMPAT_SPEC = importlib.util.spec_from_file_location(
+    "task_request_compat_for_passthrough", REPO_ROOT / "utils" / "request_compatibility.py"
+)
+COMPAT = importlib.util.module_from_spec(COMPAT_SPEC)
+COMPAT_SPEC.loader.exec_module(COMPAT)
 
 
 class RecordingLogger:
@@ -191,6 +196,11 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
                 "gcp_step_image_edit",
             },
             "ToolPolicy": ToolPolicy,
+            "enabled_for": COMPAT.enabled_for,
+            "merge_request": COMPAT.merge_request,
+            "split_static_instructions": COMPAT.split_static_instructions,
+            "STATIC_INSTRUCTIONS": COMPAT.STATIC_INSTRUCTIONS,
+            "REQUEST_BASELINE": COMPAT.BASELINE,
             "ToolsReminder": SimpleNamespace(
                 inject_structured_tool_usage_hint=lambda prompt: (
                     str(prompt or "") + "\nSHORT STRUCTURED TOOL RULE"
@@ -227,6 +237,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             setattr(RequestHarness, name, namespace[name])
 
         harness = RequestHarness()
+        harness.config = {}
         harness.enable_group_chat = True
         harness.step_image_config = {"image_tool_backend": "codex_oauth"}
         harness.enabled_groups = ["10001"]
@@ -236,7 +247,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
         harness._group_llm_runtime_guard_enabled = lambda event: True
         harness._infer_step_image_action = lambda event: None
         harness._check_compliance_status = lambda: None
-        harness._build_step_image_tool_directive = lambda tool_names: ""
+        harness._build_step_image_tool_directive = lambda tool_names, event=None: ""
         return harness, logger
 
     @staticmethod

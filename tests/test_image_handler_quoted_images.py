@@ -170,6 +170,41 @@ class ImageHandlerQuotedImagesTest(unittest.TestCase):
         self.assertEqual([item.source for item in result], ["quoted_embedded"])
         self.assertEqual(quoted_calls, [])
 
+    def test_nested_embedded_reply_images_keep_order_without_remote_fetch(self):
+        chain = [FakeImage("top"), FakeReply("outer", [FakeImage("first"),
+                  FakeReply("nested", [FakeImage("second")])])]
+        result = asyncio.run(ImageHandler.collect_message_images(FakeEvent(chain), chain, 10))
+        self.assertEqual([r.url for r in result], ["top", "first", "second"])
+        self.assertEqual([r.component_index for r in result], [0, 1, 1])
+        self.assertEqual(quoted_calls, [])
+        has_image, has_text, images = ImageHandler._analyze_message(chain)
+        self.assertTrue(has_image)
+        self.assertTrue(has_text)
+        self.assertEqual(len(images), 3)
+
+    def test_nested_quote_render_and_depth_cycle_are_bounded(self):
+        reply = FakeReply("outer", [FakeReply("nested", [FakeImage("one")], message_str="")], message_str="")
+        self.assertIn("[引用消息]", ImageHandler._format_special_component(reply))
+        reply.chain.append(reply)
+        result = asyncio.run(ImageHandler.collect_message_images(FakeEvent([reply]), [reply], 10))
+        self.assertEqual([r.url for r in result], ["one"])
+        self.assertEqual(quoted_calls, [])
+
+    def test_quote_text_chain_is_preserved_without_legacy_message_string(self):
+        reply = FakeReply("outer", [FakePlain("引用正文"),
+                          FakeReply("nested", [FakePlain("嵌套正文")], message_str="")], message_str="")
+        rendered = ImageHandler._format_special_component(reply)
+        self.assertIn("引用正文", rendered)
+        self.assertIn("嵌套正文", rendered)
+
+    def test_overdeep_quote_images_use_parser_fallback_instead_of_unbounded_walk(self):
+        deep = FakeReply("depth4", [FakeImage("too-deep")])
+        chain = [FakeReply("outer", [FakeReply("depth2", [FakeReply("depth3", [deep])])])]
+        result = asyncio.run(ImageHandler.collect_message_images(FakeEvent(chain), chain, 10))
+        self.assertEqual(result, [])
+        self.assertEqual(quoted_calls, ["outer"])
+        self.assertFalse(ImageHandler._analyze_message(chain)[0])
+
     def test_empty_reply_chain_uses_public_parser(self):
         quoted_results["r1"] = ["quoted-a"]
         chain = [FakeReply("r1")]

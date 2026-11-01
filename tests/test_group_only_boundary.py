@@ -139,7 +139,7 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
         self.assertIn('astrbot_version: ">=4.24.0,<5"', metadata)
         self.assertIn("support_platforms:", metadata)
         self.assertIn("  - aiocqhttp", metadata)
-        self.assertIn("可配置 Codex OAuth 与 StepFun 群聊生图与修图", metadata)
+        self.assertIn("Grok 与 GPT Image 群聊生图与修图", metadata)
         self.assertNotIn("Web", metadata)
         self.assertNotIn("Him666233", metadata)
 
@@ -178,26 +178,26 @@ class GroupOnlyBoundaryTest(unittest.TestCase):
 
     def test_group_image_backend_documentation_contract(self):
         for marker in (
-            "根据实际发起工具调用的正式回复模型选择后端",
-            "选择发生在 AstrBot 模型回退之后",
-            "无法确认调用模型或模型类型不受支持时，拒绝绘图",
-            "留空也不会默认转入 Codex",
-            "`gcp_step_image_generate` 与 `gcp_step_image_edit`",
-            "通用进度文本、一次图片结果",
+            "未设置的群保持原行为",
+            "普通成员只能调用当前群默认接口",
+            "管理员仍可在单次请求中明确指定另一接口",
+            "规划模型回退后仍按新模型选择",
+            "`gcp_grok_image` 和 `gcp_gpt_image`",
+            "成功后发送一次图片",
             "取消、等待本插件尚未完成的图片请求",
         ):
             self.assertIn(marker, self.readme_source)
 
         for marker in (
-            "根据实际发起工具调用的正式回复模型路由",
+            "群默认接口优先",
             "路由绑定 AstrBot 回退后的 Provider 实例",
             "无法确定调用模型时拒绝请求",
             "后端字段留空不会转入 Codex",
             "文生图需要 Provider 声明 `image_generate`；修图额外需要 `image_edit`",
             "Provider 负责 OAuth 凭据以及 `image_generation` 请求",
-            "`gcp_step_image_generate` 与 `gcp_step_image_edit`",
-            "通用自然语言进度文本和一次图片结果",
-            "当前群人格生成自然语言收尾",
+            "`gcp_grok_image` 与 `gcp_gpt_image`",
+            "不发送固定进度文本",
+            "成功时发送一次图片，再由模型自然收尾",
         ):
             self.assertIn(marker, self.config_reference_source)
         self.assertNotIn(

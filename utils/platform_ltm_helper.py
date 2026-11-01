@@ -1039,18 +1039,19 @@ class PlatformLTMHelper:
             是否包含图片
         """
         try:
-            from astrbot.api.message_components import Image
+            from astrbot.api.message_components import Image, Plain, Reply
+            from .reply_chain_utils import analyze_chain
 
             if not hasattr(event, "message_obj") or not hasattr(
                 event.message_obj, "message"
             ):
                 return False
 
-            for component in event.message_obj.message:
-                if isinstance(component, Image):
-                    return True
-
-            return False
+            has_image, _, _ = analyze_chain(
+                event.message_obj.message, image_type=Image, plain_type=Plain,
+                reply_type=Reply,
+            )
+            return has_image
 
         except Exception:
             return False
@@ -1067,22 +1068,18 @@ class PlatformLTMHelper:
             是否是纯图片消息
         """
         try:
-            from astrbot.api.message_components import Image, Plain
+            from astrbot.api.message_components import Image, Plain, Reply
+            from .reply_chain_utils import analyze_chain
 
             if not hasattr(event, "message_obj") or not hasattr(
                 event.message_obj, "message"
             ):
                 return False
 
-            has_image = False
-            has_text = False
-
-            for component in event.message_obj.message:
-                if isinstance(component, Image):
-                    has_image = True
-                elif isinstance(component, Plain):
-                    if component.text and component.text.strip():
-                        has_text = True
+            has_image, has_text, _ = analyze_chain(
+                event.message_obj.message, image_type=Image, plain_type=Plain,
+                reply_type=Reply,
+            )
 
             return has_image and not has_text
 

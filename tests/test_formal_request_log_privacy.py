@@ -57,6 +57,8 @@ def _load_generate_reply(logger):
         "ReplyHandler": FakeReplyHandler,
         "build_reply_mode_instruction": lambda mode: f"mode-guidance:{mode}",
         "ToolPolicy": SimpleNamespace(clone_tool_container=lambda value: value),
+        "STATIC_INSTRUCTIONS": "static_instructions",
+        "enabled_for": lambda event, config, key: bool(config and event.unified_msg_origin in config.get(key, [])),
         "resolve_session_persona": resolve_session_persona,
         "_expand_event_plugins_name_for_tool_access": lambda *_args: None,
         "format_ai_error": lambda exc, _stage: type(exc).__name__,
