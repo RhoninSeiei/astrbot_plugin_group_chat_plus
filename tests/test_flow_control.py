@@ -160,6 +160,15 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.controller.repeat_progress(self.event, "checking", result))
         self.assertTrue(self.controller.final_matches_progress(self.event, "checking"))
 
+    async def test_metrics_only_does_not_bypass_original_final_duplicate_filter(self):
+        self.config["flow_tool_progress_enabled"] = False
+        trace = self.begin()
+        await self.event.send(chain("checking"))
+        self.controller.agent_done(self.event)
+        self.assertEqual(trace.send_count, 1)
+        self.assertFalse(self.controller.final_matches_progress(self.event, "checking"))
+        self.controller.finish(self.event, trace)
+
     async def test_streaming_is_not_whole_text_deduplicated_or_called_first_token(self):
         trace = self.begin()
         result = SimpleNamespace(is_llm_result=lambda: True, async_stream=object())

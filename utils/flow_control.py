@@ -321,7 +321,8 @@ class FlowController:
 
     def final_matches_progress(self, event, text):
         trace = self.trace(event)
-        return bool(trace and trace.agent_done_seen and _digest(text) in trace.progress_hashes)
+        return bool(trace and self.enabled(event, "flow_tool_progress_enabled")
+                    and trace.agent_done_seen and _digest(text) in trace.progress_hashes)
 
     def new_window(self, event, timeout_ms):
         if self.enabled(event, "flow_adaptive_wait_enabled"):
