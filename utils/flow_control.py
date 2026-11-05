@@ -38,7 +38,9 @@ def _visible(chain):
             "forward", "dice", "rps", "contact", "location", "json", "wechatemoji",
             "music", "share",
         }:
-            return True
+            if any(getattr(part, key, None) not in (None, "", [], {})
+                   for key in ("file", "url", "file_", "data", "content", "id", "md5", "audio", "lat", "value")):
+                return True
     return False
 
 

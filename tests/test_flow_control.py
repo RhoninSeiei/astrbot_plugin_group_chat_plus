@@ -107,6 +107,17 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("first_sdk_submit", [row["stage"] for row in self.logs])
         self.controller.finish(self.event, trace)
 
+    async def test_empty_media_does_not_count_but_submitted_image_does(self):
+        class Image:
+            def __init__(self, file):
+                self.file = file
+        trace = self.begin()
+        await self.event.send(SimpleNamespace(chain=[Image("")]))
+        self.assertEqual(trace.send_count, 0)
+        await self.event.send(SimpleNamespace(chain=[Image("synthetic.png")]))
+        self.assertEqual(trace.send_count, 1)
+        self.controller.finish(self.event, trace)
+
     async def test_successful_send_forwards_all_arguments_and_does_not_claim_receipt(self):
         trace = self.begin()
         self.clock.tick = 2.5

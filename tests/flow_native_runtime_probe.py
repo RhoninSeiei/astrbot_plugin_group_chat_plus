@@ -115,8 +115,7 @@ async def main():
     original = respond_module.call_event_hook
     respond_module.call_event_hook = hook
     try:
-        async for _ in stage.process(event):
-            pass
+        await stage.process(event)
     finally:
         respond_module.call_event_hook = original
         controller.finish(event, trace)
