@@ -10262,7 +10262,10 @@ class ChatPlus(Star):
             if native_progress and flow.repeat_progress(event, reply_text, result):
                 event.clear_result()
                 return
-            brief_text = reply_text if native_progress else ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
+            if native_progress:
+                brief_text = reply_text
+            else:
+                brief_text = ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
             if brief_text != reply_text:
                 logger.info(
                     f"[群聊短回复限制] 已裁剪回复长度: {len(reply_text)} -> {len(brief_text)} 字符"
