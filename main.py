@@ -96,6 +96,7 @@ from .utils.request_compatibility import (
     native_memory_available,
     split_static_instructions,
 )
+from .utils.flow_control import FlowController, PROGRESS_INSTRUCTION
 
 
 from astrbot.api.all import *
@@ -577,6 +578,10 @@ class ChatPlus(Star):
         _GWW_MAX_USERS_HARD_LIMIT = 20
 
         self.enable_group_wait_window = config.get("enable_group_wait_window", False)
+        self.flow_control = FlowController(
+            config,
+            lambda row: logger.info("GCP_FLOW %s", json.dumps(row, separators=(",", ":"))),
+        )
 
         _gww_timeout_raw = config.get("group_wait_window_timeout_ms", 3000)
         try:
@@ -2639,6 +2644,9 @@ class ChatPlus(Star):
 
         停止主动对话功能的后台任务并保存状态
         """
+        flow = getattr(self, "flow_control", None)
+        if flow:
+            flow.close()
         self._image_tools_terminated = True
         planner_handle = getattr(self, "_image_planner_context_handle", None)
         if planner_handle is not None:
@@ -2836,6 +2844,9 @@ class ChatPlus(Star):
         """
         # 🔧 用于 finally 安全清理，防止 processing_sessions 泄漏导致后续消息卡住
         _cleanup_message_id = None
+        _flow = getattr(self, "flow_control", None)
+        _flow_trace = None
+        _flow_outcome = None
         try:
             # 🔘 检查群聊功能总开关
             if not self.enable_group_chat or event.is_private_chat():
@@ -2985,11 +2996,19 @@ class ChatPlus(Star):
                 return
 
             # 处理群消息
+            if _flow and self._is_enabled(event):
+                _flow_trace = _flow.start(event)
             async for result in self._process_message(event):
                 yield result
+        except asyncio.CancelledError:
+            _flow_outcome = "cancelled"
+            raise
         except Exception as e:
+            _flow_outcome = "failed"
             logger.error(f"处理群消息时发生错误: {e}", exc_info=True)
         finally:
+            if _flow_trace:
+                _flow.finish(event, _flow_trace, _flow_outcome)
             # 🔧 安全网：确保 processing_sessions 条目不会泄漏
             # 当 after_message_sent 未被框架调用时（如 on_decorating_result 清空了 result，
             # 或 _generate_and_send_reply 未 yield 就提前返回，或管线中途异常），
@@ -6448,6 +6467,9 @@ class ChatPlus(Star):
             ):
                 event.call_llm = True
 
+            flow = getattr(self, "flow_control", None)
+            if flow and is_provider_request:
+                flow.formal_request(event)
             yield reply_result
 
             # 🔧 安全兜底：agent完整流程结束后，检查是否有未保存的累积回复
@@ -6905,6 +6927,9 @@ class ChatPlus(Star):
             if window is None:
                 return False  # 无活跃窗口，不拦截
             current_window_token = window.get("token")
+            adaptive_arrival = (
+                window["adaptive"].clock() if window.get("adaptive") else None
+            )
 
         async def _force_complete_window(reason: str) -> None:
             async with self._group_wait_window_lock:
@@ -7005,6 +7030,16 @@ class ChatPlus(Star):
 
         # 普通消息（含关键词触发消息）：拦截并缓存
         # 处理逻辑与概率过滤失败时的缓存路径完全一致
+        adaptive_inflight = False
+        if adaptive_arrival is not None:
+            async with self._group_wait_window_lock:
+                current = self._group_wait_windows.get(window_key)
+                if current is None or current.get("token") != current_window_token:
+                    return False
+                current["adaptive"].note_message(adaptive_arrival)
+                current["deadline"] = current["adaptive"].deadline
+                current["inflight"] = current.get("inflight", 0) + 1
+                adaptive_inflight = True
         try:
             original_message_text = MessageCleaner.extract_raw_message_from_event(event)
 
@@ -7112,6 +7147,14 @@ class ChatPlus(Star):
                 processed_text = original_message_text
                 should_cache = bool(processed_text and processed_text.strip())
 
+            if adaptive_inflight:
+                async with self._group_wait_window_lock:
+                    current = self._group_wait_windows.get(window_key)
+                    if current is None or current.get("token") != current_window_token:
+                        # The hard limit/force-close already released the owner.
+                        # Do not orphan this message in a consumed cache batch;
+                        # let the normal message pipeline process it instead.
+                        return False
             has_cached_payload = bool(
                 processed_text
                 or cached_image_urls
@@ -7187,14 +7230,15 @@ class ChatPlus(Star):
             # 更新窗口状态：extra_count++，重置 deadline
             async with self._group_wait_window_lock:
                 w = self._group_wait_windows.get(window_key)
-                if w:
+                if w and (not w.get("adaptive") or w.get("token") == current_window_token):
                     if count_after_buffer:
                         w["extra_count"] += 1
                     if force_complete_after_buffer:
                         w["force_complete"] = True
-                    w["deadline"] = (
-                        time.time() + self.group_wait_window_timeout_ms / 1000.0
-                    )
+                    if w.get("adaptive"):
+                        w["deadline"] = w["adaptive"].deadline
+                    else:
+                        w["deadline"] = time.time() + self.group_wait_window_timeout_ms / 1000.0
                     if self.debug_mode:
                         logger.info(
                             f"[等待窗口] 用户{sender_id}: "
@@ -7209,8 +7253,14 @@ class ChatPlus(Star):
                 exc.__class__.__name__,
             )
             return False
+        finally:
+            if adaptive_inflight:
+                async with self._group_wait_window_lock:
+                    current = self._group_wait_windows.get(window_key)
+                    if current is not None and current.get("token") == current_window_token:
+                        current["inflight"] = max(0, current.get("inflight", 0) - 1)
 
-    async def _run_group_wait_window(self, chat_id: str, user_id: str) -> int:
+    async def _run_group_wait_window(self, chat_id: str, user_id: str, event=None) -> int:
         """
         启动并运行群聊等待窗口（⏳ v1.2.0）。
 
@@ -7227,6 +7277,8 @@ class ChatPlus(Star):
             int: 窗口期间收集到的额外消息数量（用于注意力机制补偿）
         """
         window_key = (chat_id, user_id)
+        flow = getattr(self, "flow_control", None)
+        adaptive = flow.new_window(event, self.group_wait_window_timeout_ms) if flow else None
         timeout_sec = self.group_wait_window_timeout_ms / 1000.0
         _extra_count = 0  # 🔧 追踪窗口期间收集的额外消息数（用于注意力机制补偿）
 
@@ -7255,9 +7307,10 @@ class ChatPlus(Star):
             # 创建/覆盖窗口（接管时旧循环会因令牌不匹配自动退出）
             self._group_wait_windows[window_key] = {
                 "extra_count": 0,
-                "deadline": time.time() + timeout_sec,
+                "deadline": adaptive.deadline if adaptive else time.time() + timeout_sec,
                 "force_complete": False,
                 "token": my_token,
+                "adaptive": adaptive,
             }
 
         logger.info(
@@ -7294,7 +7347,12 @@ class ChatPlus(Star):
                             f"达到上限，继续处理"
                         )
                         break
-                    if time.time() >= w["deadline"]:
+                    if w.get("adaptive"):
+                        if w["adaptive"].clock() >= w["adaptive"].hard_deadline:
+                            break
+                        if w.get("inflight", 0):
+                            continue
+                    if (w["adaptive"].expired() if w.get("adaptive") else time.time() >= w["deadline"]):
                         logger.info(
                             f"[等待窗口] 用户{user_id}：超时，"
                             f"共收集{w['extra_count']}条额外消息，继续处理"
@@ -7324,6 +7382,7 @@ class ChatPlus(Star):
             event: 消息事件对象
         """
         _process_start_time = time.time()
+        flow = getattr(self, "flow_control", None)
 
         # 步骤1: 执行初始检查（最基本的过滤）
         (
@@ -7742,9 +7801,18 @@ class ChatPlus(Star):
             )
             if _gww_recheck:
                 return
-            _gww_extra_count = await self._run_group_wait_window(
-                chat_id, _gww_sender_id
-            )
+            wait_trace = flow.begin(event, "wait") if flow else None
+            try:
+                _gww_extra_count = await self._run_group_wait_window(
+                    chat_id, _gww_sender_id, event=event
+                )
+            except BaseException:
+                if wait_trace:
+                    wait_trace.end("wait", "interrupted")
+                raise
+            finally:
+                if wait_trace:
+                    wait_trace.end("wait")
 
         # 步骤3.6: 使用之前检测的戳一戳信息（避免重复检测）
         # 提取内嵌的poke_info用于后续处理
@@ -8018,6 +8086,7 @@ class ChatPlus(Star):
             else False
         )
         _at_all_skip_all = is_at_all_message and self.at_all_message_mode == "skip_all"
+        decision_trace = flow.begin(event, "decision") if flow else None
 
         if _welcome_skip_all or _at_all_skip_all:
             should_reply = True
@@ -8043,6 +8112,9 @@ class ChatPlus(Star):
                 original_message_text=original_message_text,
                 pending_cooldown_context=pending_cooldown_context,
             )
+
+        if decision_trace:
+            decision_trace.end("decision", "allow" if should_reply else "decline")
 
         if not should_reply:
             # 🆕 v1.2.0: AI决策判定不通过时，才将消息添加到缓存
@@ -9624,6 +9696,9 @@ class ChatPlus(Star):
             # 不是本插件的请求，不做任何处理
             return
 
+        flow = getattr(self, "flow_control", None)
+        if flow:
+            flow.formal_request(event, ready=True)
         self._check_compliance_status()
 
         if self.debug_mode:
@@ -9759,6 +9834,9 @@ class ChatPlus(Star):
             else:
                 req.func_tool = plugin_tool_set
 
+        if (flow and flow.trace(event) and flow.enabled(event, "flow_tool_progress_enabled")
+                and _get_compatible_tools(req.func_tool)):
+            merged_system_prompt = (merged_system_prompt or "") + PROGRESS_INSTRUCTION
         req.system_prompt = merged_system_prompt or ""
 
         # 🔧 修复：注入 Skills 提示词，避免插件接管 LLM 请求后丢失技能识别
@@ -9874,6 +9952,9 @@ class ChatPlus(Star):
             if message_id not in self.processing_sessions:
                 return
 
+            flow = getattr(self, "flow_control", None)
+            if flow:
+                flow.agent_done(event, response)
             # 设置agent完成标志
             self._agent_done_flags.add(message_id)
 
@@ -9906,6 +9987,18 @@ class ChatPlus(Star):
 
         except Exception as e:
             logger.error(f"[on_llm_response] 处理失败: {e}", exc_info=True)
+
+    @filter.on_using_llm_tool(priority=-1)
+    async def on_flow_tool_start(self, event: AstrMessageEvent, tool, tool_args):
+        flow = getattr(self, "flow_control", None)
+        if flow:
+            flow.tool_start(event, tool)
+
+    @filter.on_llm_tool_respond(priority=-1)
+    async def on_flow_tool_end(self, event: AstrMessageEvent, tool, tool_args, tool_result):
+        flow = getattr(self, "flow_control", None)
+        if flow:
+            flow.tool_end(event, tool, tool_result)
 
     @staticmethod
     def _replace_llm_result_text(result, new_text: str) -> bool:
@@ -10060,8 +10153,11 @@ class ChatPlus(Star):
                 for component in getattr(result, "chain", None) or []
                 if hasattr(component, "text")
             ).strip()
+            flow = getattr(self, "flow_control", None)
             failure_reason = classify_raw_llm_failure(reply_text)
             if failure_reason and self._group_llm_runtime_guard_enabled(event):
+                if flow:
+                    flow.failure(event)
                 self._mark_reply_generation_failed(event, message_id)
                 source = (
                     "plugin"
@@ -10162,7 +10258,11 @@ class ChatPlus(Star):
                 _replace_result_text(tool_call_guard.sanitized_text)
                 reply_text = tool_call_guard.sanitized_text
 
-            brief_text = ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
+            native_progress = bool(flow and flow.keep_progress(event, result))
+            if native_progress and flow.repeat_progress(event, reply_text, result):
+                event.clear_result()
+                return
+            brief_text = reply_text if native_progress else ReplyHandler._apply_group_chat_brevity_limit(event, reply_text)
             if brief_text != reply_text:
                 logger.info(
                     f"[群聊短回复限制] 已裁剪回复长度: {len(reply_text)} -> {len(brief_text)} 字符"
@@ -10215,7 +10315,8 @@ class ChatPlus(Star):
 
             # 🔧 重要：重复检测必须在错字模拟之前执行，基于原始内容检测
             # 清理过期缓存并进行重复检查（使用可配置参数）
-            if self.enable_duplicate_filter:
+            final_matches_progress = bool(flow and flow.final_matches_progress(event, reply_text))
+            if self.enable_duplicate_filter and not native_progress and not final_matches_progress:
                 duplicate_match = self._match_recent_duplicate_reply(chat_id, reply_text)
                 if duplicate_match:
                     recent_content = duplicate_match.get("recent_content", "")
@@ -10280,6 +10381,8 @@ class ChatPlus(Star):
                 except Exception:
                     pass  # 缓存写入失败不影响主流程
 
+            if native_progress:
+                flow.prepare_progress(event, reply_text, result)
             # 🆕 v1.0.2: 应用错字模拟（在重复检测之后，对原始内容进行装饰性修改）
             if self.typo_enabled and self.typo_generator:
                 if self.debug_mode:
@@ -10362,6 +10465,9 @@ class ChatPlus(Star):
                 if message_id not in self.processing_sessions:
                     return  # 不是本插件触发的回复，忽略
 
+                flow = getattr(self, "flow_control", None)
+                if flow:
+                    flow.send_hook(event)
                 # 🔧 双重防护：检查此消息是否已经保存过
                 # 当分段插件启用时，同一消息会触发多次 after_message_sent
                 # processing_sessions 是第一道防线（通常已足够）

@@ -1942,6 +1942,36 @@
         "hint": "当一条普通消息通过概率筛选后，bot会短暂等待同一用户紧接着发来的多条消息，一次性批量处理，避免分段消息被AI割裂回复。@消息不受影响，仍然立即回复。",
         "default": "--- 群聊等待窗口配置区 ---"
     },
+    "flow_optimization_sessions": {
+        "description": "回复流程优化会话白名单",
+        "type": "list",
+        "default": [],
+        "hint": "仅填写完整 unified_msg_origin，例如 default:GroupMessage:905956314。空列表保持原行为；以下阶段观测、自适应窗口和自然工具反馈只在此列表内生效。"
+    },
+    "flow_metrics_enabled": {
+        "description": "记录回复阶段耗时",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对流程优化白名单生效。日志仅含随机请求标识、阶段、耗时和结果类别，不记录正文、参数或用户ID。SDK发送成功提交不代表对方已收到；流式仅能观测完整提交完成。"
+    },
+    "flow_adaptive_wait_enabled": {
+        "description": "自适应群聊等待窗口",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对流程优化白名单内已开启的普通消息等待窗口生效。根据静默与连续发言间隔提前结束，单窗口总等待不超过原超时或3000毫秒；不改变@和戳一戳的原有放行规则。"
+    },
+    "flow_wait_quiet_ms": {
+        "description": "自适应窗口初始静默时间",
+        "type": "int",
+        "default": 1000,
+        "hint": "白名单窗口初始静默时间，范围600-1600毫秒。后续发言按窗口内间隔动态调整，并遵守总等待硬上限。"
+    },
+    "flow_tool_progress_enabled": {
+        "description": "保留长工具自然反馈",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对流程优化白名单生效。提示原生模型在实际耗时工具前按当前人格自然说明动作，保留其原有中间回复；不添加固定模板、额外模型或额外发送，快工具无需寒暄。"
+    },
     "enable_group_wait_window": {
         "description": "🆕 启用群聊等待窗口",
         "type": "bool",
