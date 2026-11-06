@@ -1,0 +1,584 @@
+diff --git a/_conf_schema.json b/_conf_schema.json
+index 1eb51ce..964811d 100644
+--- a/_conf_schema.json
++++ b/_conf_schema.json
+@@ -1089,5 +1089,28 @@
+         "default": "legacy"
+       }
+     }
++  },
++  "identity_mode": {
++    "description": "群内称呼事实模式",
++    "type": "string",
++    "default": "off",
++    "options": [
++      "off",
++      "shadow",
++      "active"
++    ],
++    "hint": "off关闭；shadow仅记录候选，不向回复提供事实；active允许本人明确确认与否认。称呼不代表权限或现实身份。"
++  },
++  "identity_allowed_sessions": {
++    "description": "称呼事实允许会话",
++    "type": "list",
++    "default": [],
++    "hint": "填写完整UMO，空列表完全禁用。仅指定会话采集及读取，仍遵守学习黑白名单。"
++  },
++  "identity_relation_scopes": {
++    "description": "历史关系来源明确绑定的会话",
++    "type": "list",
++    "default": [],
++    "hint": "必须是identity_allowed_sessions子集。仅在确认历史group关系属于该完整UMO时填写；空列表不读取历史关系，不自动推断适配器归属。"
+   }
+ }
+diff --git a/config.py b/config.py
+index 5279c4c..3ee2388 100644
+--- a/config.py
++++ b/config.py
+@@ -192,6 +192,11 @@ class PluginConfig(BaseModel):
+ 
+     model_config = ConfigDict(extra="ignore", populate_by_name=True)
+ 
++    # Scoped identity facts; intentionally separate from jargon and persona learning.
++    identity_mode: str = "off"
++    identity_allowed_sessions: List[str] = Field(default_factory=list)
++    identity_relation_scopes: List[str] = Field(default_factory=list)
++
+     # 基础开关
+     enable_message_capture: bool = True
+     enable_auto_learning: bool = True
+@@ -419,6 +424,21 @@ class PluginConfig(BaseModel):
+             raise ValueError("日志等级必须是 error、warning、info、debug 或 trace")
+         return normalized
+ 
++    @field_validator("identity_mode", mode="before")
++    @classmethod
++    def _normalize_identity_mode(cls, value):
++        return value if isinstance(value, str) and value in {"off", "shadow", "active"} else "off"
++
++    @field_validator("identity_allowed_sessions", "identity_relation_scopes", mode="before")
++    @classmethod
++    def _normalize_identity_sessions(cls, value, info):
++        if not isinstance(value, (list, tuple)):
++            return []
++        values = list(dict.fromkeys(v for v in value if isinstance(v, str) and 0 < len(v) <= 256))[:64]
++        if info.field_name == "identity_relation_scopes":
++            values = [v for v in values if v in info.data.get("identity_allowed_sessions", [])]
++        return values
++
+     @field_validator("target_qq_list", mode="before")
+     @classmethod
+     def _normalize_target_qq_list(cls, value) -> List[str]:
+@@ -520,6 +540,9 @@ class PluginConfig(BaseModel):
+         logger.info(f" [配置加载] enable_goal_driven_chat: {goal_driven_chat_settings.get('enable_goal_driven_chat', 'NOT_FOUND')}")
+ 
+         return cls(
++            identity_mode=config.get("identity_mode", "off"),
++            identity_allowed_sessions=config.get("identity_allowed_sessions", []),
++            identity_relation_scopes=config.get("identity_relation_scopes", []),
+             enable_message_capture=basic_settings.get('enable_message_capture', True),
+             enable_auto_learning=basic_settings.get('enable_auto_learning', True),
+             enable_realtime_learning=basic_settings.get('enable_realtime_learning', False),
+diff --git a/core/plugin_lifecycle.py b/core/plugin_lifecycle.py
+index 2fc2ac6..c4b4ecc 100644
+--- a/core/plugin_lifecycle.py
++++ b/core/plugin_lifecycle.py
+@@ -395,6 +395,14 @@ class PluginLifecycle:
+ 
+         logger.info(StatusMessages.ON_LOAD_START)
+ 
++        # Independent local identity store; failures leave the normal pipeline intact.
++        from ..services.identity import IdentityService
++        p.identity_service = IdentityService(
++            plugin_config.data_dir, plugin_config,
++            qq_filter=getattr(p, "qq_filter", None), database=getattr(p, "db_manager", None),
++        )
++        await p.identity_service.start()
++
+         # ------ DB 启动（带重试）------
+         db_started = False
+         max_retries = 3
+@@ -523,6 +531,9 @@ class PluginLifecycle:
+ 
+             # 0. 阻止新消息产生后台任务
+             p._shutting_down = True
++            identity = getattr(p, "identity_service", None)
++            if identity is not None:
++                await self._safe_step("关闭群内称呼事实", identity.close())
+ 
+             # 1. 停止学习任务
+             logger.info("停止所有学习任务...")
+diff --git a/main.py b/main.py
+index 0239f85..a9271fd 100644
+--- a/main.py
++++ b/main.py
+@@ -132,6 +132,7 @@ class SelfLearningPlugin(star.Star):
+         self.remember_service = None
+         self.feature_delegation = None
+         self.qq_filter = None
++        self.identity_service = None
+         self.plugin_config = None
+         self.page_api = None
+         self._message_capture_diag_counts: dict[str, int] = {}
+@@ -465,6 +466,10 @@ class SelfLearningPlugin(star.Star):
+                 self._log_message_capture_diag("skip:pipeline_missing", event, message_text, level="info")
+                 return
+ 
++            identity = getattr(self, "identity_service", None)
++            if identity is not None:
++                identity.prepare_event(event)
++
+             # 后台学习流水线
+             self._track_task(asyncio.create_task(
+                 self._process_learning_message(group_id, sender_id, message_text, event)
+@@ -490,6 +495,12 @@ class SelfLearningPlugin(star.Star):
+ 
+         collected = await pipeline.process_learning(group_id, sender_id, message_text, event)
+         if collected:
++            identity = getattr(self, "identity_service", None)
++            if identity is not None:
++                try:
++                    await identity.observe_event(event)
++                except Exception as exc:
++                    logger.warning("Identity observation failed: %s", type(exc).__name__)
+             self.learning_stats.total_messages_collected += 1
+             if self.plugin_config:
+                 self.plugin_config.total_messages_collected = self.learning_stats.total_messages_collected
+@@ -497,6 +508,21 @@ class SelfLearningPlugin(star.Star):
+         else:
+             self._log_message_capture_diag("fail:raw_message_not_saved", event, message_text, level="info")
+ 
++    async def get_identity_context(self, event, *, subject_ids=(), aliases=(), include_relations=True):
++        """Versioned read API; Self Learning remains the only fact writer."""
++        identity = getattr(self, "identity_service", None)
++        if identity is None or getattr(self, "_shutting_down", False):
++            return {"version": 1, "status": "unavailable", "scope": "",
++                    "subjects": [], "unresolved": [], "relations": []}
++        try:
++            return await identity.get_identity_context(
++                event, subject_ids=subject_ids, aliases=aliases,
++                include_relations=include_relations,
++            )
++        except Exception:
++            return {"version": 1, "status": "unavailable", "scope": "",
++                    "subjects": [], "unresolved": [], "relations": []}
++
+     def _track_task(self, task: asyncio.Task) -> None:
+         """Register a fire-and-forget task for cancellation during shutdown."""
+         bg = getattr(self, 'background_tasks', None)
+diff --git a/services/identity/__init__.py b/services/identity/__init__.py
+new file mode 100644
+index 0000000..7c6ec51
+--- /dev/null
++++ b/services/identity/__init__.py
+@@ -0,0 +1,4 @@
++"""Request-scoped identity facts, owned exclusively by Self Learning."""
++from .service import IdentityService
++
++__all__ = ["IdentityService"]
+diff --git a/services/identity/service.py b/services/identity/service.py
+new file mode 100644
+index 0000000..4fb5f12
+--- /dev/null
++++ b/services/identity/service.py
+@@ -0,0 +1,349 @@
++"""Bounded, local identity facts. Nicknames are preferences, never authority."""
++import asyncio
++from contextlib import closing
++import hashlib
++import json
++import os
++import re
++import sqlite3
++import time
++import unicodedata
++from pathlib import Path
++
++_QQ = re.compile(r'[1-9][0-9]{3,19}\Z')
++_RESERVED = {'管理员', '群主', '系统', '机器人', 'admin', 'system', 'assistant', 'developer', '所有人', '大家', '我', '你', '他'}
++_SELF = re.compile(r'(请叫我|我的花名是|我的昵称是|别叫我|我的花名不是)(.+?)[。！!]?\Z')
++_THIRD = re.compile(r'@([1-9][0-9]{3,19})(?:也叫|的花名是|的昵称是)(.+?)[。！!]?\Z')
++
++
++def clean_name(value, limit=48):
++    if not isinstance(value, str):
++        return ''
++    value = unicodedata.normalize('NFKC', value).strip()
++    if not value or len(value) > limit or any(unicodedata.category(c).startswith('C') for c in value):
++        return ''
++    return value
++
++
++def alias_value(value):
++    value = clean_name(value, 28)
++    pairs = [('“', '”'), ('「', '」'), ('"', '"'), ("'", "'")]
++    for left, right in pairs:
++        if value.startswith(left) and value.endswith(right):
++            value = value[1:-1].strip()
++            break
++    if not 2 <= len(value) <= 24 or any(c in value for c in '\n\r<>[]{}@,，。！？!?:：;；“”「」"\''):
++        return ''
++    if value.casefold() in _RESERVED or value.isdecimal():
++        return ''
++    return value
++
++
++class IdentityService:
++    """Single writer; all consumers receive detached JSON-compatible snapshots."""
++    def __init__(self, data_dir, config, *, qq_filter=None, database=None):
++        self.path = Path(data_dir) / 'identity' / 'identity.sqlite3'
++        self.config, self.qq_filter, self.database = config, qq_filter, database
++        self._closed = False
++        self._ready = False
++        self._lock = asyncio.Lock()
++        self._pending = 0
++
++    def _mode(self):
++        value = getattr(self.config, 'identity_mode', 'off')
++        return value if value in ('off', 'shadow', 'active') else 'off'
++
++    async def start(self):
++        if self._closed or self._mode() == 'off' or not getattr(self.config, 'identity_allowed_sessions', []):
++            return
++        try:
++            self.path.parent.mkdir(parents=True, exist_ok=True)
++            await self._run(self._initialize)
++            if os.name != "nt":
++                os.chmod(self.path.parent, 0o700)
++                os.chmod(self.path, 0o600)
++            self._ready = True
++        except (OSError, sqlite3.Error):
++            self._ready = False
++
++    def _initialize(self, con):
++        con.executescript('''
++          CREATE TABLE IF NOT EXISTS members (
++            adapter TEXT, scope TEXT, user_id TEXT, display_name TEXT,
++            names TEXT NOT NULL, updated INTEGER NOT NULL,
++            PRIMARY KEY(adapter,scope,user_id));
++          CREATE TABLE IF NOT EXISTS observed_names (
++            adapter TEXT, scope TEXT, user_id TEXT, normalized TEXT, name TEXT,
++            PRIMARY KEY(adapter,scope,user_id,normalized));
++          CREATE TABLE IF NOT EXISTS aliases (
++            adapter TEXT, scope TEXT, user_id TEXT, normalized TEXT, alias TEXT,
++            state TEXT, updated INTEGER NOT NULL,
++            PRIMARY KEY(adapter,scope,user_id,normalized));
++          CREATE TABLE IF NOT EXISTS events (
++            key TEXT PRIMARY KEY, adapter TEXT, scope TEXT, updated INTEGER NOT NULL);
++          CREATE TABLE IF NOT EXISTS claims (
++            event_key TEXT, adapter TEXT, scope TEXT, subject TEXT, actor TEXT,
++            alias TEXT, kind TEXT, updated INTEGER NOT NULL,
++            PRIMARY KEY(event_key,subject,alias));
++        ''')
++
++    async def _run(self, operation):
++        if self._closed or self._pending >= 16:
++            raise RuntimeError('identity_unavailable')
++        self._pending += 1
++        try:
++            async with self._lock:
++                if self._closed:
++                    raise RuntimeError('identity_closed')
++                def run():
++                    with closing(sqlite3.connect(self.path, timeout=0.1)) as con:
++                        con.row_factory = sqlite3.Row
++                        with con:
++                            return operation(con)
++                task = asyncio.create_task(asyncio.to_thread(run))
++                try:
++                    return await asyncio.shield(task)
++                except asyncio.CancelledError:
++                    # A cancelled coroutine must not release the writer lock while
++                    # SQLite is still committing in its worker thread.
++                    await task
++                    raise
++        finally:
++            self._pending -= 1
++
++    async def close(self):
++        self._closed = True
++        self._ready = False
++        async with self._lock:
++            pass
++
++    def _snapshot(self, event):
++        try:
++            adapter = str(event.get_platform_id() or '')
++            scope = str(event.unified_msg_origin or '')
++            group = str(event.get_group_id() or '')
++            sender = str(event.get_sender_id() or '')
++            if not adapter or len(adapter) > 96 or len(scope) > 256 or not _QQ.fullmatch(sender) or not _QQ.fullmatch(group):
++                return None
++            if scope != f'{adapter}:GroupMessage:{group}':
++                return None
++            if scope not in getattr(self.config, 'identity_allowed_sessions', []):
++                return None
++            components = event.get_messages() or []
++            if not isinstance(components, (list, tuple)):
++                return None
++            self_id = getattr(event, 'get_self_id', lambda: '')()
++            if str(self_id or '') == sender:
++                return None
++            parts, mentioned, quoted = [], [], []
++            unsafe = False
++            for part in components[:64]:
++                kind = type(part).__name__
++                if kind == 'Plain':
++                    plain = str(getattr(part, 'text', ''))
++                    if len(plain) > 2000:
++                        unsafe = True
++                    parts.append(plain[:2000])
++                elif kind == 'At':
++                    target = str(getattr(part, 'qq', '') or '')
++                    if _QQ.fullmatch(target):
++                        mentioned.append(target)
++                        parts.append('@' + target)
++                elif kind == 'Reply':
++                    target = str(getattr(part, 'sender_id', '') or '')
++                    if _QQ.fullmatch(target):
++                        quoted.append(target)
++                    unsafe = True
++                else:
++                    unsafe = True
++            if len(components) > 64:
++                unsafe = True
++            text = ''.join(parts).strip()
++            if len(text) > 2000:
++                text, unsafe = text[:2000], True
++            message_id = str(getattr(getattr(event, 'message_obj', None), 'message_id', '') or '')
++            key = hashlib.sha256(json.dumps([adapter,scope,sender,message_id],ensure_ascii=False).encode()).hexdigest() if message_id else None
++            # Preserve reception order when the API races the message collector.
++            order = time.time_ns()
++            extra = getattr(event, 'get_extra', None)
++            prior = extra('_sl_identity_reception_v1') if callable(extra) else None
++            if isinstance(prior, dict) and prior.get('key') == key and prior.get('scope') == scope and isinstance(prior.get('order'), int):
++                order = prior['order']
++            setter = getattr(event, 'set_extra', None)
++            if callable(setter):
++                setter('_sl_identity_reception_v1', {'key':key,'scope':scope,'order':order})
++            return {'adapter':adapter,'scope':scope,'group':group,'sender':sender,
++                    'display':clean_name(event.get_sender_name()),'text':text,
++                    'mentions':mentioned[:8],'quotes':quoted[:8],'unsafe':unsafe,
++                    'key':key,'order':order}
++        except Exception:
++            return None
++
++    def prepare_event(self, event):
++        """Capture arrival order before scheduling the existing background pipeline."""
++        if not self._closed and self._mode() != "off":
++            self._snapshot(event)
++
++    def _filter_allowed(self, snap):
++        if self.qq_filter is not None:
++            try:
++                return bool(self.qq_filter.should_collect_message(snap['sender'], snap['group']))
++            except Exception:
++                return False
++        return True
++
++    def _collect_allowed(self, snap):
++        return bool(getattr(self.config, "enable_message_capture", True)) and self._filter_allowed(snap)
++
++    async def observe_event(self, event):
++        snap = self._snapshot(event)
++        if self._closed or not self._ready or self._mode() == 'off' or not snap or not snap['key'] or not self._collect_allowed(snap):
++            return False
++        mode = self._mode()
++        try:
++            return await self._run(lambda con:self._observe(con,snap,mode))
++        except (OSError, sqlite3.Error, RuntimeError):
++            return False
++
++    def _observe(self, con, s, mode):
++        con.execute('BEGIN IMMEDIATE')
++        if con.execute('SELECT 1 FROM events WHERE key=?',(s['key'],)).fetchone():
++            return True
++        con.execute('INSERT INTO events VALUES (?,?,?,?)',(s['key'],s['adapter'],s['scope'],s['order']))
++        row = con.execute('SELECT * FROM members WHERE adapter=? AND scope=? AND user_id=?',(s['adapter'],s['scope'],s['sender'])).fetchone()
++        if row is None or s['order'] >= row['updated']:
++            names = json.loads(row['names']) if row else []
++            if s['display']:
++                candidates, names, seen = [s['display']] + names, [], set()
++                for name in candidates:
++                    normalized = name.casefold()
++                    if normalized not in seen:
++                        names.append(name)
++                        seen.add(normalized)
++                names = names[:8]
++            con.execute('INSERT OR REPLACE INTO members VALUES (?,?,?,?,?,?)',(s['adapter'],s['scope'],s['sender'],s['display'],json.dumps(names,ensure_ascii=False),s['order']))
++            con.execute('DELETE FROM observed_names WHERE adapter=? AND scope=? AND user_id=?',(s['adapter'],s['scope'],s['sender']))
++            con.executemany('INSERT INTO observed_names VALUES (?,?,?,?,?)',[(s['adapter'],s['scope'],s['sender'],name.casefold(),name) for name in names])
++        if not s['unsafe']:
++            match = _SELF.fullmatch(s['text'])
++            subject, actor, value, kind = s['sender'],s['sender'],'',''
++            if match:
++                value = alias_value(match[2])
++                kind = 'self_denied' if match[1] in ('别叫我','我的花名不是') else 'self_confirmed'
++            else:
++                match = _THIRD.fullmatch(s['text'])
++                if match and match[1] in s['mentions'] and match[1] != s['sender']:
++                    subject,value,kind = match[1],alias_value(match[2]),'candidate'
++            if value:
++                con.execute('INSERT OR IGNORE INTO claims VALUES (?,?,?,?,?,?,?,?)',(s['key'],s['adapter'],s['scope'],subject,actor,value,kind,s['order']))
++                if mode == 'active' and kind.startswith('self_'):
++                    old = con.execute('SELECT updated FROM aliases WHERE adapter=? AND scope=? AND user_id=? AND normalized=?',(s['adapter'],s['scope'],subject,value.casefold())).fetchone()
++                    if old is None or s['order'] > old['updated']:
++                        con.execute('INSERT OR REPLACE INTO aliases VALUES (?,?,?,?,?,?,?)',(s['adapter'],s['scope'],subject,value.casefold(),value,kind,s['order']))
++        # Bound replay ledger/candidates; never prune confirmed decisions or denials.
++        for table in ('claims',):
++            con.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE adapter=? AND scope=? ORDER BY updated DESC LIMIT -1 OFFSET 2048)',(s['adapter'],s['scope']))
++        return True
++
++    @staticmethod
++    def _empty(status, scope=''):
++        return {'version':1,'status':status,'scope':scope,'subjects':[], 'unresolved':[], 'relations':[]}
++
++    async def get_identity_context(self, event, *, subject_ids=(), aliases=(), include_relations=True):
++        snap = self._snapshot(event)
++        if self._mode() == 'off' or not snap:
++            return self._empty('off')
++        if self._closed or not self._ready:
++            return self._empty('unavailable',snap['scope'])
++        try:
++            if not self._filter_allowed(snap):
++                return self._empty('off')
++            if self._collect_allowed(snap):
++                if not await asyncio.wait_for(self.observe_event(event), timeout=0.35):
++                    return self._empty('unavailable',snap['scope'])
++            if self._mode() == 'shadow':
++                return self._empty('shadow',snap['scope'])
++            result = await asyncio.wait_for(self._run(lambda con:self._read(con,snap,subject_ids,aliases)),timeout=0.35)
++            if include_relations and self.database and snap["scope"] in getattr(self.config, "identity_relation_scopes", []):
++                try:
++                    await asyncio.wait_for(self._relations(result,snap),timeout=0.2)
++                except asyncio.TimeoutError:
++                    pass
++            return result
++        except (Exception, asyncio.CancelledError) as exc:
++            if isinstance(exc, asyncio.CancelledError):
++                raise
++            return self._empty('unavailable',snap['scope'])
++
++    def _read(self, con, s, requested_ids, requested_aliases):
++        result = self._empty('ready',s['scope'])
++        roles = {s['sender']:['sender']}
++        for label,ids in [('mention',s['mentions']),('quote',s['quotes'])]:
++            for uid in ids:
++                roles.setdefault(uid,[])
++                if label not in roles[uid]: roles[uid].append(label)
++        allowed = set(roles)
++        selected = [s['sender']]
++        hints = list(requested_ids[:8]) if isinstance(requested_ids, (list,tuple)) else []
++        for uid in hints + s['mentions'] + s['quotes']:
++            uid = str(uid)
++            if uid in allowed and uid not in selected and len(selected)<8: selected.append(uid)
++        rows = con.execute('SELECT user_id,alias,normalized FROM aliases WHERE adapter=? AND scope=? AND state=? AND instr(?,normalized)>0 ORDER BY updated DESC',(s['adapter'],s['scope'],'self_confirmed',unicodedata.normalize('NFKC',s['text']).casefold())).fetchall()
++        rows = list(rows) + list(con.execute('SELECT user_id,name AS alias,normalized FROM observed_names WHERE adapter=? AND scope=? AND instr(?,normalized)>0',(s['adapter'],s['scope'],unicodedata.normalize('NFKC',s['text']).casefold())).fetchall())
++        text = unicodedata.normalize('NFKC',s['text']).casefold()
++        matched = {}
++        for row in rows:
++            norm=row['normalized']
++            if norm not in text: continue
++            if norm.isascii() and re.search(r'(?<!\w)'+re.escape(norm)+r'(?!\w)',text) is None: continue
++            matched.setdefault(norm,{'alias':row['alias'],'ids':set()})['ids'].add(row['user_id'])
++        denied = con.execute('SELECT user_id,normalized,alias FROM aliases WHERE adapter=? AND scope=? AND state=?',(s['adapter'],s['scope'],'self_denied')).fetchall()
++        denied_by_user = {}
++        for row in denied:
++            denied_by_user.setdefault(row['user_id'],set()).add(row['normalized'])
++            if row['normalized'] in matched:
++                matched[row['normalized']]['ids'].discard(row['user_id'])
++            if row['normalized'] in text and (row['normalized'] not in matched or not matched[row['normalized']]['ids']):
++                result['unresolved'].append({'alias':row['alias'],'status':'denied'})
++        # Caller hints cannot introduce names absent from this request.
++        for found in list(matched.values())[:8]:
++            if not found['ids']:
++                continue
++            if len(found['ids']) != 1:
++                result['unresolved'].append({'alias':found['alias'],'status':'ambiguous'})
++                continue
++            uid=next(iter(found['ids']))
++            if uid not in selected and len(selected)>=8: continue
++            if uid not in selected: selected.append(uid)
++            roles.setdefault(uid,[])
++            if 'alias' not in roles[uid]: roles[uid].append('alias')
++        for uid in selected:
++            member=con.execute('SELECT * FROM members WHERE adapter=? AND scope=? AND user_id=?',(s['adapter'],s['scope'],uid)).fetchone()
++            facts=con.execute('SELECT alias FROM aliases WHERE adapter=? AND scope=? AND user_id=? AND state=? ORDER BY updated DESC LIMIT 8',(s['adapter'],s['scope'],uid,'self_confirmed')).fetchall()
++            denied_names = denied_by_user.get(uid,set())
++            names = [name for name in json.loads(member['names']) if name.casefold() not in denied_names] if member else []
++            display = member['display_name'] if member and member['display_name'].casefold() not in denied_names else ''
++            result['subjects'].append({'user_id':uid,'display_name':display, 'observed_names':names, 'confirmed_aliases':[r['alias'] for r in facts],'roles':roles.get(uid,[])})
++        result['unresolved'] = result['unresolved'][:8]
++        return result
++
++    async def _relations(self, result, s):
++        ids={item['user_id'] for item in result['subjects']}
++        getter=getattr(self.database,'get_user_social_relations',None)
++        if not callable(getter): return
++        seen=set()
++        for uid in list(ids)[:8]:
++            if len(result['relations'])>=8: break
++            try:
++                data=await asyncio.wait_for(getter(s['group'],uid),timeout=0.15)
++                for row in (data or {}).get('relations',[])[:64]:
++                    a=str(row.get('from_user_id',row.get('from_user','')))
++                    b=str(row.get('to_user_id',row.get('to_user','')))
++                    relation=clean_name(row.get('relation_type',''),48)
++                    key=(a,b,relation)
++                    if a in ids and b in ids and relation and key not in seen:
++                        seen.add(key)
++                        result['relations'].append({'from_user_id':a,'to_user_id':b,'relation_type':relation,'source':'legacy_social_relations','inferred':True})
++                    if len(result['relations'])>=8: break
++            except Exception:
++                continue
+diff --git a/webui/services/config_service.py b/webui/services/config_service.py
+index 5545b25..a41fa5f 100644
+--- a/webui/services/config_service.py
++++ b/webui/services/config_service.py
+@@ -316,6 +316,7 @@ _PROVIDER_SCHEMA_TIMEOUT_SECONDS = 5.0
+ _PROVIDER_OPTION_MODEL_PREVIEW_LIMIT = 3
+ 
+ _RESTART_REQUIRED_KEYS = {
++    "identity_mode", "identity_allowed_sessions", "identity_relation_scopes",
+     "data_dir",
+     "db_type",
+     "mysql_host",
+@@ -623,9 +624,12 @@ class ConfigService:
+         current_payload = self._plain_mapping(astrbot_config)
+         schema_fields = {
+             field_name
+-            for group_definition in schema_definition.values()
+-            if isinstance(group_definition, dict)
+-            for field_name in group_definition.get("items", {})
++            for key, definition in schema_definition.items()
++            if isinstance(definition, dict)
++            for field_name in (
++                {key: definition} if definition.get("type") not in (None, "object")
++                else definition.get("items", {})
++            )
+         }
+         if hasattr(validated_config, "model_dump"):
+             config_values = validated_config.model_dump()
+@@ -646,6 +650,11 @@ class ConfigService:
+         for group_key, group_definition in schema_definition.items():
+             if not isinstance(group_definition, dict):
+                 continue
++            if group_definition.get("type") not in (None, "object"):
++                if group_key in config_values:
++                    next_payload[group_key] = config_values[group_key]
++                    synced_groups.add(group_key)
++                continue
+             items = group_definition.get("items", {})
+             if not isinstance(items, dict):
+                 continue
+@@ -1701,7 +1710,9 @@ class ConfigService:
+         for group_key, group_definition in schema_definition.items():
+             if not isinstance(group_definition, dict):
+                 continue
+-            items = group_definition.get("items", {})
++            items = ({group_key: group_definition}
++                     if group_definition.get("type") not in (None, "object")
++                     else group_definition.get("items", {}))
+             if not isinstance(items, dict):
+                 continue
+ 
