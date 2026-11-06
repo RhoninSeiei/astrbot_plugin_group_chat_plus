@@ -17,3 +17,11 @@ Validation used `astrbot-rhonin:4.29.4-local-20261106-r2`: all Group Chat Plus t
 `self-learning-member-identity-v1.patch`基于自学习本地基线7ecae7a，目标5139e185，包含独立身份服务、配置页与生命周期适配。它是已有自用改动之上的增量，不可直接套在不同上游提交；需先核对基线。禁止覆盖原有学习数据库。
 
 `self-learning-pilot-repairs-20261106.patch`基于0252d3b，修复合法点号和@会话的LightRAG路径校验、纯媒体采集隔断及匿名采集统计，目标4c8411d。保留原目录名称与知识索引，不迁移身份数据。
+
+## 2026-11-07撤销状态与完整记忆修复
+
+`self-learning-scoped-denials-20261107.patch`基于4c8411d，目标749320b，按当前已选成员携带有效称呼撤销，兼容旧unresolved字段。同名按主体隔离；每成员最多八项，正文提及优先。未扩大原有自然语言解析语法。
+
+`livingmemory-complete-recall-and-alias-denial-20261107.patch`基于6c7625c，目标034f022，移除条目正文800字符截断；普通路径按完整条目执行软预算，精确opt-in交接全部候选及同一个无截断formatter，由GCP选择完整条目。否认别名只从对应成员的检索锚点中排除。无需依赖、配置或数据库迁移。
+
+GCP消费提交6f97dae。两份补丁均为本地增量，应用前核对基线，禁止启动时自动套用或覆盖人格与学习数据库。最终验证使用r3镜像；LM发布Git blob原始字节通过1238后端及43原生召回场景，SL通过1235项及119子测试。自然语法12项既有缺口与工具停滞行为仍需后续开发，不据此扩大试点。

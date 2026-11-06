@@ -1,0 +1,154 @@
+diff --git a/docs/maintenance/2026-11-06-identity-facts-v1.md b/docs/maintenance/2026-11-06-identity-facts-v1.md
+index 99088f0..780c26e 100644
+--- a/docs/maintenance/2026-11-06-identity-facts-v1.md
++++ b/docs/maintenance/2026-11-06-identity-facts-v1.md
+@@ -6,7 +6,7 @@ Self Learning 是唯一写入者。GCP 与 LivingMemory 每请求通过当前已
+ 
+ 身份键是适配器 ID、完整 UMO 与真实 QQ。本人完整明确表达“请叫我 X”“我的花名是 X”“我的昵称是 X”才可确认；“别叫我 X”“我的花名不是 X”保留撤销决定。转述、条件、引用、转发、多媒体和混合复杂内容不确认。第三人必须通过结构化 At 指定成员，只进入候选；重复次数和不同账号数量永远不提升候选。命令权限、现实身份、账号归属和人格不由花名授权。
+ 
+-平台昵称只作为 observed 显示名。已观察的当前与最近历史显示名和已确认花名合并消歧；重名或冒用其他已观察成员的显示名返回 unresolved status=ambiguous。本人撤销的称呼从该主体的显示名、历史名字及已确认花名输出中排除，当前文本涉及时返回 unresolved status=denied。只要名字有歧义就不猜测成员。
++平台昵称只作为 observed 显示名。已观察的当前与最近历史显示名和已确认花名合并消歧；重名或冒用其他已观察成员的显示名返回 unresolved status=ambiguous。本人撤销的称呼从该主体的显示名、历史名字及已确认花名输出中排除，当前已选主体的有效撤销通过 subjects[].denied_aliases 返回，泛化问法也携带该状态，不要求正文重复旧称呼。每主体最多八条，正文提及的撤销优先；重新确认后旧撤销不再输出。兼容旧接口时，unresolved 优先返回 status=denied，但同名仍属于另一已选有效成员时不作全局词禁用，消费方应按成员范围理解 denied_aliases。未选成员的撤销不会因查询其旧名而泄漏。只要名字有歧义就不猜测成员。
+ 
+ subjects 每项包含 user_id、display_name、observed_names、confirmed_aliases、roles。roles 只表示请求来源 sender、mention、quote、alias，不代表管理员权限。subject_ids 仅接受当前发送者、结构化 At 与引用作者；另可自动发现当前纯文本中的已确认花名或观测名字，调用方无法传入无关花名枚举全群。最多返回八个主体和八条关系。关系格式为 `{from_user_id, to_user_id, relation_type, source: "legacy_social_relations", inferred: true}`，仅包含当前已选主体之间的边，不输出描述正文。关系和观测名字都不是权威身份声明，LivingMemory 不得仅凭 observed 名字改写查询或长期记忆。
+ 
+diff --git a/services/identity/service.py b/services/identity/service.py
+index 4fb5f12..730ddf1 100644
+--- a/services/identity/service.py
++++ b/services/identity/service.py
+@@ -297,14 +297,12 @@ class IdentityService:
+             if norm not in text: continue
+             if norm.isascii() and re.search(r'(?<!\w)'+re.escape(norm)+r'(?!\w)',text) is None: continue
+             matched.setdefault(norm,{'alias':row['alias'],'ids':set()})['ids'].add(row['user_id'])
+-        denied = con.execute('SELECT user_id,normalized,alias FROM aliases WHERE adapter=? AND scope=? AND state=?',(s['adapter'],s['scope'],'self_denied')).fetchall()
++        denied = con.execute('SELECT user_id,normalized,alias FROM aliases WHERE adapter=? AND scope=? AND state=? ORDER BY updated DESC',(s['adapter'],s['scope'],'self_denied')).fetchall()
+         denied_by_user = {}
+         for row in denied:
+             denied_by_user.setdefault(row['user_id'],set()).add(row['normalized'])
+             if row['normalized'] in matched:
+                 matched[row['normalized']]['ids'].discard(row['user_id'])
+-            if row['normalized'] in text and (row['normalized'] not in matched or not matched[row['normalized']]['ids']):
+-                result['unresolved'].append({'alias':row['alias'],'status':'denied'})
+         # Caller hints cannot introduce names absent from this request.
+         for found in list(matched.values())[:8]:
+             if not found['ids']:
+@@ -323,8 +321,25 @@ class IdentityService:
+             denied_names = denied_by_user.get(uid,set())
+             names = [name for name in json.loads(member['names']) if name.casefold() not in denied_names] if member else []
+             display = member['display_name'] if member and member['display_name'].casefold() not in denied_names else ''
+-            result['subjects'].append({'user_id':uid,'display_name':display, 'observed_names':names, 'confirmed_aliases':[r['alias'] for r in facts],'roles':roles.get(uid,[])})
+-        result['unresolved'] = result['unresolved'][:8]
++            # Withdrawals belong to a selected member, not a word globally.
++            # A generic self-question still needs these current facts so stale
++            # memory and short-term state cannot silently reintroduce a name.
++            withdrawn = [row['alias'] for row in denied if row['user_id'] == uid]
++            withdrawn.sort(key=lambda alias: alias.casefold() not in text)
++            result['subjects'].append({'user_id':uid,'display_name':display, 'observed_names':names, 'confirmed_aliases':[r['alias'] for r in facts], 'denied_aliases':withdrawn[:8],'roles':roles.get(uid,[])})
++        # Preserve the v1 unresolved fallback for older consumers, but only for
++        # selected members and never ban a valid other member's same name.
++        emitted = set()
++        legacy_withdrawals = []
++        for owner in result['subjects']:
++            others = {value.casefold() for other in result['subjects'] if other['user_id'] != owner['user_id']
++                      for value in [other['display_name'], *other['observed_names'], *other['confirmed_aliases']] if value}
++            for alias in owner['denied_aliases']:
++                norm = alias.casefold()
++                if norm not in others and norm not in emitted:
++                    legacy_withdrawals.append({'alias':alias,'status':'denied'})
++                    emitted.add(norm)
++        result['unresolved'] = (legacy_withdrawals + result['unresolved'])[:8]
+         return result
+ 
+     async def _relations(self, result, s):
+diff --git a/tests/unit/test_identity_service.py b/tests/unit/test_identity_service.py
+index 1b07576..1531681 100644
+--- a/tests/unit/test_identity_service.py
++++ b/tests/unit/test_identity_service.py
+@@ -212,3 +212,88 @@ class IdentityTests(unittest.IsolatedAsyncioTestCase):
+         result=await self.service.get_identity_context(event)
+         self.assertEqual(result['status'],'ready')
+         self.assertEqual(result['subjects'][0]['confirmed_aliases'],[])
++    async def test_generic_self_question_exposes_effective_denial_for_legacy_interfaces(self):
++        await self.service.observe_event(Event('请叫我“星河”'))
++        await self.service.observe_event(Event('别叫我“星河”'))
++        result=await self.service.get_identity_context(Event('现在应该怎么称呼我？'))
++        self.assertEqual(result['unresolved'],[{'alias':'星河','status':'denied'}])
++        self.assertEqual(result['subjects'][0].get('denied_aliases'),['星河'])
++        # Existing memory/short-state consumers use unresolved rather than the
++        # new per-subject extension; both must receive the active withdrawal.
++        legacy_tokens={row['alias'] for row in result['unresolved'] if row['status']=='denied'}
++        stale_memory='本人以前确认称呼为星河'
++        stale_short_state='topic: 星河正在提问'
++        self.assertTrue(any(token in stale_memory for token in legacy_tokens))
++        self.assertTrue(any(token in stale_short_state for token in legacy_tokens))
++    async def test_generic_question_does_not_disclose_unselected_member_denial(self):
++        await self.service.observe_event(Event('别叫我“私有旧名”',sender='10002'))
++        result=await self.service.get_identity_context(Event('现在应该怎么称呼我？'))
++        self.assertEqual(result['unresolved'],[])
++        self.assertEqual([s['user_id'] for s in result['subjects']],['10001'])
++    async def test_reconfirmation_removes_prior_generic_denial(self):
++        await self.service.observe_event(Event('别叫我“星河”'))
++        await self.service.observe_event(Event('请叫我“星河”'))
++        result=await self.service.get_identity_context(Event('现在应该怎么称呼我？'))
++        self.assertEqual(result['unresolved'],[])
++        self.assertEqual(result['subjects'][0].get('denied_aliases'),[])
++        self.assertEqual(result['subjects'][0]['confirmed_aliases'],['星河'])
++    async def test_same_alias_denial_is_owned_not_a_global_ban(self):
++        await self.service.observe_event(Event('别叫我“星河”'))
++        await self.service.observe_event(Event('请叫我“星河”',sender='10002'))
++        result=await self.service.get_identity_context(Event(parts=[At('10002'),Plain('我们现在应该怎么称呼？')]))
++        self.assertEqual(result['unresolved'],[])
++        first=next(s for s in result['subjects'] if s['user_id']=='10001')
++        second=next(s for s in result['subjects'] if s['user_id']=='10002')
++        self.assertEqual(first.get('denied_aliases'),['星河'])
++        self.assertEqual(second['confirmed_aliases'],['星河'])
++        self.assertEqual(second.get('denied_aliases'),[])
++    async def test_effective_denial_is_scoped_even_when_both_scopes_enabled(self):
++        await self.service.observe_event(Event('别叫我“星河”'))
++        self.config.identity_allowed_sessions.extend(['default:GroupMessage:20002','qq2:GroupMessage:20001'])
++        for event in (Event('现在怎么称呼我',group='20002'),Event('现在怎么称呼我',adapter='qq2')):
++            result=await self.service.get_identity_context(event)
++            self.assertEqual(result['unresolved'],[])
++            self.assertEqual(result['subjects'][0].get('denied_aliases'),[])
++    async def test_disabled_and_shadow_sessions_never_expose_denial(self):
++        await self.service.observe_event(Event('别叫我“星河”'))
++        for mode in ('off','shadow'):
++            self.config.identity_mode=mode
++            result=await self.service.get_identity_context(Event('现在怎么称呼我'))
++            self.assertEqual(result['subjects'],[])
++            self.assertEqual(result['unresolved'],[])
++    async def test_late_old_denial_cannot_override_new_reconfirmation(self):
++        old=Event('别叫我“星河”')
++        self.service.prepare_event(old)
++        await self.service.observe_event(Event('请叫我“星河”'))
++        await self.service.observe_event(old)
++        result=await self.service.get_identity_context(Event('现在怎么称呼我'))
++        self.assertEqual(result['subjects'][0]['confirmed_aliases'],['星河'])
++        self.assertEqual(result['subjects'][0]['denied_aliases'],[])
++        self.assertEqual(result['unresolved'],[])
++    async def test_text_mention_does_not_enumerate_another_members_withdrawals(self):
++        await self.service.observe_event(Event('别叫我“私有旧名”',sender='10002'))
++        result=await self.service.get_identity_context(Event('私有旧名是谁'))
++        self.assertEqual([s['user_id'] for s in result['subjects']],['10001'])
++        self.assertEqual(result['unresolved'],[])
++    async def test_legacy_denial_fallback_precedes_ambiguous_names_at_output_limit(self):
++        await self.service.observe_event(Event('别叫我“星河”'))
++        for i in range(8):
++            for j in range(2):
++                await self.service.observe_event(Event(f'请叫我“重名成员{i}”',sender=str(20000+i*2+j)))
++        text='现在怎么称呼我？'+','.join(f'重名成员{i}' for i in range(8))
++        result=await self.service.get_identity_context(Event(text))
++        self.assertIn({'alias':'星河','status':'denied'},result['unresolved'])
++        self.assertLessEqual(len(result['unresolved']),8)
++    async def test_withdrawal_projection_is_bounded_without_deleting_older_decisions(self):
++        for i in range(9):
++            await self.service.observe_event(Event(f'别叫我“旧称呼{i}”'))
++        generic=await self.service.get_identity_context(Event('现在怎么称呼我？'))
++        self.assertEqual(len(generic['subjects'][0]['denied_aliases']),8)
++        self.assertNotIn('旧称呼0',generic['subjects'][0]['denied_aliases'])
++        explicit=await self.service.get_identity_context(Event('我现在还叫旧称呼0吗？'))
++        self.assertIn('旧称呼0',explicit['subjects'][0]['denied_aliases'])
++        self.assertEqual(len(explicit['subjects'][0]['denied_aliases']),8)
++        import sqlite3
++        from contextlib import closing
++        with closing(sqlite3.connect(self.service.path)) as con:
++            self.assertEqual(con.execute("SELECT count(*) FROM aliases WHERE state='self_denied'").fetchone()[0],9)

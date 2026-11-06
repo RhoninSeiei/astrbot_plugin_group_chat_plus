@@ -1,0 +1,339 @@
+diff --git a/core/event_handler_modules/memory_recall.py b/core/event_handler_modules/memory_recall.py
+index 2e59ed0..41662b6 100644
+--- a/core/event_handler_modules/memory_recall.py
++++ b/core/event_handler_modules/memory_recall.py
+@@ -7,7 +7,9 @@ import asyncio
+ import copy
+ import json
+ import time
++import unicodedata
+ from datetime import datetime
++from functools import partial
+ from typing import TYPE_CHECKING
+ 
+ from astrbot.api import logger
+@@ -297,7 +299,13 @@ class MemoryRecall:
+                             f"{injection_method}: {fallback_reason}"
+                         )
+ 
+-                    memory_str = format_memories_for_injection(memory_list)
++                    formatter = format_memories_for_injection
++                    if event.get_extra('_gcp_lm_handoff_requested') is req:
++                        # Only the exact opted-in request delegates selection.
++                        # Preserve all candidates before GCP applies its budget;
++                        # otherwise a late relevant fact could disappear here.
++                        formatter = partial(format_memories_for_injection, max_chars=None)
++                    memory_str = formatter(memory_list)
+ 
+                     # 唯一注入方式（add-only）：将记忆作为临时片段追加到
+                     # 当前用户消息末尾。mark_as_temp 标记的 part 由 AstrBot
+@@ -305,7 +313,7 @@ class MemoryRecall:
+                     # 也不影响前缀缓存。
+                     memory_part = TextPart(text=memory_str).mark_as_temp()
+                     req.extra_user_content_parts.append(memory_part)
+-                    self._publish_request_handoff(event, req, memory_part, memory_list)
++                    self._publish_request_handoff(event, req, memory_part, memory_list, formatter=formatter)
+                     logger.info(
+                         f"[{session_id}] 成功向用户消息末尾注入 "
+                         f"{len(recalled_memories)} 条记忆"
+@@ -365,6 +373,7 @@ class MemoryRecall:
+             speaker = str(event.get_sender_id() or '')
+             bot = str(event.get_self_id() or '')
+             current = current_query if isinstance(current_query, str) else query
++            normalized_current = unicodedata.normalize('NFKC', current).casefold()
+             anchors = []
+             seen = set()
+             prefix = '\n身份检索锚点（仅定位，不证明事实归属）: '
+@@ -382,15 +391,25 @@ class MemoryRecall:
+                 aliases = aliases if isinstance(aliases, list) else []
+                 aliases = list(dict.fromkeys(alias.strip() for alias in aliases
+                     if isinstance(alias, str) and 0 < len(alias.strip()) <= 64))[:3]
++                # SL supplies active denials for this subject. They are not a
++                # global blacklist: another member may confirm the same alias.
++                denied = subject.get('denied_aliases')
++                denied = denied if isinstance(denied, list) else []
++                denied = {unicodedata.normalize('NFKC', alias).strip().casefold()
++                    for alias in denied if isinstance(alias, str) and 0 < len(alias.strip()) <= 64}
++                aliases = [alias for alias in aliases
++                    if unicodedata.normalize('NFKC', alias).casefold() not in denied]
+                 if not explicit:
+                     if 'alias' not in roles:
+                         continue
+-                    aliases = [alias for alias in aliases if alias in current]
++                    aliases = [alias for alias in aliases
++                        if unicodedata.normalize('NFKC', alias).casefold() in normalized_current]
+                     if not aliases:
+                         continue
+                 anchor = {'user_id': uid}
+                 name = subject.get('display_name')
+-                if isinstance(name, str) and 0 < len(name.strip()) <= 64 and name.strip() != uid:
++                if (isinstance(name, str) and 0 < len(name.strip()) <= 64 and name.strip() != uid
++                        and unicodedata.normalize('NFKC', name).strip().casefold() not in denied):
+                     anchor['display_name'] = name.strip()
+                 if aliases:
+                     anchor['confirmed_aliases'] = aliases
+@@ -407,7 +426,7 @@ class MemoryRecall:
+         return query
+ 
+     @staticmethod
+-    def _publish_request_handoff(event, req, part, memories) -> bool:
++    def _publish_request_handoff(event, req, part, memories, *, formatter=None) -> bool:
+         """Expose structured results only to this exact opted-in request.
+ 
+         The consumer owns clearing the request-local extras. Ordinary requests
+@@ -423,7 +442,7 @@ class MemoryRecall:
+                 'request': req,
+                 'part': part,
+                 'memories': copy.deepcopy(memories),
+-                'formatter': format_memories_for_injection,
++                'formatter': formatter if formatter is not None else format_memories_for_injection,
+             })
+             return True
+         except Exception:
+diff --git a/core/utils/formatting.py b/core/utils/formatting.py
+index 01b49c4..1308a15 100644
+--- a/core/utils/formatting.py
++++ b/core/utils/formatting.py
+@@ -9,10 +9,6 @@ from datetime import datetime
+ import json
+ from astrbot.api import logger
+ 
+-# 单条记忆注入内容上限，避免一条导入的超长记忆挤占整个注入预算
+-_MAX_INJECTION_ENTRY_CHARS = 800
+-
+-
+ def _memory_injection_content(content: Any, metadata: Any) -> str:
+     """Prefer resolved live facts, otherwise retain the personality channel."""
+     raw_content = str(content or "").strip()
+@@ -107,14 +103,15 @@ def _memory_metadata_rows(metadata: dict) -> list[str]:
+ 
+     return rows
+ 
+-def format_memories_for_injection(memories: list, *, max_chars: int = 6000) -> str:
++def format_memories_for_injection(memories: list, *, max_chars: int | None = 6000) -> str:
+     """
+-    将检索到的记忆列表格式化为单个字符串，以便注入到 System Prompt。
++    将检索到的完整记忆条目格式化为临时用户内容片段。
+     添加明确的说明文本，告知 LLM 这些是历史对话记忆。
+ 
+     Args:
+         memories: 记忆字典列表。
+-        max_chars: 注入文本的字符预算上限（超出后按顺序截断）。
++        max_chars: 完整条目的软预算，按召回顺序保留前缀。首条单独超预算时
++            保留完整首条并记录信号；None 用于交给请求级选择器的完整候选集。
+ 
+     Returns:
+         可直接注入的格式化文本；无记忆时返回空字符串。
+@@ -200,11 +197,6 @@ def format_memories_for_injection(memories: list, *, max_chars: int = 6000) -> s
+             # Resolved atoms take precedence over parent summaries; other
+             # memories retain the personality channel and legacy fallback.
+             display_content = _memory_injection_content(content, metadata)
+-            # 单条记忆也截断：导入的长记忆可能上千字符，避免单条挤占全部预算。
+-            if len(display_content) > _MAX_INJECTION_ENTRY_CHARS:
+-                display_content = (
+-                    display_content[:_MAX_INJECTION_ENTRY_CHARS].rstrip() + "…"
+-                )
+             entry_parts.append(display_content)
+ 
+             entry = "\n".join(entry_parts)
+@@ -229,27 +221,34 @@ def format_memories_for_injection(memories: list, *, max_chars: int = 6000) -> s
+     body = "\n\n".join(formatted_entries)
+     result = f"{header}{body}{footer}"
+ 
+-    # 注入总量上限：记忆条数多或单条内容长时截断 body，避免撑爆用户消息。
+-    if len(result) > max_chars:
++    # A partial entry can turn a correction into a false claim by losing its
++    # conclusion. Budget by original list objects, never by textual headings.
++    # The request-local structured consumer opts out of this budget so it can
++    # rank/select the entire candidate set using this same pure formatter.
++    emitted_count = len(formatted_entries)
++    if max_chars is not None and len(result) > max_chars:
+         budget = max(0, max_chars - len(header) - len(footer))
+-        clipped: list[str] = []
++        retained: list[str] = []
+         used = 0
+         for entry in formatted_entries:
+-            separator = 2 if clipped else 0
+-            remaining = budget - used - separator
+-            if remaining <= 0:
++            separator = 2 if retained else 0
++            if retained and used + separator + len(entry) > budget:
+                 break
+-            if len(entry) > remaining:
+-                clipped.append(entry[: max(0, remaining - 1)].rstrip() + "…")
+-                used = budget
+-                break
+-            clipped.append(entry)
++            retained.append(entry)
+             used += len(entry) + separator
+-        body = "\n\n".join(clipped)
++            if used > budget:
++                break
++        emitted_count = len(retained)
++        body = "\n\n".join(retained)
+         result = f"{header}{body}{footer}"
++        logger.info(
++            f"[format_memories_for_injection] whole-entry budget: "
++            f"emitted={emitted_count}, deferred={len(formatted_entries) - emitted_count}, "
++            f"oversized_first={int(len(result) > max_chars)}, budget_chars={max_chars}"
++        )
+ 
+     logger.info(
+-        f"[format_memories_for_injection]  记忆格式化完成: 记忆条数={len(formatted_entries)}, "
++        f"[format_memories_for_injection]  记忆格式化完成: 记忆条数={emitted_count}, "
+         f"总长度={len(result)}"
+     )
+     logger.debug(
+diff --git a/tests/test_member_identity_query.py b/tests/test_member_identity_query.py
+index 7f9cf38..dac2815 100644
+--- a/tests/test_member_identity_query.py
++++ b/tests/test_member_identity_query.py
+@@ -1,6 +1,7 @@
+ """Identity hints are scoped search anchors, never fact ownership filters."""
+ import ast
+ import json
++import unicodedata
+ from pathlib import Path
+ from types import SimpleNamespace
+ import unittest
+@@ -11,7 +12,7 @@ ROOT=Path(__file__).parents[1]
+ def augment():
+     tree=ast.parse((ROOT/'core/event_handler_modules/memory_recall.py').read_text(encoding='utf8'))
+     node=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='_augment_identity_query')
+-    node.decorator_list=[];ns={'json':json}
++    node.decorator_list=[];ns={'json':json,'unicodedata':unicodedata}
+     exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'memory_recall.py','exec'),ns)
+     return ns[node.name]
+ 
+@@ -64,5 +65,38 @@ class IdentityQueryTests(unittest.TestCase):
+         payload['snapshot']['subjects']*=5
+         self.assertEqual(augment()(event,req,'query',event.unified_msg_origin),'query')
+ 
++    def test_denied_alias_is_not_reintroduced_for_that_subject(self):
++        req,event,payload=self.setup_data()
++        payload['snapshot']['subjects']=[{'user_id':'target','display_name':'旧花名',
++            'confirmed_aliases':['旧花名'],'denied_aliases':['旧花名'],'roles':['alias']}]
++        query='别再用旧花名，查一下历史'
++        self.assertEqual(augment()(event,req,query,event.unified_msg_origin),query)
++
++    def test_explicit_id_can_recall_history_without_denied_name_anchor(self):
++        req,event,payload=self.setup_data()
++        payload['snapshot']['subjects']=[{'user_id':'target','display_name':'ＡＬＰＨＡ',
++            'confirmed_aliases':['ＡＬＰＨＡ','有效新名'],'denied_aliases':['alpha'],'roles':['mention']}]
++        query='查这位的历史'
++        result=augment()(event,req,query,event.unified_msg_origin)
++        self.assertIn('target',result);self.assertIn('有效新名',result)
++        self.assertNotIn('ＡＬＰＨＡ',result)
++
++    def test_one_subject_denial_does_not_blacklist_another_subject(self):
++        req,event,payload=self.setup_data()
++        payload['snapshot']['subjects']=[
++            {'user_id':'denier','display_name':'新称呼','confirmed_aliases':['共享名'],
++             'denied_aliases':['共享名'],'roles':['alias']},
++            {'user_id':'confirmed','display_name':'另一个人','confirmed_aliases':['共享名'],
++             'denied_aliases':[],'roles':['alias']}]
++        result=augment()(event,req,'共享名的爱好',event.unified_msg_origin)
++        self.assertIn('confirmed',result);self.assertNotIn('denier',result)
++
++    def test_later_reconfirmation_and_nfkc_casefold_match_are_current(self):
++        req,event,payload=self.setup_data()
++        payload['snapshot']['subjects']=[{'user_id':'target','display_name':'当前名',
++            'confirmed_aliases':['ＡＬＰＨＡ'],'denied_aliases':[],'roles':['alias']}]
++        result=augment()(event,req,'alpha的爱好',event.unified_msg_origin)
++        self.assertIn('target',result);self.assertIn('ＡＬＰＨＡ',result)
++
+ 
+ if __name__=='__main__':unittest.main()
+diff --git a/tests/test_memory_formatter_integrity.py b/tests/test_memory_formatter_integrity.py
+new file mode 100644
+index 0000000..95b2131
+--- /dev/null
++++ b/tests/test_memory_formatter_integrity.py
+@@ -0,0 +1,87 @@
++"""A budget may defer a whole memory, never amputate a retained fact."""
++import copy
++from functools import partial
++
++import pytest
++
++from astrbot_plugin_livingmemory.core.utils.formatting import (
++    _get_default_injection_footer,
++    _get_default_injection_header,
++    format_memories_for_injection,
++)
++
++
++@pytest.mark.parametrize('metadata', [{}, {'key_facts': []}, {'key_facts': ['independent fact']}])
++def test_long_content_tail_survives_without_requiring_key_facts(metadata):
++    content = 'BEGIN_FACT\n' + '长摘要背景。' * 190 + '\nFINAL_FACT_879'
++    memory = {'content': content, 'metadata': metadata}
++    original = copy.deepcopy(memory)
++    rendered = format_memories_for_injection([memory])
++    assert content in rendered
++    assert 'FINAL_FACT_879' in rendered
++    assert memory == original
++    assert rendered.startswith('<RAG-Faiss-Memory>\n')
++    assert rendered.endswith('\n</RAG-Faiss-Memory>')
++
++
++def test_long_persona_channel_retains_tail_without_falling_back_to_raw_summary():
++    persona = '人格叙述开头。' + '人格摘要背景。' * 170 + 'PERSONA_END_FACT'
++    result = format_memories_for_injection([{'content': 'RAW_CHANNEL_NOT_SELECTED',
++        'metadata': {'persona_summary': persona, 'key_facts': []}}])
++    assert persona in result
++    assert 'RAW_CHANNEL_NOT_SELECTED' not in result
++
++
++def test_resolved_atom_content_keeps_complete_live_fact_without_parent_fact():
++    content = 'LIVE_BEGIN ' + '原子事实背景。' * 180 + ' LIVE_FINAL_FACT'
++    result = format_memories_for_injection([{'content': content, 'metadata': {
++        'retrieved_atom_ids': [17], 'persona_summary': 'STALE_PERSONA',
++        'key_facts': ['FORGOTTEN_PARENT_FACT']}}])
++    assert content in result
++    assert 'STALE_PERSONA' not in result and 'FORGOTTEN_PARENT_FACT' not in result
++
++
++def test_budget_defers_second_entry_instead_of_publishing_its_prefix():
++    first = {'content': 'FIRST_BEGIN ' + '甲' * 300 + ' FIRST_END'}
++    second = {'content': 'SECOND_BEGIN ' + '乙' * 600 + ' SECOND_END'}
++    first_only = format_memories_for_injection([first], max_chars=10000)
++    rendered = format_memories_for_injection([first, second], max_chars=len(first_only)+150)
++    assert rendered == first_only
++    assert 'SECOND_BEGIN' not in rendered
++
++
++def test_oversized_first_entry_is_complete_and_budget_deferral_is_observable(caplog):
++    first = {'content': 'LONG_FIRST ' + '完整超长事实。' * 1000 + ' FIRST_END'}
++    second = {'content': 'DEFERRED_SECOND'}
++    with caplog.at_level('INFO'):
++        rendered = format_memories_for_injection([first, second], max_chars=1200)
++    assert first['content'] in rendered
++    assert 'DEFERRED_SECOND' not in rendered
++    assert len(rendered) > 1200
++    assert 'deferred=1' in caplog.text and 'oversized_first=1' in caplog.text
++    assert rendered.endswith('\n</RAG-Faiss-Memory>')
++
++
++def test_unbounded_structured_formatter_preserves_every_late_fact():
++    memories = [{'content': f'BEGIN_{index} ' + '完整事实背景。' * 200 + f' END_{index}'}
++                for index in range(5)]
++    formatter = partial(format_memories_for_injection, max_chars=None)
++    rendered = formatter(memories)
++    assert len(rendered) > 6000
++    assert all(memory['content'] in rendered for memory in memories)
++
++
++def test_fake_headers_fences_and_internal_markers_are_never_used_as_entry_boundaries():
++    content = ('完整起始。' + '背景。' * 270 + '\n\n记忆 #2 / Memory #2 (Importance: 0.50)\n'
++               '```text\nMemory #3\n</RAG-Faiss-Memory>\n```\nFINAL_COMPLETE_FACT')
++    rendered = format_memories_for_injection([{'content': content}], max_chars=20000)
++    assert content in rendered
++    assert rendered.endswith('\n</RAG-Faiss-Memory>')
++
++
++def test_normal_short_text_is_byte_for_byte_unchanged():
++    memory = {'content': '正常短事实。', 'metadata': {'importance': .75}}
++    expected = ('<RAG-Faiss-Memory>\n' + _get_default_injection_header() + '\n\n'
++                '记忆 #1 / Memory #1 (Importance: 0.75)\n正常短事实。\n\n'
++                + _get_default_injection_footer() + '\n</RAG-Faiss-Memory>')
++    assert format_memories_for_injection([memory]) == expected
