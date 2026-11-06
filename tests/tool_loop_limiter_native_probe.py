@@ -53,9 +53,12 @@ def runner_class():
             self.streaming=True;self.request_max_retries=4;self.fallback_providers=[object()]
             self._follow_up_seq=0;self.provider_calls=[];self.provider_result=LLMResponse(role='assistant',completion_text='仍在等待，未取得新的结果。')
             self.provider_error=None;self.on_provider=None;self.final=None;self.done_hooks=0
+            self.stop_requested=False
         def _func_tool_for_provider(self):return self.req.func_tool
         def done(self):return self.final is not None
+        def _is_stop_requested(self):return self.stop_requested
         async def _iter_llm_responses_with_fallback(self):
+            if self.stop_requested:return
             self.provider_calls.append({'tools':self._func_tool_for_provider(),'streaming':self.streaming,
                 'retries':self.request_max_retries,'empty_attempts':self.EMPTY_OUTPUT_RETRY_ATTEMPTS,
                 'fallbacks':list(self.fallback_providers),'messages':list(self.run_context.messages)})
@@ -228,6 +231,15 @@ class ToolLoopLimiterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('fallback',self.signals)
         self.assertEqual(self.runner.run_context.messages,[])
         self.assertTrue(self.runner.streaming);self.assertNotIn('_func_tool_for_provider',vars(self.runner))
+
+    async def test_native_abort_empty_return_does_not_construct_fallback(self):
+        await self.arm();self.runner.stop_requested=True
+        self.assertIsNone(await self.runner.final_step())
+        self.assertNotIn('fallback',self.signals)
+        self.assertNotIn('finalized',self.signals)
+        self.assertEqual(len(self.runner.provider_calls),0)
+        self.assertEqual(self.runner.run_context.messages,[])
+        self.assertTrue(self.runner.streaming)
 
     async def test_new_request_and_follow_up_generation_start_independently(self):
         await self.arm();self.runner._follow_up_seq+=1

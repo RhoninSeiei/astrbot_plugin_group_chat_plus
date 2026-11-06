@@ -407,6 +407,11 @@ async def _final_responses(runner, handle, state, original):
         response = None
     finally:
         runner.run_context.messages[:] = [message for message in runner.run_context.messages if message is not note]
+    stop_requested = getattr(runner, '_is_stop_requested', None)
+    if callable(stop_requested) and stop_requested():
+        # Native abort can end the generator normally without an exception.
+        # Let _step take its own abort path; this is not an empty-model failure.
+        return
     if not handle._owns(state):
         _clear_retire_gate(state)
         yield _inactive_response()
