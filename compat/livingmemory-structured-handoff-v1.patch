@@ -1,0 +1,56 @@
+diff --git a/core/event_handler_modules/memory_recall.py b/core/event_handler_modules/memory_recall.py
+index febf17b..04575ad 100644
+--- a/core/event_handler_modules/memory_recall.py
++++ b/core/event_handler_modules/memory_recall.py
+@@ -4,6 +4,7 @@
+ """
+ 
+ import asyncio
++import copy
+ import time
+ from datetime import datetime
+ from typing import TYPE_CHECKING
+@@ -304,9 +305,9 @@ class MemoryRecall:
+                     # 当前用户消息末尾。mark_as_temp 标记的 part 由 AstrBot
+                     # 在保存对话历史时过滤，注入不会写入 AstrBot 的历史，
+                     # 也不影响前缀缓存。
+-                    req.extra_user_content_parts.append(
+-                        TextPart(text=memory_str).mark_as_temp()
+-                    )
++                    memory_part = TextPart(text=memory_str).mark_as_temp()
++                    req.extra_user_content_parts.append(memory_part)
++                    self._publish_request_handoff(event, req, memory_part, memory_list)
+                     logger.info(
+                         f"[{session_id}] 成功向用户消息末尾注入 "
+                         f"{len(recalled_memories)} 条记忆"
+@@ -319,6 +320,30 @@ class MemoryRecall:
+         except Exception as e:
+             logger.error(f"处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+ 
++    @staticmethod
++    def _publish_request_handoff(event, req, part, memories) -> bool:
++        """Expose structured results only to this exact opted-in request.
++
++        The consumer owns clearing the request-local extras. Ordinary requests
++        retain their original TextPart and do not copy or publish any memories.
++        """
++        try:
++            if req is None or event.get_extra('_gcp_lm_handoff_requested', None) is not req:
++                return False
++            if not getattr(part, '_no_save', False):
++                return False
++            event.set_extra('_gcp_lm_handoff', {
++                'version': 1,
++                'request': req,
++                'part': part,
++                'memories': copy.deepcopy(memories),
++                'formatter': format_memories_for_injection,
++            })
++            return True
++        except Exception:
++            # Optional compatibility must not change successful native recall.
++            return False
++
+     def _remove_agent_recall_policy_from_context(self, req: ProviderRequest) -> int:
+         """移除本插件上一轮注入的自主回忆规则临时片段（重复钩子去重）。
+ 
