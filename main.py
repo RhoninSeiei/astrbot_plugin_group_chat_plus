@@ -177,6 +177,7 @@ from .utils.tool_timeout_override import (
     resolve_group_image_tool_timeout,
 )
 from .utils.image_planner_context import install_image_planner_context
+from .utils.tool_loop_limiter import install_tool_loop_limiter
 from .utils.image_subject_context import append_subject_definitions, subject_tool_hint
 from .utils.image_tool_routing import (
     ALL_IMAGE_TOOLS, PUBLIC_IMAGE_TOOLS, LEGACY_IMAGE_TOOLS,
@@ -779,6 +780,7 @@ class ChatPlus(Star):
         }
         self._group_image_tool_timeout_override_handle = None
         self._image_planner_context_handle = None
+        self._tool_loop_limiter_handle = None
         self._image_operation_tasks = set()
         self._image_tools_terminated = False
         self.step_image_default_size = config.get(
@@ -2594,6 +2596,19 @@ class ChatPlus(Star):
         启动主动对话功能的后台任务
         """
         self._image_tools_terminated = False
+        flow = getattr(self, 'flow_control', None)
+        if (self.enable_group_chat and flow
+                and getattr(self, '_tool_loop_limiter_handle', None) is None):
+            try:
+                handle = install_tool_loop_limiter(
+                    authorize=flow.tool_loop_token,
+                    emit=flow.tool_loop_observation,
+                )
+                self._tool_loop_limiter_handle = handle
+                flow.loop_release = handle.release
+            except Exception as exc:
+                logger.warning('GCP_TOOL_LOOP_LIMITER_INSTALL_FAILED error_type=%s',
+                               type(exc).__name__)
         self.dashboard_http_session = aiohttp.ClientSession()
         # 生成运行时签名，用于追踪插件实例状态
         self._session_sig = self._compute_session_integrity("init")
@@ -2658,6 +2673,10 @@ class ChatPlus(Star):
         if planner_handle is not None:
             planner_handle.close()
             self._image_planner_context_handle = None
+        limiter = getattr(self, '_tool_loop_limiter_handle', None)
+        if limiter is not None:
+            limiter.close()
+            self._tool_loop_limiter_handle = None
         image_tasks = tuple(getattr(self, "_image_operation_tasks", ()))
         for task in image_tasks:
             task.cancel()

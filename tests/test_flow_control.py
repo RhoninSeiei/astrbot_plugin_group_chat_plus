@@ -59,6 +59,38 @@ def chain(text="natural progress"):
 
 
 class FlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loop_policy_requires_exact_owned_prepared_request_and_pilot(self):
+        request = SimpleNamespace(extra_user_content_parts=[])
+        self.event.get_message_str = lambda: 'synthetic request'
+        self.event.get_sender_id = lambda: 'synthetic sender'
+        self.assertIsNone(self.controller.tool_loop_token(self.event, request))
+        trace = self.begin()
+        self.assertIsNone(self.controller.tool_loop_token(self.event, request))
+        self.controller.prepare_request(self.event, request, 'persona')
+        self.assertIs(self.controller.tool_loop_token(self.event, request), trace)
+        self.assertIsNone(self.controller.tool_loop_token(self.event, SimpleNamespace()))
+        self.config['flow_tool_guard_enabled'] = False
+        self.assertIsNone(self.controller.tool_loop_token(self.event, request))
+        self.config['flow_tool_guard_enabled'] = True
+        self.config['flow_optimization_sessions'] = []
+        self.assertIsNone(self.controller.tool_loop_token(self.event, request))
+        self.config['flow_optimization_sessions'] = [Event.unified_msg_origin]
+        self.controller.finish(self.event, trace)
+        self.assertIsNone(self.controller.tool_loop_token(self.event, request))
+        self.assertIsNone(trace.loop_request)
+
+    async def test_loop_release_is_request_local_on_finish_and_close(self):
+        released = []
+        self.controller.loop_release = lambda e, r: released.append((e, r))
+        self.event.get_message_str = lambda: 'synthetic request'
+        self.event.get_sender_id = lambda: 'synthetic sender'
+        request = SimpleNamespace(extra_user_content_parts=[])
+        trace = self.begin()
+        self.controller.prepare_request(self.event, request, 'persona')
+        self.controller.close()
+        self.controller.finish(self.event, trace)
+        self.assertEqual(released, [(self.event, request)])
+        self.assertIsNone(trace.loop_request)
     def setUp(self):
         self.flow = load_flow()
         self.clock = Clock()

@@ -97,6 +97,7 @@ class FlowTrace:
         self.tools = []
         self.tool_seq = self.send_count = 0
         self.formal_started = self.agent_done_seen = self.finished = False
+        self.loop_request = None
         self.send_failed = self.stream_completed = self.failed = False
         self.progress_hashes = set()
         self.progress_candidate = None
@@ -174,6 +175,7 @@ class FlowTrace:
             except Exception:
                 pass
         self.restorers.clear()
+        self.loop_request = None
         if self.context.get(None) is self:
             self.context.set(None)
         self.release(self)
@@ -189,6 +191,7 @@ class FlowController:
         self.sequence = 0
         self.reset_orders = {}
         self.closed = False
+        self.loop_release = None
         # Child tasks inherit the request association; a reused event in an
         # older task does not inherit a newer request's observation context.
         self.context = contextvars.ContextVar("gcp_flow_request", default=None)
@@ -218,6 +221,20 @@ class FlowController:
         return trace if (getattr(trace, "protocol", None) == TRACE_PROTOCOL
                          and trace.owner is self.owner and not trace.finished
                          and trace.context.get(None) is trace) else None
+
+    def tool_loop_token(self, event, request):
+        """Authorize only this prepared request, never another plugin's runner."""
+        trace = self.trace(event)
+        return trace if (trace and trace.formal_started
+                         and trace.loop_request is request and request is not None
+                         and self.enabled(event, 'flow_tool_guard_enabled')) else None
+
+    def tool_loop_observation(self, event, signal):
+        trace = self.trace(event)
+        if trace:
+            reason = signal if signal in {'armed', 'blocked', 'finalizing', 'finalized',
+                                          'fallback', 'released'} else 'unrecognized'
+            trace.point('tool_loop_limit', reason)
 
     def start(self, event):
         if not (self.enabled(event) or self.metrics_enabled(event)):
@@ -359,6 +376,10 @@ class FlowController:
         if not trace or trace.request_prepared:
             return
         trace.request_prepared = True
+        trace.loop_request = req
+        release = self.loop_release
+        if callable(release):
+            trace.restorers.append(lambda: release(event, req))
         persona_id = str(persona_id or "").strip()
         valid_persona = bool(persona_id and persona_id != "[%None]")
         query = str(event.get_message_str() or "")
