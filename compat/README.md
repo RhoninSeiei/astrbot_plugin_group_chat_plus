@@ -9,3 +9,7 @@ Group Chat Plus requests a handoff only for its explicitly enabled behavior sess
 Without this compatible producer, Group Chat Plus preserves unstructured memory text and reports budget observations. Other requests retain normal LivingMemory behavior. The patch neither adds memory retrieval nor modifies persona or learning data. After a future LivingMemory upgrade, revalidate this identity-bound contract before reapplying the patch; do not infer entry boundaries from rendered memory text.
 
 Validation used `astrbot-rhonin:4.29.4-local-20261106-r2`: all Group Chat Plus tests passed (495 tests and 134 subtests), the three LivingMemory handoff contract tests passed, and a native request/TextPart/formatter probe verified structured selection and cleanup. These checks establish local pipeline compatibility; deployment and live acceptance remain separate steps.
+
+## 群成员身份适配
+
+`livingmemory-member-identity-v1.patch`基于上述结构化交接版本f43f6c6，增加请求绑定的身份查询锚点及近邻顺序修复。运行基线6c7625c。部署顺序为Self Learning身份服务、LivingMemory、GCP；不向上游自动推送。完整协议与配置见[实现记录](../docs/maintenance/2026-11-06-member-identity.md)。

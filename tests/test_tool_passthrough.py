@@ -143,6 +143,7 @@ class ToolPassthroughIntegrationTest(unittest.TestCase):
             "_can_expose_step_image_tools",
             "_filter_step_image_tools_for_request",
             "_capture_step_image_request_references",
+            "_on_llm_request_impl",
             "on_llm_request",
         ]
         available_method_names = {

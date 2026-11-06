@@ -1249,7 +1249,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             event.get_extra(reference_key),
             ["C:/tmp/core-resolved-quoted.png"],
         )
-        on_request_source = self._method_source("on_llm_request")
+        on_request_source = self._method_source("_on_llm_request_impl")
         self.assertLess(
             on_request_source.index("self._sanitize_llm_request_images"),
             on_request_source.index(

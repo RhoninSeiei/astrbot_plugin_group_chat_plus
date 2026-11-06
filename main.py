@@ -313,6 +313,8 @@ class ChatPlus(Star):
         super().__init__(context)
         self.context = context
         self.config = config
+        from .utils.member_identity import MemberIdentityBridge
+        self.member_identity_bridge = MemberIdentityBridge(context, config, emit=logger.info)
         self._migrate_legacy_config_types()
         runtime_image_tool_backend = _migrate_image_tool_backend_config(config)
 
@@ -2644,6 +2646,9 @@ class ChatPlus(Star):
 
         停止主动对话功能的后台任务并保存状态
         """
+        identity = getattr(self, "member_identity_bridge", None)
+        if identity:
+            await identity.aclose()
         flow = getattr(self, "flow_control", None)
         if flow:
             flow.close()
@@ -2847,6 +2852,8 @@ class ChatPlus(Star):
         _flow = getattr(self, "flow_control", None)
         _flow_trace = None
         _flow_outcome = None
+        _identity = getattr(self, "member_identity_bridge", None)
+        _identity_scope = _identity.begin(event) if _identity else None
         try:
             # 🔘 检查群聊功能总开关
             if not self.enable_group_chat or event.is_private_chat():
@@ -3007,6 +3014,8 @@ class ChatPlus(Star):
             _flow_outcome = "failed"
             logger.error(f"处理群消息时发生错误: {e}", exc_info=True)
         finally:
+            if _identity and _identity_scope:
+                _identity.end(event, _identity_scope)
             if _flow_trace:
                 _flow.finish(event, _flow_trace, _flow_outcome)
             # 🔧 安全网：确保 processing_sessions 条目不会泄漏
@@ -9681,9 +9690,20 @@ class ChatPlus(Star):
         flow = getattr(self, "flow_control", None)
         if flow and event.get_extra(PLUGIN_REQUEST_MARKER, False):
             flow.request_memory_handoff(event, req)
+        identity = getattr(self, "member_identity_bridge", None)
+        if identity and event.get_extra(PLUGIN_REQUEST_MARKER, False):
+            await identity.prepare(event, req)
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        try:
+            return await self._on_llm_request_impl(event, req)
+        finally:
+            identity = getattr(self, "member_identity_bridge", None)
+            if identity:
+                identity.release(event, req)
+
+    async def _on_llm_request_impl(self, event: AstrMessageEvent, req: ProviderRequest):
         """
         🆕 v1.2.0: LLM 请求钩子 - 处理插件与平台/其他插件的上下文冲突
 

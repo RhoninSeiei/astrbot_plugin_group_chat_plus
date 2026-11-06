@@ -1,0 +1,184 @@
+diff --git a/core/event_handler_modules/memory_recall.py b/core/event_handler_modules/memory_recall.py
+index 04575ad..2e59ed0 100644
+--- a/core/event_handler_modules/memory_recall.py
++++ b/core/event_handler_modules/memory_recall.py
+@@ -5,6 +5,7 @@
+ 
+ import asyncio
+ import copy
++import json
+ import time
+ from datetime import datetime
+ from typing import TYPE_CHECKING
+@@ -145,6 +146,7 @@ class MemoryRecall:
+ 
+                 # 存储用户消息（仅私聊），无论是否启用召回都需要
+                 is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
++                stored_current_id = None
+ 
+                 # 与 AstrBot LLM 历史对账：WebUI 编辑/重试会截断 LLM 历史，
+                 # 插件会话库需同步清理被撤销的尾部轮次（仅私聊；群聊被动
+@@ -161,11 +163,14 @@ class MemoryRecall:
+                         )
+                     if not message_to_store:
+                         message_to_store = actual_query.strip()
+-                    await self.conversation_manager.add_message_from_event(
++                    stored_message = await self.conversation_manager.add_message_from_event(
+                         event=event,
+                         role="user",
+                         content=message_to_store,
+                     )
++                    stored_current_id = getattr(stored_message, 'id', None)
++                    if type(stored_current_id) is not int or stored_current_id <= 0:
++                        stored_current_id = None
+                     await self.message_utils.enforce_message_limit(session_id)
+ 
+                 # Beta 自主回忆规则：独立于自动召回是否命中；即使 top_k=0
+@@ -214,29 +219,17 @@ class MemoryRecall:
+                             max_messages=5,
+                             format_for_llm=False,
+                         )
+-                        if recent_messages and len(recent_messages) > 1:
+-                            # recent_messages 按 timestamp DESC 排列（最新在前）
+-                            # 跳过索引0（当前消息），取后续消息作为扩展上下文
+-                            context_parts = []
++                        if recent_messages:
++                            # ConversationManager returns chronological order.
++                            # Only a known private-message row can be excluded.
+                             max_age_seconds = self.config_manager.get(
+                                 "recall_engine.recent_context_max_age_seconds", 7200
+                             )
+                             now = time.time()
+-                            skipped_by_age = 0
+-                            for msg in reversed(recent_messages[1:]):
+-                                if max_age_seconds > 0:
+-                                    timestamp = self._message_timestamp_seconds(
+-                                        msg.get("timestamp")
+-                                    )
+-                                    if (
+-                                        timestamp is None
+-                                        or now - timestamp > max_age_seconds
+-                                    ):
+-                                        skipped_by_age += 1
+-                                        continue
+-                                content = msg.get("content", "")
+-                                if content and content.strip():
+-                                    context_parts.append(content.strip())
++                            context_parts, skipped_by_age = self._recent_query_context(
++                                recent_messages, max_age_seconds, now,
++                                current_message_id=stored_current_id,
++                            )
+                             if context_parts:
+                                 expanded = " | ".join(context_parts)
+                                 query_for_search = expanded + " " + actual_query
+@@ -248,9 +241,14 @@ class MemoryRecall:
+                     except Exception as e:
+                         logger.warning(f"[{session_id}] 获取上下文扩展失败: {e}")
+ 
++                query_for_search = self._augment_identity_query(
++                    event, req, query_for_search, recall_session_id,
++                    current_query=actual_query,
++                )
++
+                 # 执行记忆召回
+                 logger.info(
+-                    f"[{session_id}] 开始记忆召回，查询='{query_for_search[:80]}...'"
++                    f"[{session_id}] 开始记忆召回，查询长度={len(query_for_search)}"
+                 )
+ 
+                 recalled_memories = await self.memory_engine.search_memories(
+@@ -320,6 +318,94 @@ class MemoryRecall:
+         except Exception as e:
+             logger.error(f"处理 on_llm_request 钩子时发生错误: {e}", exc_info=True)
+ 
++    def _recent_query_context(self, recent_messages, max_age_seconds, now,
++                              current_message_id=None):
++        """Preserve store order; never infer the current group row from its text."""
++        parts = []
++        skipped_by_age = 0
++        for message in recent_messages:
++            if not isinstance(message, dict):
++                continue
++            if current_message_id is not None and message.get('id') == current_message_id:
++                continue
++            if max_age_seconds > 0:
++                timestamp = self._message_timestamp_seconds(message.get('timestamp'))
++                if timestamp is None or now - timestamp > max_age_seconds:
++                    skipped_by_age += 1
++                    continue
++            content = message.get('content', '')
++            if isinstance(content, str) and content.strip():
++                parts.append(content.strip())
++        return parts, skipped_by_age
++
++    @staticmethod
++    def _augment_identity_query(event, req, query, recall_session_id, *, current_query=None):
++        """Use confirmed in-group identity anchors in the original single search.
++
++        A participant identifies a conversation window, not the subject or owner
++        of every fact inside it. This path never filters candidates by people.
++        """
++        try:
++            if req is None or not isinstance(query, str) or not query.strip():
++                return query
++            payload = event.get_extra('_gcp_member_identity_v1', None)
++            if not isinstance(payload, dict) or payload.get('request') is not req:
++                return query
++            snapshot = payload.get('snapshot')
++            if not isinstance(snapshot, dict):
++                return query
++            scope = getattr(event, 'unified_msg_origin', None)
++            if (type(snapshot.get('version')) is not int or snapshot['version'] != 1
++                    or snapshot.get('status') != 'ready' or not isinstance(scope, str)
++                    or not scope or snapshot.get('scope') != scope or recall_session_id != scope):
++                return query
++            subjects = snapshot.get('subjects')
++            if not isinstance(subjects, list) or len(subjects) > 8:
++                return query
++            speaker = str(event.get_sender_id() or '')
++            bot = str(event.get_self_id() or '')
++            current = current_query if isinstance(current_query, str) else query
++            anchors = []
++            seen = set()
++            prefix = '\n身份检索锚点（仅定位，不证明事实归属）: '
++            anchor_budget = min(512, 2000 - len(query))
++            for subject in subjects:
++                if not isinstance(subject, dict):
++                    continue
++                uid = subject.get('user_id')
++                roles = subject.get('roles')
++                if (not isinstance(uid, str) or not uid.strip() or len(uid) > 128
++                        or uid in {speaker, bot} or uid in seen or not isinstance(roles, list)):
++                    continue
++                explicit = any(role in {'mention', 'quote'} for role in roles if isinstance(role, str))
++                aliases = subject.get('confirmed_aliases')
++                aliases = aliases if isinstance(aliases, list) else []
++                aliases = list(dict.fromkeys(alias.strip() for alias in aliases
++                    if isinstance(alias, str) and 0 < len(alias.strip()) <= 64))[:3]
++                if not explicit:
++                    if 'alias' not in roles:
++                        continue
++                    aliases = [alias for alias in aliases if alias in current]
++                    if not aliases:
++                        continue
++                anchor = {'user_id': uid}
++                name = subject.get('display_name')
++                if isinstance(name, str) and 0 < len(name.strip()) <= 64 and name.strip() != uid:
++                    anchor['display_name'] = name.strip()
++                if aliases:
++                    anchor['confirmed_aliases'] = aliases
++                encoded = json.dumps(anchors + [anchor], ensure_ascii=False, separators=(',', ':'))
++                if len(prefix) + len(encoded) > anchor_budget:
++                    continue
++                anchors.append(anchor)
++                seen.add(uid)
++            if anchors:
++                return query + prefix + json.dumps(anchors, ensure_ascii=False, separators=(',', ':'))
++        except Exception:
++            # Identity availability must never turn successful recall into failure.
++            return query
++        return query
++
+     @staticmethod
+     def _publish_request_handoff(event, req, part, memories) -> bool:
+         """Expose structured results only to this exact opted-in request.
