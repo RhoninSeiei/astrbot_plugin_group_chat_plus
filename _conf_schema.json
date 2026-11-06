@@ -1946,13 +1946,19 @@
         "description": "回复流程优化会话白名单",
         "type": "list",
         "default": [],
-        "hint": "仅填写完整 unified_msg_origin，例如 default:GroupMessage:905956314。空列表保持原行为；以下阶段观测、自适应窗口和自然工具反馈只在此列表内生效。"
+        "hint": "仅填写完整 unified_msg_origin，例如 default:GroupMessage:905956314。空列表保持原行为；自适应窗口、自然反馈、短期连续性和记忆预算选择仅在此列表内生效。观测范围由独立会话白名单控制。"
+    },
+    "flow_metrics_sessions": {
+        "description": "回复阶段观测会话白名单",
+        "type": "list",
+        "default": [],
+        "hint": "填写完整 unified_msg_origin。仅开启耗时、出口类别与预算观测，不启用行为优化；可覆盖多个GCP负责群。显式空列表不记录，旧配置未提供此键时兼容原行为白名单的观测范围。"
     },
     "flow_metrics_enabled": {
         "description": "记录回复阶段耗时",
         "type": "bool",
         "default": true,
-        "hint": "仅对流程优化白名单生效。日志仅含随机请求标识、阶段、耗时和结果类别，不记录正文、参数或用户ID。SDK发送成功提交不代表对方已收到；流式仅能观测完整提交完成。"
+        "hint": "仅对阶段观测白名单生效。日志仅含随机请求标识、阶段、耗时、数值预算与固定出口类别，不记录正文、参数或用户ID。cohort区分行为试点与仅观测；SDK成功提交不代表对方已收到。"
     },
     "flow_adaptive_wait_enabled": {
         "description": "自适应群聊等待窗口",
@@ -1971,6 +1977,48 @@
         "type": "bool",
         "default": true,
         "hint": "仅对流程优化白名单生效。提示原生模型在实际耗时工具前按当前人格自然说明动作，保留其原有中间回复；不添加固定模板、额外模型或额外发送，快工具无需寒暄。"
+    },
+    "flow_continuity_enabled": {
+        "description": "短期对话连续性",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对行为白名单生效。按完整会话、发送者和当前人格隔离，限时保存当前原文片段与已观测工具状态，并作为临时用户级历史数据提供。缺少人格或发送者时跳过，不写人格和长期记忆。"
+    },
+    "flow_continuity_ttl_seconds": {
+        "description": "短期状态有效期",
+        "type": "int",
+        "default": 180,
+        "hint": "范围30-600秒；到期按需清除，不启动后台任务。长图片请求可设600，重载时不保留。"
+    },
+    "flow_continuity_max_entries": {
+        "description": "短期状态容量",
+        "type": "int",
+        "default": 128,
+        "hint": "范围16-512，满后按最近使用时间淘汰。每次当前消息仅保存最多256字符片段。"
+    },
+    "flow_memory_budget_enabled": {
+        "description": "按需选择原生记忆片段",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对行为白名单且当前人格明确的请求生效，不额外召回记忆或调用模型。需配套LivingMemory按请求提供结构化结果，验证请求与片段对象绑定、完整格式重建一致后选择完整条目；纯文本或不匹配内容原样保留。其他插件片段、人格和工具协议不改动。"
+    },
+    "flow_memory_budget_chars": {
+        "description": "原生记忆软预算字符数",
+        "type": "int",
+        "default": 2400,
+        "hint": "范围800-12000，包含记忆保护头尾。只保留完整条目；预算不足以容纳完整条目时原样保留，不裁断事实。仅观测会话只记录实际字符量。"
+    },
+    "flow_tool_guard_enabled": {
+        "description": "工具重复与等待状态观测",
+        "type": "bool",
+        "default": true,
+        "hint": "记录同请求中同参数重复、失败后再调用、状态未知及等待超时信号；不执行、并行、切换接口或自动重试工具。当前轮模型提醒沿用核心实现，用户修正后的新请求独立计算。"
+    },
+    "flow_tool_stale_seconds": {
+        "description": "工具久未结果观测阈值",
+        "type": "int",
+        "default": 45,
+        "hint": "范围5-300秒。在后续钩子、同范围追问或请求结束时按需检查，不启动定时发送；未观察到结果不等于工具失败。"
     },
     "enable_group_wait_window": {
         "description": "🆕 启用群聊等待窗口",

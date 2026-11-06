@@ -1,6 +1,10 @@
 """Explicit integration probe in the isolated deployed AstrBot image only."""
 import asyncio
+import ast
+import copy
 import importlib.util
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,11 +13,16 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.pipeline.respond import stage as respond_module
 from astrbot.core.message.message_event_result import MessageEventResult, MessageChain
 from astrbot.core.message.components import Plain
+from astrbot.core.agent.message import TextPart
 
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("flow_native_probe", ROOT / "utils/flow_control.py")
+package = types.ModuleType("gcp_flow_native_helpers")
+package.__path__ = [str(ROOT / "utils")]
+sys.modules[package.__name__] = package
+spec = importlib.util.spec_from_file_location("gcp_flow_native_helpers.flow_control", ROOT / "utils/flow_control.py")
 flow_module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = flow_module
 spec.loader.exec_module(flow_module)
 
 
@@ -43,6 +52,9 @@ class Event:
     def get_sender_id(self):
         return "synthetic"
 
+    def get_message_str(self):
+        return "current telescope question"
+
     def _outline_chain(self, chain):
         return "synthetic chain"
 
@@ -65,6 +77,50 @@ class Event:
             await self.send(chain)
 
 
+def publish_native_memory_fixture(root, controller, event, req):
+    """Use actual LM publisher body and formatter; no recall/network/providers."""
+    root = Path(root)
+    for name, directory in [
+        ("lm_contract", root), ("lm_contract.core", root / "core"),
+        ("lm_contract.core.base", root / "core/base"),
+        ("lm_contract.core.utils", root / "core/utils"),
+    ]:
+        package = types.ModuleType(name)
+        package.__path__ = [str(directory)]
+        sys.modules[name] = package
+    specification = importlib.util.spec_from_file_location("lm_contract.core.utils.formatting", root / "core/utils/formatting.py")
+    formatting = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = formatting
+    specification.loader.exec_module(formatting)
+    tree = ast.parse((root / "core/event_handler_modules/memory_recall.py").read_text())
+    publisher = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_publish_request_handoff")
+    publisher.decorator_list = []
+    namespace = {"copy": copy, "format_memories_for_injection": formatting.format_memories_for_injection}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[publisher], type_ignores=[])), "memory_recall.py", "exec"), namespace)
+    memories = [{"content": word * 120, "importance": .5, "metadata": {"topics": [word.strip()]}}
+                for word in ["camera ", "telescope ", "cooking "]]
+    original_text = formatting.format_memories_for_injection(memories)
+    original = TextPart(text=original_text)
+    original.mark_as_temp()
+    other = TextPart(text="another plugin's user context")
+    req.extra_user_content_parts = [other, original]
+    req.system_prompt = "synthetic unchanged persona"
+    req.contexts = [{"role": "tool", "content": "synthetic unchanged tool protocol"}]
+    controller.request_memory_handoff(event, req)
+    assert namespace[publisher.name](event, req, original, memories)
+    controller.prepare_request(event, req, "synthetic-persona")
+    assert req.extra_user_content_parts[0] is other
+    assert req.extra_user_content_parts[1] is not original
+    assert req.extra_user_content_parts[1]._no_save and original.text == original_text
+    assert len(req.extra_user_content_parts[1].text) < len(original_text)
+    assert "telescope" in req.extra_user_content_parts[1].text
+    assert req.system_prompt == "synthetic unchanged persona"
+    assert req.contexts == [{"role": "tool", "content": "synthetic unchanged tool protocol"}]
+    assert event.get_extra(flow_module.HANDOFF_REQUESTED) is None
+    assert event.get_extra(flow_module.HANDOFF_RESULT) is None
+    print("NATIVE_MEMORY_HANDOFF_OK: actual LM publisher/formatter, native temporary part, structured selection, identity and cleanup")
+
+
 async def main():
     event = Event()
     rows = []
@@ -85,6 +141,8 @@ async def main():
         if not isinstance(request, ProviderRequest):
             continue
         assert controller.trace(event) is not None, "usage scope reset another ContextVar"
+        if len(sys.argv) > 1:
+            publish_native_memory_fixture(sys.argv[1], controller, event, request)
         tool = object()
         # A core streaming feeder may consume the agent in a child task.
         async def consume():

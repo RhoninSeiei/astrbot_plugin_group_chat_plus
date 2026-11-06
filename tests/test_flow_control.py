@@ -2,6 +2,8 @@ import asyncio
 import ast
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,8 +12,12 @@ import unittest
 
 def load_flow():
     path = Path(__file__).parents[1] / "utils/flow_control.py"
-    spec = importlib.util.spec_from_file_location("gcp_flow_control_test", path)
+    package = types.ModuleType("gcp_flow_helpers_test")
+    package.__path__ = [str(path.parent)]
+    sys.modules[package.__name__] = package
+    spec = importlib.util.spec_from_file_location("gcp_flow_helpers_test.flow_control", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -72,6 +78,77 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.controller.start(other))
         self.assertNotIn("send", vars(other))
         self.assertIsNone(self.flow.FlowController({}).start(self.event))
+
+    async def test_metrics_scope_can_observe_without_enabling_behavior(self):
+        other = Event()
+        other.unified_msg_origin = "default:GroupMessage:619114682"
+        self.config["flow_metrics_sessions"] = [other.unified_msg_origin]
+        trace = self.controller.start(other)
+        self.assertIsNotNone(trace)
+        self.assertFalse(self.controller.enabled(other))
+        self.assertIsNone(self.controller.new_window(other, 3000))
+        self.controller.formal_request(other)
+        self.assertFalse(self.controller.keep_progress(other, SimpleNamespace(is_llm_result=lambda: True)))
+        self.controller.finish(other, trace)
+        self.assertTrue(self.logs)
+
+    async def test_explicit_empty_metrics_scope_keeps_behavior_without_logging(self):
+        self.config["flow_metrics_sessions"] = []
+        trace = self.begin()
+        self.assertIsNotNone(trace)
+        self.assertIsNotNone(self.controller.new_window(self.event, 3000))
+        self.controller.finish(self.event, trace)
+        self.assertEqual(self.logs, [])
+
+    async def test_exit_reasons_are_explicit_and_unknown_text_cannot_enter_logs(self):
+        for reason in ["probability", "cooldown", "blacklist", "merged", "no_reply", "cancelled", "failed"]:
+            trace = self.begin()
+            self.controller.exit(self.event, reason)
+            self.controller.finish(self.event, trace)
+            self.assertEqual(self.logs[-1]["outcome"], reason)
+        trace = self.begin()
+        self.controller.exit(self.event, "private user text 905956314")
+        self.controller.finish(self.event, trace)
+        self.assertEqual(self.logs[-1]["outcome"], "filtered")
+        self.assertNotIn("private user text", json.dumps(self.logs))
+
+    async def test_handoff_opt_in_and_exception_cleanup_are_request_local(self):
+        trace = self.begin()
+        req = SimpleNamespace(extra_user_content_parts=[])
+        self.controller.request_memory_handoff(self.event, req)
+        self.event.set_extra(self.flow.HANDOFF_RESULT, {"request": req, "memories": ["private"]})
+        with self.assertRaises(AttributeError):  # This fixture deliberately has no message getter.
+            self.controller.prepare_request(self.event, req, "persona")
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_REQUESTED))
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_RESULT))
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_OWNER))
+        self.controller.finish(self.event, trace)
+
+    async def test_old_generation_cannot_clear_new_handoff_even_for_reused_request(self):
+        old = self.begin()
+        req = SimpleNamespace(extra_user_content_parts=[])
+        self.controller.request_memory_handoff(self.event, req)
+        newer = load_flow().FlowController(self.config, self.logs.append, self.clock)
+        current = newer.start(self.event)
+        newer.formal_request(self.event)
+        newer.request_memory_handoff(self.event, req)
+        self.controller.finish(self.event, old)
+        self.assertIs(self.event.get_extra(self.flow.HANDOFF_REQUESTED), req)
+        self.assertIs(self.event.get_extra(self.flow.HANDOFF_OWNER), current)
+        newer.close()
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_REQUESTED))
+
+    async def test_replacing_request_clears_unconsumed_same_trace_handoff(self):
+        trace = self.begin()
+        first, second = object(), object()
+        self.controller.request_memory_handoff(self.event, first)
+        self.event.set_extra(self.flow.HANDOFF_RESULT, {"request": first, "memories": ["private"], "formatter": lambda data: data})
+        self.controller.request_memory_handoff(self.event, second)
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_RESULT))
+        self.assertIs(self.event.get_extra(self.flow.HANDOFF_REQUESTED), second)
+        self.controller.finish(self.event, trace)
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_RESULT))
+        self.assertIsNone(self.event.get_extra(self.flow.HANDOFF_OWNER))
 
     async def test_window_closes_on_silence_and_bursts_never_extend_hard_limit(self):
         window = self.controller.new_window(self.event, 3000)
@@ -280,6 +357,201 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.event.send, send)
         self.assertTrue(old.finished)
         newer.finish(self.event, current)
+
+
+class ContinuityIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module = load_flow()
+        self.clock = Clock()
+        self.rows = []
+        self.config = {"flow_optimization_sessions": [Event.unified_msg_origin]}
+        class TempPart:
+            def __init__(self, text):
+                self.text = text
+            def mark_as_temp(self):
+                self._no_save = True
+        self.Part = TempPart
+        self.flow = self.module.FlowController(self.config, self.rows.append, self.clock, self.Part)
+
+    def event(self, text, sender="user", origin=Event.unified_msg_origin):
+        event = Event()
+        event.unified_msg_origin = origin
+        event.get_message_str = lambda: text
+        event.get_sender_id = lambda: sender
+        return event
+
+    def prepare(self, text, persona="persona", parts=None, event=None):
+        event = event or self.event(text)
+        trace = self.flow.start(event)
+        self.flow.formal_request(event)
+        req = SimpleNamespace(extra_user_content_parts=list(parts or []), system_prompt="persona body", contexts=[{"role": "tool", "content": "tool protocol"}])
+        self.flow.request_memory_handoff(event, req)
+        if parts and event.get_extra(self.module.HANDOFF_REQUESTED) is req:
+            memory = parts[0]
+            if hasattr(memory, "structured_memories"):
+                event.set_extra(self.module.HANDOFF_RESULT, {
+                    "version": 1, "request": req, "part": memory,
+                    "memories": memory.structured_memories,
+                    "formatter": memory.structured_formatter,
+                })
+        self.flow.prepare_request(event, req, persona)
+        return event, trace, req
+
+    def memory(self):
+        budget = sys.modules["gcp_flow_helpers_test.native_memory_budget"]
+        memories = [{"content": word * 100} for word in ["camera ", "telescope ", "flower "]]
+        def formatter(rows):
+            return budget._PREFIX + "\n\n".join(
+                f"记忆 #{n} / Memory #{n} (Importance: 5)\n" + row["content"]
+                for n, row in enumerate(rows, 1)
+            ) + budget._SUFFIX
+        part = self.Part(formatter(memories))
+        part.structured_memories = memories
+        part.structured_formatter = formatter
+        part.mark_as_temp()
+        return part
+
+    async def test_memory_selection_is_owned_temporary_and_missing_persona_fails_closed(self):
+        original = self.memory()
+        _, trace, req = self.prepare("telescope", parts=[original])
+        self.assertLess(len(req.extra_user_content_parts[0].text), len(original.text))
+        self.assertIn("telescope", req.extra_user_content_parts[0].text)
+        self.assertTrue(req.extra_user_content_parts[0]._no_save)
+        self.assertEqual(req.system_prompt, "persona body")
+        self.assertEqual(req.contexts, [{"role": "tool", "content": "tool protocol"}])
+        missing_event, missing, missing_req = self.prepare("telescope", persona="", parts=[original])
+        self.assertIs(missing_req.extra_user_content_parts[0], original)
+        self.assertIsNone(missing.turn_key)
+        self.assertTrue(any(row["stage"] == "continuity_context" and row["outcome"] == "persona_missing" for row in self.rows))
+        self.flow.finish(missing_event, missing)
+
+    async def test_metrics_only_does_not_select_memory_or_attach_state(self):
+        origin = "default:GroupMessage:619114682"
+        self.config["flow_metrics_sessions"] = [origin]
+        memory = self.memory()
+        event, trace, req = self.prepare("telescope", parts=[memory], event=self.event("telescope", origin=origin))
+        self.assertIs(req.extra_user_content_parts[0], memory)
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        self.assertEqual(self.flow.turn_cache.get(origin, "user", "persona"), {})
+        self.assertEqual(self.rows[-1]["outcome"], "observe_only")
+        self.flow.finish(event, trace)
+
+    async def test_previous_context_is_untrusted_user_part_and_current_correction_wins(self):
+        old_event, old, _ = self.prepare("Old camera question?")
+        self.flow.finish(old_event, old)
+        event, trace, req = self.prepare("Correction: telescope question?")
+        self.assertIn("Old camera question", req.extra_user_content_parts[-1].text)
+        self.assertNotIn("last_request_id", req.extra_user_content_parts[-1].text)
+        self.assertTrue(req.extra_user_content_parts[-1]._no_save)
+        state = self.flow.turn_cache.get(event.unified_msg_origin, "user", "persona")
+        self.assertEqual(state["topic"], "Correction: telescope question?")
+        self.assertEqual(req.system_prompt, "persona body")
+        self.flow.finish(event, trace)
+
+    async def test_old_concurrent_tool_end_and_finish_cannot_overwrite_new_request(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def old_worker():
+            event, trace, _ = self.prepare("Old unfinished question?")
+            tool = SimpleNamespace(name="query")
+            self.flow.tool_start(event, tool, {"query": "old"})
+            entered.set()
+            await release.wait()
+            self.flow.tool_end(event, tool, SimpleNamespace(isError=False))
+            self.flow.agent_done(event)
+            await event.send(chain("old answer"))
+            self.flow.finish(event, trace)
+        task = asyncio.create_task(old_worker())
+        await entered.wait()
+        event, trace, _ = self.prepare("New corrected question?")
+        self.flow.tool_start(event, SimpleNamespace(name="query"), {"query": "new"})
+        release.set()
+        await task
+        state = self.flow.turn_cache.get(event.unified_msg_origin, "user", "persona")
+        self.assertEqual(state["pending_request"], "New corrected question?")
+        self.assertNotIn("tool_state", state)
+        self.assertNotIn("answered", state)
+        self.assertEqual(state["task_request"], "New corrected question?")
+        self.assertIn("尚未观测到结果", state["task_state"])
+        self.flow.finish(event, trace)
+
+    async def test_expired_or_evicted_state_is_not_revived_by_late_completion(self):
+        for expire in [True, False]:
+            event, trace, _ = self.prepare("old pending question?")
+            tool = SimpleNamespace(name="query")
+            self.flow.tool_start(event, tool, {})
+            if expire:
+                self.clock.tick += 181
+            else:
+                for n in range(128):
+                    self.flow.turn_cache.update("umo", str(n), "persona", {"topic": "other"})
+            self.flow.tool_end(event, tool, SimpleNamespace(isError=False))
+            self.flow.agent_done(event)
+            await event.send(chain("late result"))
+            self.flow.finish(event, trace)
+            self.assertEqual(self.flow.turn_cache.get(event.unified_msg_origin, "user", "persona"), {})
+
+    async def test_delayed_persona_resolution_cannot_replace_newer_request_state(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def delayed_old_request():
+            event = self.event("old request?")
+            trace = self.flow.start(event)
+            self.flow.formal_request(event)
+            entered.set()
+            await release.wait()
+            self.flow.prepare_request(event, SimpleNamespace(extra_user_content_parts=[]), "persona")
+            self.flow.finish(event, trace)
+        task = asyncio.create_task(delayed_old_request())
+        await entered.wait()
+        event, trace, _ = self.prepare("new corrected request?")
+        release.set()
+        await task
+        self.assertEqual(self.flow.turn_cache.get(event.unified_msg_origin, "user", "persona")["topic"], "new corrected request?")
+        self.flow.finish(event, trace)
+
+    async def test_progress_query_keeps_old_pending_task_and_late_result_only_updates_task(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def old_drawing_request():
+            event, trace, _ = self.prepare("draw the original image")
+            tool = SimpleNamespace(name="gcp_gpt_image")
+            self.flow.tool_start(event, tool, {"prompt": "original"})
+            entered.set()
+            await release.wait()
+            self.flow.tool_end(event, tool, SimpleNamespace(isError=False))
+            self.flow.agent_done(event)
+            await event.send(chain("old task result"))
+            self.flow.finish(event, trace)
+        task = asyncio.create_task(old_drawing_request())
+        await entered.wait()
+        self.clock.tick = 46
+        event, trace, req = self.prepare("进度如何？")
+        self.assertIn("尚未观测到结果", req.extra_user_content_parts[-1].text)
+        self.flow.agent_done(event)
+        await event.send(chain("still waiting"))
+        self.flow.finish(event, trace)
+        key = (event.unified_msg_origin, "user", "persona")
+        state = self.flow.turn_cache.get(*key)
+        self.assertEqual(state["task_request"], "draw the original image")
+        self.assertIn("尚未观测到结果", state["task_state"])
+        release.set()
+        await task
+        state = self.flow.turn_cache.get(*key)
+        self.assertEqual(state["topic"], "进度如何？")
+        self.assertIn("已返回", state["task_state"])
+        self.assertNotIn("成功", state["task_state"])
+
+    async def test_reset_scope_does_not_clear_other_scope_and_rejects_old_prepare(self):
+        event, trace, _ = self.prepare("old topic")
+        self.flow.turn_cache.update("other", "user", "persona", {"topic": "preserved"})
+        self.flow.reset_scope(event.unified_msg_origin)
+        self.assertEqual(self.flow.turn_cache.get("other", "user", "persona"), {"topic": "preserved"})
+        self.assertEqual(self.flow.turn_cache.get(event.unified_msg_origin, "user", "persona"), {})
+        late_event = self.event("late old input")
+        old = self.flow.start(late_event)
+        self.flow.formal_request(late_event)
+        self.flow.reset_scope(late_event.unified_msg_origin)
+        self.flow.prepare_request(late_event, SimpleNamespace(extra_user_content_parts=[]), "persona")
+        self.assertEqual(self.flow.turn_cache.get(late_event.unified_msg_origin, "user", "persona"), {})
+        self.flow.finish(late_event, old)
 
 
 class WaitLoopTests(unittest.IsolatedAsyncioTestCase):

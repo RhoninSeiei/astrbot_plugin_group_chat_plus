@@ -3,10 +3,25 @@ import hashlib
 import contextvars
 import time
 import uuid
+from types import SimpleNamespace
+
+from .turn_continuity import TurnStateCache, build_turn_context
+from .native_memory_budget import select_native_memory_parts
+from .tool_progress_guard import RequestToolProgress
 
 
 TRACE_KEY = "_gcp_flow_trace"
 TRACE_PROTOCOL = "gcp.flow.trace.v1"
+HANDOFF_REQUESTED = "_gcp_lm_handoff_requested"
+HANDOFF_RESULT = "_gcp_lm_handoff"
+HANDOFF_OWNER = "_gcp_lm_handoff_owner"
+EXIT_REASONS = {"probability", "cooldown", "blacklist", "merged", "no_reply",
+                "cancelled", "failed", "filtered", "duplicate", "completed"}
+TOOL_SIGNALS = {"started", "duplicate_pending", "duplicate_success", "retry_after_failure",
+                "uncertain_repeat", "stale_pending", "success", "failed", "unknown",
+                "unrecognized", "superseded_result", "pending", "repeated_result"}
+METRIC_COUNTS = {"before_chars", "after_chars", "retained_entries", "budget_chars",
+                 "context_chars", "attempts", "stalled", "entry_count_known"}
 PROGRESS_INSTRUCTION = (
     "\n[耗时工具的自然反馈]\n"
     "实际需要搜索、查询、绘图等可能让对方等待的操作时，可以在调用工具前，"
@@ -69,9 +84,11 @@ class AdaptiveWindow:
 class FlowTrace:
     protocol = TRACE_PROTOCOL
 
-    def __init__(self, owner, emit, clock, release, context):
+    def __init__(self, owner, emit, clock, release, context, behavior_enabled):
         self.owner, self.emit, self.clock = owner, emit, clock
         self.context = context
+        self.cohort = "behavior_pilot" if behavior_enabled else "observe_only"
+        self.exit_reason = None
         self.request_id = uuid.uuid4().hex[:16]
         self.started = clock()
         self.stages = {}
@@ -81,20 +98,28 @@ class FlowTrace:
         self.send_failed = self.stream_completed = self.failed = False
         self.progress_hashes = set()
         self.progress_candidate = None
+        self.request_prepared = False
+        self.turn_key = None
+        self.tool_progress = None
+        self.final_send_count = 0
+        self.handoff_request = None
         self.restorers = []
         self.release = release
         self.point("request_start")
 
-    def point(self, stage, outcome="ok", *, duration_ms=None, tool_seq=None):
+    def point(self, stage, outcome="ok", *, duration_ms=None, tool_seq=None, counts=None):
         if self.finished:
             return
-        row = {"request_id": self.request_id, "stage": stage,
+        row = {"request_id": self.request_id, "cohort": self.cohort, "stage": stage,
                "elapsed_ms": round(max(0, self.clock() - self.started) * 1000, 1),
                "outcome": outcome}
         if duration_ms is not None:
             row["duration_ms"] = round(max(0, duration_ms), 1)
         if tool_seq is not None:
             row["tool_seq"] = tool_seq
+        for key, value in (counts or {}).items():
+            if key in METRIC_COUNTS and isinstance(value, (int, float)) and 0 <= value < 100000000:
+                row[key] = value
         try:
             self.emit(row)
         except Exception:
@@ -118,6 +143,7 @@ class FlowTrace:
             self.point("first_sdk_submit")
         self.point("sdk_submit")
         if self.agent_done_seen:
+            self.final_send_count += 1
             self.point("final_sdk_submit")
         else:
             text = "".join(str(getattr(p, "text", "") or "") for p in getattr(chain, "chain", []))
@@ -152,16 +178,25 @@ class FlowTrace:
 
 
 class FlowController:
-    def __init__(self, config, emit=None, clock=None):
+    def __init__(self, config, emit=None, clock=None, part_factory=None):
         self.config = config or {}
         self.emit = emit or (lambda row: None)
         self.clock = clock or time.monotonic
         self.owner = object()
         self.active = set()
+        self.sequence = 0
+        self.reset_orders = {}
         self.closed = False
         # Child tasks inherit the request association; a reused event in an
         # older task does not inherit a newer request's observation context.
         self.context = contextvars.ContextVar("gcp_flow_request", default=None)
+        self.part_factory = part_factory
+        self.turn_cache = TurnStateCache(
+            ttl_seconds=_milliseconds(self.config.get("flow_continuity_ttl_seconds", 180), 180, 30, 600),
+            max_entries=_milliseconds(self.config.get("flow_continuity_max_entries", 128), 128, 16, 512),
+            clock=self.clock,
+            max_fields=12,
+        )
 
     def enabled(self, event, feature=None):
         sessions = self.config.get("flow_optimization_sessions", [])
@@ -170,6 +205,12 @@ class FlowController:
                     and not event.is_private_chat()
                     and (feature is None or self.config.get(feature, True)))
 
+    def metrics_enabled(self, event):
+        sessions = self.config.get("flow_metrics_sessions", self.config.get("flow_optimization_sessions", []))
+        return bool(not self.closed and event is not None and isinstance(sessions, list)
+                    and str(getattr(event, "unified_msg_origin", "") or "") in sessions
+                    and not event.is_private_chat() and self.config.get("flow_metrics_enabled", True))
+
     def trace(self, event):
         trace = event.get_extra(TRACE_KEY) if event is not None else None
         return trace if (getattr(trace, "protocol", None) == TRACE_PROTOCOL
@@ -177,16 +218,24 @@ class FlowController:
                          and trace.context.get(None) is trace) else None
 
     def start(self, event):
-        if not self.enabled(event):
+        if not (self.enabled(event) or self.metrics_enabled(event)):
             return None
         old = event.get_extra(TRACE_KEY)
         # The stable protocol survives module reloads; the old class need not
         # be an instance of this generation's FlowTrace class.
         if getattr(old, "protocol", None) == TRACE_PROTOCOL and not old.finished:
             old.finish("superseded")
-        emit = self.emit if self.config.get("flow_metrics_enabled", True) else lambda row: None
-        trace = FlowTrace(self.owner, emit, self.clock, self.active.discard, self.context)
+        emit = self.emit if self.metrics_enabled(event) else lambda row: None
+        trace = FlowTrace(self.owner, emit, self.clock, self.active.discard, self.context, self.enabled(event))
+        self.sequence += 1
+        trace.order = self.sequence
         self.context.set(trace)
+        if self.config.get("flow_tool_guard_enabled", True):
+            trace.tool_progress = RequestToolProgress(
+                trace.request_id,
+                stale_seconds=_milliseconds(self.config.get("flow_tool_stale_seconds", 45), 45, 5, 300),
+                clock=self.clock,
+            )
         event.set_extra(TRACE_KEY, trace)
         self.active.add(trace)
         self._observe_sender(event, trace, "send")
@@ -195,6 +244,7 @@ class FlowController:
             if event.get_extra(TRACE_KEY) is trace:
                 event.set_extra(TRACE_KEY, None)
         trace.restorers.append(clear_event)
+        trace.restorers.append(lambda: self.clear_memory_handoff(event, trace.handoff_request, trace))
         return trace
 
     def _observe_sender(self, event, trace, name):
@@ -258,6 +308,15 @@ class FlowController:
             trace.begin(stage)
         return trace
 
+    def exit(self, event, reason):
+        trace = self.trace(event)
+        if trace:
+            trace.exit_reason = reason if reason in EXIT_REASONS else "filtered"
+
+    def outcome(self, event, default):
+        trace = self.trace(event)
+        return trace.exit_reason if trace and trace.exit_reason else default
+
     def formal_request(self, event, *, ready=False):
         trace = self.trace(event)
         if trace and not trace.formal_started:
@@ -266,12 +325,148 @@ class FlowController:
         if trace and ready:
             trace.point("formal_request_ready")
 
-    def tool_start(self, event, tool):
+    def request_memory_handoff(self, event, req):
+        trace = self.trace(event)
+        if trace and trace.formal_started and self.enabled(event, "flow_memory_budget_enabled"):
+            if trace.handoff_request is not req:
+                self.clear_memory_handoff(event, trace.handoff_request, trace)
+            trace.handoff_request = req
+            event.set_extra(HANDOFF_REQUESTED, req)
+            event.set_extra(HANDOFF_OWNER, trace)
+
+    def clear_memory_handoff(self, event, req, trace):
+        if req is None or trace is None or event.get_extra(HANDOFF_OWNER) is not trace:
+            return
+        if event.get_extra(HANDOFF_REQUESTED) is req:
+            event.set_extra(HANDOFF_REQUESTED, None)
+        handoff = event.get_extra(HANDOFF_RESULT)
+        if isinstance(handoff, dict) and handoff.get("request") is req:
+            event.set_extra(HANDOFF_RESULT, None)
+        if not event.get_extra(HANDOFF_REQUESTED) and not event.get_extra(HANDOFF_RESULT):
+            event.set_extra(HANDOFF_OWNER, None)
+
+    def prepare_request(self, event, req, persona_id=""):
+        trace = self.trace(event)
+        try:
+            return self._prepare_request(event, req, persona_id)
+        finally:
+            self.clear_memory_handoff(event, req, trace)
+
+    def _prepare_request(self, event, req, persona_id=""):
+        trace = self.trace(event)
+        if not trace or trace.request_prepared:
+            return
+        trace.request_prepared = True
+        persona_id = str(persona_id or "").strip()
+        valid_persona = bool(persona_id and persona_id != "[%None]")
+        query = str(event.get_message_str() or "")
+        budget = _milliseconds(self.config.get("flow_memory_budget_chars", 2400), 2400, 800, 12000)
+        select = valid_persona and self.enabled(event, "flow_memory_budget_enabled")
+        target = req if select else SimpleNamespace(extra_user_content_parts=list(getattr(req, "extra_user_content_parts", []) or []))
+        handoff = event.get_extra(HANDOFF_RESULT) if select else None
+        if handoff is not None:
+            stats = select_native_memory_parts(target, budget_chars=budget, query=query, handoff=handoff)
+        else:
+            stats = select_native_memory_parts(target, budget_chars=budget if select else 100000000, query=query)
+        reason = stats["reason"] if select else ("persona_missing" if self.enabled(event) and not valid_persona else "observe_only")
+        trace.point("memory_budget", reason, counts={
+            "before_chars": stats["before_chars"],
+            "after_chars": stats["after_chars"] if select else stats["before_chars"],
+            "retained_entries": stats["retained_entries"], "budget_chars": budget,
+            "entry_count_known": stats.get("entry_count_known", 0),
+        })
+        if not self.enabled(event, "flow_continuity_enabled"):
+            return
+        sender = str(event.get_sender_id() or "").strip()
+        if not valid_persona or not sender:
+            trace.point("continuity_context", "persona_missing" if not valid_persona else "sender_missing")
+            return
+        key = (str(event.unified_msg_origin), sender, persona_id)
+        previous = self.turn_cache.get(*key)
+        if (int(previous.get("request_order", "0")) > trace.order
+                or self.clock() - trace.started >= self.turn_cache.ttl_seconds
+                or trace.order <= self.reset_orders.get(key[0], 0)):
+            trace.point("continuity_context", "superseded")
+            return
+        # On-demand observation only: a follow-up may reveal that the current
+        # pending tool has exceeded the stale threshold. Never resurrect an
+        # expired/evicted record, or update state owned by a newer request.
+        if previous:
+            for prior in tuple(self.active):
+                if (prior is not trace and prior.turn_key == key
+                        and previous.get("last_request_id") == prior.request_id):
+                    self._check_tool_progress(prior)
+            previous = self.turn_cache.get(*key)
+        text = build_turn_context({key: previous[key] for key in (
+            "topic", "pending_request", "unanswered_question", "task_request", "task_state", "answered"
+        ) if key in previous}, query)
+        if text:
+            factory = self.part_factory
+            if factory is None:
+                from astrbot.core.agent.message import TextPart
+                factory = TextPart
+            part = factory(text=text)
+            part.mark_as_temp()
+            req.extra_user_content_parts.append(part)
+        trace.turn_key = key
+        trace.point("continuity_context", "attached" if text else "empty", counts={"context_chars": len(text)})
+        if query.strip():
+            excerpt = query.strip()[:256]
+            trace.user_excerpt = excerpt
+            self.turn_cache.update(*key, {"topic": excerpt, "pending_request": excerpt,
+                "unanswered_question": excerpt if any(mark in query for mark in ("?", "？")) else None,
+                "last_request_id": trace.request_id, "request_order": str(trace.order),
+                "tool_state": None, "answered": None})
+
+    def _tool_signal(self, trace, signal, seq=None, *, starting=False):
+        reason = signal.reason if signal.reason in TOOL_SIGNALS else "unrecognized"
+        trace.point("tool_progress", {"success": "returned", "duplicate_success": "duplicate_returned"}.get(reason, reason), tool_seq=seq,
+                    counts={"attempts": signal.attempts, "stalled": int(signal.stalled)})
+        if not trace.turn_key:
+            return
+        state = self.turn_cache.get(*trace.turn_key)
+        if not state:
+            return
+        labels = {
+            "started": "工具已开始，尚未观测到结果", "pending": "尚未观测到工具结果",
+            "stale_pending": "等待已超过观测阈值，尚未观测到结果，原因未知",
+            "success": "工具已返回，未标记错误", "failed": "工具返回并标记错误",
+            "unknown": "工具结果状态未知", "unrecognized": "工具结果状态未知",
+            "duplicate_pending": "同参数重复调用，仍有结果尚未观测到",
+            "duplicate_success": "同参数重复调用，先前返回未标记错误；不代表结果相同",
+            "retry_after_failure": "同请求中在失败后再次调用，结果未定",
+            "uncertain_repeat": "同参数重复调用，先前结果状态未知",
+            "repeated_result": "相同参数与相同结果指纹重复",
+        }
+        if starting:
+            if int(state.get("task_order", "0")) > trace.order:
+                return
+            self.turn_cache.update(*trace.turn_key, {
+                "task_request_id": trace.request_id, "task_order": str(trace.order),
+                "task_call_seq": str(seq), "task_request": getattr(trace, "user_excerpt", ""),
+                "task_state": labels.get(reason, "工具结果状态未知"),
+            })
+        elif (state.get("task_request_id") == trace.request_id
+              and state.get("task_call_seq") == str(seq)):
+            self.turn_cache.update(*trace.turn_key, {"task_state": labels.get(reason, "工具结果状态未知")})
+
+    def _check_tool_progress(self, trace):
+        if trace.tool_progress:
+            for _, seq, _ in trace.tools:
+                signal = trace.tool_progress.check(str(seq))
+                if signal.stalled:
+                    self._tool_signal(trace, signal, seq)
+
+    def tool_start(self, event, tool, tool_args=None):
         trace = self.trace(event)
         if trace and trace.formal_started:
+            self._check_tool_progress(trace)
             trace.tool_seq += 1
             trace.tools.append((id(tool), trace.tool_seq, self.clock()))
             trace.point("tool_start", tool_seq=trace.tool_seq)
+            if trace.tool_progress:
+                signal = trace.tool_progress.begin(str(trace.tool_seq), str(getattr(tool, "name", "") or ""), tool_args)
+                self._tool_signal(trace, signal, trace.tool_seq, starting=True)
 
     def tool_end(self, event, tool, result):
         trace = self.trace(event)
@@ -282,6 +477,9 @@ class FlowController:
                 trace.tools.pop(index)
                 trace.point("tool_end", "failed" if getattr(result, "isError", False) else "ok",
                             duration_ms=(self.clock() - started) * 1000, tool_seq=seq)
+                if trace.tool_progress:
+                    status = "unknown" if result is None else "failed" if getattr(result, "isError", False) else "success"
+                    self._tool_signal(trace, trace.tool_progress.finish(str(seq), status), seq)
                 break
 
     def agent_done(self, event, response=None):
@@ -289,6 +487,10 @@ class FlowController:
         if trace:
             trace.agent_done_seen = True
             trace.failed = getattr(response, "role", None) == "err"
+            self._check_tool_progress(trace)
+            if trace.tool_progress:
+                for _, seq, _ in trace.tools:
+                    self._tool_signal(trace, trace.tool_progress.finish(str(seq), "unknown"), seq)
             trace.close_tools()
             trace.end("formal_total", "failed" if getattr(response, "role", None) == "err" else "ok")
             trace.point("agent_done")
@@ -335,8 +537,16 @@ class FlowController:
             return
         if outcome is None:
             outcome = ("failed" if trace.send_failed or trace.failed else
+                       trace.exit_reason if trace.exit_reason else
                        "agent_done" if trace.agent_done_seen else
-                       "incomplete_agent" if trace.formal_started else "no_formal_request")
+                       "incomplete_agent" if trace.formal_started else "filtered")
+        self._check_tool_progress(trace)
+        if trace.tool_progress:
+            for _, seq, _ in trace.tools:
+                self._tool_signal(trace, trace.tool_progress.finish(str(seq), "unknown"), seq)
+        if (trace.turn_key and trace.final_send_count and not trace.failed and not trace.send_failed
+                and self.turn_cache.get(*trace.turn_key).get("last_request_id") == trace.request_id):
+            self.turn_cache.update(*trace.turn_key, {"pending_request": None, "unanswered_question": None, "answered": "yes"})
         trace.finish(outcome)
         self.active.discard(trace)
         if event.get_extra(TRACE_KEY) is trace:
@@ -347,3 +557,10 @@ class FlowController:
         for trace in tuple(self.active):
             trace.finish("terminated")
         self.active.clear()
+        self.turn_cache.clear()
+        self.reset_orders.clear()
+
+    def reset_scope(self, umo):
+        if umo in self.config.get("flow_optimization_sessions", []):
+            self.turn_cache.clear_scope(umo)
+            self.reset_orders[umo] = self.sequence

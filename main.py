@@ -3468,6 +3468,9 @@ class ChatPlus(Star):
             platform_name = event.get_platform_name()
             is_private = event.is_private_chat()
             chat_id = event.get_group_id() if not is_private else event.get_sender_id()
+            flow = getattr(self, "flow_control", None)
+            if flow:
+                flow.reset_scope(str(event.unified_msg_origin))
 
             logger.info(
                 "【会话重置】开始: platform=%s, 类型=%s, chat_id=%s",
@@ -4084,6 +4087,9 @@ class ChatPlus(Star):
 
         blacklist_keywords = self.blacklist_keywords
         if KeywordChecker.check_blacklist_keywords(event, blacklist_keywords):
+            flow = getattr(self, "flow_control", None)
+            if flow:
+                flow.exit(event, "blacklist")
             if self.debug_mode:
                 logger.info("【步骤2】黑名单关键词匹配，丢弃消息")
                 logger.info("=" * 60)
@@ -4174,6 +4180,9 @@ class ChatPlus(Star):
                     is_mentioned=is_at_message or has_trigger_keyword,
                 )
                 if should_skip:
+                    flow = getattr(self, "flow_control", None)
+                    if flow:
+                        flow.exit(event, "no_reply")
                     if self.debug_mode:
                         logger.info(
                             f"【步骤5】🎭 拟人增强: 动态阈值未达到，跳过本次判断 ({skip_reason})"
@@ -7529,6 +7538,8 @@ class ChatPlus(Star):
                 mention_info=mention_info,
             )
             if _gww_intercepted:
+                if flow:
+                    flow.exit(event, "merged")
                 return
 
         # 关键逻辑：触发关键词等同于@消息
@@ -7594,7 +7605,13 @@ class ChatPlus(Star):
             pending_cooldown_context=pending_cooldown_context,
             is_at_all_message=is_at_all_message,
         )
+        if flow:
+            cooldown_trace = flow.trace(event)
+            if cooldown_trace:
+                cooldown_trace.point("cooldown_context", "active" if pending_cooldown_context.get("active_before") else "pending" if pending_cooldown_context.get("pending_after") else "inactive")
         if not should_process:
+            if flow:
+                flow.exit(event, flow.outcome(event, "probability"))
             # 🆕 概率判断失败时，也进行简化的消息缓存（避免上下文断裂）
             # 🆕 v1.2.0: 尝试从平台 LTM 获取图片描述，充分利用平台的图片理解功能
             try:
@@ -7800,6 +7817,8 @@ class ChatPlus(Star):
                 mention_info=mention_info,
             )
             if _gww_recheck:
+                if flow:
+                    flow.exit(event, "merged")
                 return
             wait_trace = flow.begin(event, "wait") if flow else None
             try:
@@ -7967,6 +7986,8 @@ class ChatPlus(Star):
                 )
 
                 if await self.smart_concurrent.is_consumed(early_message_id):
+                    if flow:
+                        flow.exit(event, "merged")
                     consumer_id = await self.smart_concurrent.get_consumer(
                         early_message_id
                     )
@@ -7984,6 +8005,8 @@ class ChatPlus(Star):
                     )
                     while time.monotonic() < wait_deadline:
                         if await self.smart_concurrent.is_consumed(early_message_id):
+                            if flow:
+                                flow.exit(event, "merged")
                             consumer_id = await self.smart_concurrent.get_consumer(
                                 early_message_id
                             )
@@ -8005,6 +8028,8 @@ class ChatPlus(Star):
                     chat_id, early_message_id
                 )
                 if smart_claim.get("is_consumed"):
+                    if flow:
+                        flow.exit(event, "merged")
                     event.call_llm = True
                     return
 
@@ -8117,6 +8142,8 @@ class ChatPlus(Star):
             decision_trace.end("decision", "allow" if should_reply else "decline")
 
         if not should_reply:
+            if flow:
+                flow.exit(event, "no_reply")
             # 🆕 v1.2.0: AI决策判定不通过时，才将消息添加到缓存
             # 这样可以避免需要正常处理的消息被错误缓存
             if cached_message_data:
@@ -8162,6 +8189,8 @@ class ChatPlus(Star):
             async with self.concurrent_lock:
                 # 🔧 修复：检查相同message_id是否已在处理中（防止平台重复推送同一消息）
                 if message_id in self.processing_sessions:
+                    if flow:
+                        flow.exit(event, "duplicate")
                     logger.info(
                         f"🚫 [并发去重] 消息 {message_id[:30]}... 已在处理中，跳过重复处理"
                     )
@@ -9649,6 +9678,9 @@ class ChatPlus(Star):
         from .utils.reply_handler import PLUGIN_REQUEST_MARKER, PLUGIN_CUSTOM_CONTEXTS, PLUGIN_IMAGE_URLS
         if event.get_extra(PLUGIN_REQUEST_MARKER, False) and enabled_for(event, self.config):
             capture_baseline(event, req, event.get_extra(PLUGIN_CUSTOM_CONTEXTS, []), event.get_extra(PLUGIN_IMAGE_URLS, []))
+        flow = getattr(self, "flow_control", None)
+        if flow and event.get_extra(PLUGIN_REQUEST_MARKER, False):
+            flow.request_memory_handoff(event, req)
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -9839,6 +9871,23 @@ class ChatPlus(Star):
             merged_system_prompt = (merged_system_prompt or "") + PROGRESS_INSTRUCTION
         req.system_prompt = merged_system_prompt or ""
 
+        if flow and flow.trace(event):
+            persona_id = ""
+            if flow.enabled(event):
+                try:
+                    conversation_persona = getattr(getattr(req, "conversation", None), "persona_id", None)
+                    persona = await resolve_session_persona(
+                        self.context, event=event, conversation_persona_id=conversation_persona
+                    )
+                    identity = persona.get("persona_id") or persona.get("name") if isinstance(persona, dict) else None
+                    persona_id = identity.strip() if isinstance(identity, str) else ""
+                except Exception:
+                    pass  # Missing persona must fail closed, never fall back across personas.
+            try:
+                flow.prepare_request(event, req, persona_id)
+            except Exception:
+                flow.trace(event).point("continuity_context", "unavailable")
+
         # 🔧 修复：注入 Skills 提示词，避免插件接管 LLM 请求后丢失技能识别
         # 原因：插件通过 event.request_llm() 创建的 ProviderRequest 没有 conversation 对象，
         # 导致框架的 _ensure_persona_and_skills() 跳过执行，Skills 提示词不会被注入。
@@ -9992,7 +10041,7 @@ class ChatPlus(Star):
     async def on_flow_tool_start(self, event: AstrMessageEvent, tool, tool_args):
         flow = getattr(self, "flow_control", None)
         if flow:
-            flow.tool_start(event, tool)
+            flow.tool_start(event, tool, tool_args)
 
     @filter.on_llm_tool_respond(priority=-1)
     async def on_flow_tool_end(self, event: AstrMessageEvent, tool, tool_args, tool_result):
@@ -10213,6 +10262,8 @@ class ChatPlus(Star):
                 self._replace_llm_result_text(result, new_text)
 
             if ReplyHandler._is_final_gate_decline(reply_text):
+                if flow:
+                    flow.exit(event, "no_reply")
                 logger.warning("[主模型最终判断] 检测到 NO_REPLY 污染输出，已跳过发送")
                 event.set_extra(PLUGIN_MAIN_MODEL_FINAL_GATE_DECLINED, True)
                 event.clear_result()
@@ -10322,6 +10373,8 @@ class ChatPlus(Star):
             if self.enable_duplicate_filter and not native_progress and not final_matches_progress:
                 duplicate_match = self._match_recent_duplicate_reply(chat_id, reply_text)
                 if duplicate_match:
+                    if flow:
+                        flow.exit(event, "duplicate")
                     recent_content = duplicate_match.get("recent_content", "")
                     reason_label = self._format_duplicate_match_reason(duplicate_match)
                     logger.warning(
