@@ -13,6 +13,25 @@ class Part:
  def __init__(self,text):self.text=text;self._no_save=False
  def mark_as_temp(self):self._no_save=True;return self
 class Tests(unittest.IsolatedAsyncioTestCase):
+ async def test_denial_is_member_scoped_and_survives_generic_query_handoff(self):
+  self.snapshot['subjects'][0].update(confirmed_aliases=[],denied_aliases=['星河'])
+  self.snapshot['subjects'].append({'user_id':'222','display_name':'乙','confirmed_aliases':['星河'],'denied_aliases':[],'roles':['mention']})
+  await self.bridge.prepare(self.event,self.req)
+  rows=self.event.get_extra(m.HANDOFF)['snapshot']['subjects']
+  self.assertEqual(rows[0]['denied_aliases'],['星河'])
+  self.assertEqual(rows[1]['confirmed_aliases'],['星河'])
+  self.assertIn('仅适用于对应成员',self.req.extra_user_content_parts[0].text)
+  self.assertEqual(self.req.system_prompt,'persona')
+ async def test_denial_field_is_bounded_and_old_snapshots_remain_compatible(self):
+  self.snapshot['subjects'][0]['denied_aliases']=['x'*40]*9+[None]
+  await self.bridge.prepare(self.event,self.req)
+  aliases=self.event.get_extra(m.HANDOFF)['snapshot']['subjects'][0]['denied_aliases']
+  self.assertEqual(aliases,['x'*24]*8)
+  self.bridge.release(self.event,self.req)
+  self.req.extra_user_content_parts=[]
+  del self.snapshot['subjects'][0]['denied_aliases']
+  await self.bridge.prepare(self.event,self.req)
+  self.assertEqual(self.event.get_extra(m.HANDOFF)['snapshot']['subjects'][0]['denied_aliases'],[])
  def setUp(self):
   self.event=Event();self.req=NS(extra_user_content_parts=[],system_prompt='persona')
   self.snapshot={'version':1,'status':'ready','scope':self.event.unified_msg_origin,'subjects':[{'user_id':'111','display_name':'小明','observed_names':['小明'],'confirmed_aliases':['老张'],'roles':['sender']}],'unresolved':[],'relations':[]}
