@@ -87,6 +87,7 @@ from typing import List, Optional
 from collections import OrderedDict
 import aiohttp
 from astrbot.api import logger
+from .utils.decision_observation import (reset as reset_decision_observation, record as record_decision_observation, finish as finish_decision_observation)
 from .utils.request_compatibility import (
     BASELINE as REQUEST_BASELINE,
     STATIC_INSTRUCTIONS,
@@ -4532,6 +4533,7 @@ class ChatPlus(Star):
         """
         # v1.1.2: 检查关键词智能模式（使用已提取的实例变量）
         DecisionAI.clear_reply_classification(event)
+        reset_decision_observation(event, source="rule")
         keyword_smart_mode = self.keyword_smart_mode
 
         # 获取会话信息
@@ -8122,46 +8124,52 @@ class ChatPlus(Star):
         _at_all_skip_all = is_at_all_message and self.at_all_message_mode == "skip_all"
         decision_trace = flow.begin(event, "decision") if flow else None
 
-        if _welcome_skip_all or _at_all_skip_all:
-            should_reply = True
-            if self.debug_mode:
-                if _welcome_skip_all:
-                    logger.info(
-                        "【步骤7】新成员入群消息(skip_all模式)，跳过AI决策，强制处理"
-                    )
-                if _at_all_skip_all:
-                    logger.info(
-                        "【步骤7】@全体成员消息(skip_all模式)，跳过AI决策，强制处理"
-                    )
-        else:
-            # 🆕 v1.2.0: 传递匹配到的触发关键词
-            # 🆕 v1.2.0: 传递原始消息文本用于关键词检测
-            should_reply = await self._check_ai_decision(
-                event,
-                formatted_context,
-                is_at_message,
-                has_trigger_keyword,
-                merged_image_urls,
-                matched_trigger_keyword=matched_trigger_keyword,
-                original_message_text=original_message_text,
-                pending_cooldown_context=pending_cooldown_context,
-            )
-
-        if decision_trace:
-            decision_trace.end("decision", "allow" if should_reply else "decline")
+        reset_decision_observation(event, source="rule")
+        try:
+            if _welcome_skip_all or _at_all_skip_all:
+                should_reply = True
+                if self.debug_mode:
+                    if _welcome_skip_all:
+                        logger.info(
+                            "【步骤7】新成员入群消息(skip_all模式)，跳过AI决策，强制处理"
+                        )
+                    if _at_all_skip_all:
+                        logger.info(
+                            "【步骤7】@全体成员消息(skip_all模式)，跳过AI决策，强制处理"
+                        )
+            else:
+                # 🆕 v1.2.0: 传递匹配到的触发关键词
+                # 🆕 v1.2.0: 传递原始消息文本用于关键词检测
+                should_reply = await self._check_ai_decision(
+                    event,
+                    formatted_context,
+                    is_at_message,
+                    has_trigger_keyword,
+                    merged_image_urls,
+                    matched_trigger_keyword=matched_trigger_keyword,
+                    original_message_text=original_message_text,
+                    pending_cooldown_context=pending_cooldown_context,
+                )
+        except asyncio.CancelledError:
+            record_decision_observation(event, "cancelled")
+            finish_decision_observation(event, decision_trace, flow, False)
+            raise
+        except Exception:
+            record_decision_observation(event, "failed")
+            finish_decision_observation(event, decision_trace, flow, False)
+            raise
+        decision_outcome = finish_decision_observation(event, decision_trace, flow, should_reply)
 
         if not should_reply:
-            if flow:
-                flow.exit(event, "no_reply")
             # 🆕 v1.2.0: AI决策判定不通过时，才将消息添加到缓存
             # 这样可以避免需要正常处理的消息被错误缓存
             if cached_message_data:
                 self.cache_manager.add_to_cache(
                     chat_id, cached_message_data, source="AI决策过滤"
                 )
-                logger.info("📦 决策AI判断: 不回复此消息，已缓存消息，等待后续转正")
+                logger.info("GCP_DECISION outcome=%s cached=true", decision_outcome)
             else:
-                logger.info("📦 决策AI判断: 不回复此消息，无待缓存数据")
+                logger.info("GCP_DECISION outcome=%s cached=false", decision_outcome)
 
             if self.debug_mode:
                 # 验证消息确实在缓存中

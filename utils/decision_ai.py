@@ -19,6 +19,7 @@ import time
 from typing import List, Optional, Dict, Any
 from astrbot.api.all import *
 from .judgment_prompts import build_judgment_system
+from .decision_observation import reset as reset_decision_observation, record as record_decision_observation
 from .ai_response_filter import AIResponseFilter
 from .ai_error_formatter import format_ai_error
 from ._session_guard import sample_guard
@@ -392,6 +393,7 @@ class DecisionAI:
             True=应该回复，False=不回复
         """
         DecisionAI.clear_reply_classification(event)
+        reset_decision_observation(event)
         started_at = time.perf_counter()
         classification_provider_id = str(provider_id or "")
         try:
@@ -411,6 +413,7 @@ class DecisionAI:
                 provider = get_session_provider(context, event=event)
 
             if not provider:
+                record_decision_observation(event, "provider_unavailable")
                 logger.error("无法获取AI提供商")
                 try:
                     event._decision_ai_error = True
@@ -712,6 +715,7 @@ class DecisionAI:
             # 使用用户配置的超时时间
             ai_response = await asyncio.wait_for(call_decision_ai(), timeout=timeout)
 
+            empty_response = not isinstance(ai_response, str) or not ai_response.strip()
             parse_result = AIResponseFilter.parse_decision_response(
                 ai_response,
                 reasoning_start_marker if enable_reasoning else "",
@@ -735,6 +739,7 @@ class DecisionAI:
             )
             if select_reply_mode:
                 if reply_mode is None:
+                    record_decision_observation(event, "empty_response" if empty_response else "protocol_failed")
                     try:
                         event._decision_ai_error = True
                     except Exception:
@@ -764,6 +769,14 @@ class DecisionAI:
                     filtered_text = parse_result.get("filtered_text") or ""
                     decision = DecisionAI._parse_decision(filtered_text)
 
+            if empty_response:
+                record_decision_observation(event, "empty_response")
+                try:event._decision_ai_error = True
+                except Exception:pass
+            elif select_reply_mode or parse_result.get("parse_success"):
+                record_decision_observation(event, "allow" if decision else "decline")
+            else:
+                record_decision_observation(event, "unknown")
             if decision:
                 logger.info("决策AI判断: 应该回复这条消息 (yes)")
             else:
@@ -771,7 +784,11 @@ class DecisionAI:
 
             return decision
 
+        except asyncio.CancelledError:
+            record_decision_observation(event, "cancelled")
+            raise
         except asyncio.TimeoutError:
+            record_decision_observation(event, "timeout")
             logger.warning(
                 f"决策AI调用超时（超过 {timeout} 秒），默认不回复，可在配置中调整 decision_ai_timeout 参数"
             )
@@ -786,6 +803,8 @@ class DecisionAI:
                 )
             return False
         except Exception as e:
+            record_decision_observation(event, "failed")
+            logger.warning("GCP_DECISION outcome=failed error_type=%s", type(e).__name__)
             logger.error(format_ai_error(e, "读空气判断"))
             try:
                 event._decision_ai_error = True

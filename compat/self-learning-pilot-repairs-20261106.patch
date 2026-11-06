@@ -1,0 +1,240 @@
+diff --git a/main.py b/main.py
+index a9271fd..c6c5b6c 100644
+--- a/main.py
++++ b/main.py
+@@ -341,35 +341,21 @@ class SelfLearningPlugin(star.Star):
+ 
+         self._message_capture_diag_last[reason] = now
+ 
+-        platform = "unknown"
+-        group_id = "unknown"
+-        sender_id = "unknown"
+-        message_type = "unknown"
++        component_types = []
+         if event:
+-            for name, getter in (
+-                ("platform", event.get_platform_name),
+-                ("group_id", event.get_group_id),
+-                ("sender_id", event.get_sender_id),
+-                ("message_type", event.get_message_type),
+-            ):
+-                try:
+-                    value = getter()
+-                except Exception:
+-                    value = "error"
+-                if name == "platform":
+-                    platform = value
+-                elif name == "group_id":
+-                    group_id = value
+-                elif name == "sender_id":
+-                    sender_id = value
+-                elif name == "message_type":
+-                    message_type = value
+-
+-        preview = (message_text or "").replace("\n", " ")[:60]
+-        msg = (
+-            f"[消息采集] {reason} count={count}, platform={platform}, "
+-            f"type={message_type}, group={group_id}, sender={sender_id}, preview={preview!r}"
+-        )
++            try:
++                allowed = {"Plain", "Image", "Face", "MFace", "Record", "Video", "File",
++                           "Reply", "At", "AtAll", "Forward", "Node", "Music", "Json", "Xml"}
++                for component in (event.get_messages() or [])[:32]:
++                    name = type(component).__name__
++                    label = name if name in allowed else "Other"
++                    if label not in component_types:
++                        component_types.append(label)
++            except Exception:
++                component_types = ["unavailable"]
++        text_length = min(len(message_text or ""), 10000)
++        msg = (f"[消息采集] {reason} count={count}, text_len={text_length}, "
++               f"components={','.join(component_types) or 'none'}")
+ 
+         if level == "info" or count <= 3:
+             logger.info(msg)
+@@ -400,15 +386,24 @@ class SelfLearningPlugin(star.Star):
+                 return
+ 
+             message_text = event.get_message_str()
+-            if not message_text or len(message_text.strip()) == 0:
+-                self._log_message_capture_diag("skip:empty_message", event, message_text)
+-                return
+-
+             group_id = event.get_group_id() or event.get_sender_id()
+             sender_id = event.get_sender_id()
+             if self._is_self_message(event, sender_id):
+                 self._log_message_capture_diag("skip:self_message", event, message_text)
+                 return
++            if not message_text or len(message_text.strip()) == 0:
++                # Keep adjacency boundaries for non-text media without inventing
++                # captions, learning samples, or identity claims from the image.
++                try:
++                    media_types = {"Image", "Face", "MFace", "Record", "Video", "File", "Forward", "Node", "Music"}
++                    has_media = any(type(part).__name__ in media_types for part in (event.get_messages() or [])[:64])
++                except Exception:
++                    has_media = False
++                queued = has_media and self._queue_style_context_capture(group_id, sender_id, "", event)
++                self._log_message_capture_diag(
++                    "queued:media_boundary" if queued else "skip:empty_message", event, message_text,
++                )
++                return
+             event_metadata = extract_learning_event_metadata(event)
+             if should_ignore_learning_sample(
+                 message_text,
+@@ -497,10 +492,17 @@ class SelfLearningPlugin(star.Star):
+         if collected:
+             identity = getattr(self, "identity_service", None)
+             if identity is not None:
++                observed = False
+                 try:
+-                    await identity.observe_event(event)
++                    observed = bool(await identity.observe_event(event))
+                 except Exception as exc:
+                     logger.warning("Identity observation failed: %s", type(exc).__name__)
++                config = self.plugin_config
++                if (config and getattr(config, "identity_mode", "off") != "off"
++                        and getattr(event, "unified_msg_origin", None) in getattr(config, "identity_allowed_sessions", [])):
++                    self._log_message_capture_diag(
++                        "saved:identity_observation" if observed else "skip:identity_observation", event,
++                    )
+             self.learning_stats.total_messages_collected += 1
+             if self.plugin_config:
+                 self.plugin_config.total_messages_collected = self.learning_stats.total_messages_collected
+diff --git a/services/integration/lightrag_knowledge_manager.py b/services/integration/lightrag_knowledge_manager.py
+index 132ddd5..0db3308 100644
+--- a/services/integration/lightrag_knowledge_manager.py
++++ b/services/integration/lightrag_knowledge_manager.py
+@@ -22,6 +22,7 @@ Design notes:
+ 
+ import asyncio
+ import os
++import ntpath
+ import re
+ import time
+ from typing import Any, Dict, List, Optional
+@@ -48,9 +49,28 @@ except ImportError:
+ # Filename of the LightRAG LLM response cache KV store (JsonKVStorage).
+ LLM_RESPONSE_CACHE_FILENAME = "kv_store_llm_response_cache.json"
+ 
+-# Group ids are numeric platform ids (optionally with provider prefixes);
+-# anything else must never reach filesystem paths.
+-SAFE_GROUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-:]{1,64}$")
++# Literal platform scopes may include account/provider dots and @ signs.
++# Keep existing names unchanged; path containment is checked independently.
++SAFE_GROUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-:.@]{1,64}$")
++
++
++def _resolve_group_working_dir(base_dir: str, group_id: str) -> str:
++    """Validate a literal single-component workspace without renaming data."""
++    if (not isinstance(group_id, str)
++            or not SAFE_GROUP_ID_PATTERN.fullmatch(group_id)
++            or group_id in {".", ".."}
++            or ntpath.splitdrive(group_id)[0]):
++        raise ValueError("Invalid LightRAG group scope")
++    path = os.path.join(base_dir, group_id)
++    base_real = os.path.realpath(base_dir)
++    path_real = os.path.realpath(path)
++    try:
++        contained = os.path.commonpath([base_real, path_real]) == base_real
++    except ValueError:
++        contained = False
++    if not contained or path_real == base_real or os.path.islink(path):
++        raise ValueError("Invalid LightRAG group scope")
++    return path
+ 
+ 
+ class LightRAGKnowledgeManager:
+@@ -248,9 +268,16 @@ class LightRAGKnowledgeManager:
+     def persisted_group_ids(self) -> List[str]:
+         if not os.path.isdir(self._base_dir):
+             return []
+-        return sorted(entry.name for entry in os.scandir(self._base_dir)
+-                      if entry.is_dir(follow_symlinks=False)
+-                      and SAFE_GROUP_ID_PATTERN.fullmatch(entry.name))
++        groups = []
++        for entry in os.scandir(self._base_dir):
++            if not entry.is_dir(follow_symlinks=False):
++                continue
++            try:
++                _resolve_group_working_dir(self._base_dir, entry.name)
++            except ValueError:
++                continue
++            groups.append(entry.name)
++        return sorted(groups)
+ 
+     async def resume_pending_knowledge(self, group_id: str) -> None:
+         """Run the native pending/checkpoint queue, including empty raw batches."""
+@@ -372,7 +399,7 @@ class LightRAGKnowledgeManager:
+         if group_id not in self._instances:
+             return stats
+ 
+-        working_dir = os.path.join(self._base_dir, group_id)
++        working_dir = _resolve_group_working_dir(self._base_dir, group_id)
+         graph_file = os.path.join(
+             working_dir, "graph_chunk_entity_relation.graphml"
+         )
+@@ -447,9 +474,8 @@ class LightRAGKnowledgeManager:
+         freed_total = 0
+         try:
+             group_dirs = [
+-                os.path.join(self._base_dir, name)
+-                for name in os.listdir(self._base_dir)
+-                if os.path.isdir(os.path.join(self._base_dir, name))
++                _resolve_group_working_dir(self._base_dir, name)
++                for name in self.persisted_group_ids()
+             ]
+         except OSError:
+             return 0
+@@ -472,11 +498,7 @@ class LightRAGKnowledgeManager:
+             Dict with ``cleared`` group ids, ``freed_bytes`` and ``errors``.
+         """
+         try:
+-            group_names = [
+-                name
+-                for name in os.listdir(self._base_dir)
+-                if os.path.isdir(os.path.join(self._base_dir, name))
+-            ]
++            group_names = self.persisted_group_ids()
+         except OSError:
+             group_names = []
+ 
+@@ -484,7 +506,9 @@ class LightRAGKnowledgeManager:
+         if group_ids:
+             wanted: List[str] = []
+             for group_id in group_ids:
+-                if not SAFE_GROUP_ID_PATTERN.match(str(group_id)):
++                try:
++                    _resolve_group_working_dir(self._base_dir, group_id)
++                except ValueError:
+                     errors.append(f"{group_id}: 非法群号，已跳过")
+                     continue
+                 if str(group_id) not in wanted:
+@@ -505,7 +529,7 @@ class LightRAGKnowledgeManager:
+             # decision is re-checked, so an instance created concurrently is
+             # cleared via its API instead of racing a file delete.
+             async with self._init_locks[group_id]:
+-                working_dir = os.path.join(self._base_dir, group_id)
++                working_dir = _resolve_group_working_dir(self._base_dir, group_id)
+                 cache_file = os.path.join(
+                     working_dir, LLM_RESPONSE_CACHE_FILENAME
+                 )
+@@ -544,8 +568,7 @@ class LightRAGKnowledgeManager:
+         Uses a per-group asyncio lock to prevent concurrent initialisation
+         of the same group (TOCTOU race).
+         """
+-        if not SAFE_GROUP_ID_PATTERN.fullmatch(str(group_id)):
+-            raise ValueError("Invalid LightRAG group scope")
++        working_dir = _resolve_group_working_dir(self._base_dir, group_id)
+         if group_id in self._instances:
+             return self._instances[group_id]
+ 
+@@ -559,8 +582,8 @@ class LightRAGKnowledgeManager:
+             if group_id in self._instances:
+                 return self._instances[group_id]
+ 
+-            working_dir = os.path.join(self._base_dir, group_id)
+             os.makedirs(working_dir, exist_ok=True)
++            _resolve_group_working_dir(self._base_dir, group_id)
+ 
+             rag_kwargs: Dict[str, Any] = {
+                 # Native stores use working_dir/workspace. This keeps the

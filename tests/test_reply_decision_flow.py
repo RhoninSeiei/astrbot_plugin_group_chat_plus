@@ -38,6 +38,7 @@ class ReplyDecisionFlowTest(unittest.IsolatedAsyncioTestCase):
         async def interest(*args): return False, ""
         async def history(*args): return ""
         namespace = {
+            "reset_decision_observation": __import__("test_decision_observation", fromlist=["obs"]).obs.reset,
             "time": time,
             "logger": SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
             "DecisionAI": SimpleNamespace(should_reply=decide,

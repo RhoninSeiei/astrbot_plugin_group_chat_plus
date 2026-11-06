@@ -16,7 +16,9 @@ HANDOFF_REQUESTED = "_gcp_lm_handoff_requested"
 HANDOFF_RESULT = "_gcp_lm_handoff"
 HANDOFF_OWNER = "_gcp_lm_handoff_owner"
 EXIT_REASONS = {"probability", "cooldown", "blacklist", "merged", "no_reply",
-                "cancelled", "failed", "filtered", "duplicate", "completed"}
+                "cancelled", "failed", "filtered", "duplicate", "completed",
+                "decision_timeout", "decision_empty", "decision_protocol", "decision_provider",
+                "decision_failed", "decision_unknown"}
 TOOL_SIGNALS = {"started", "duplicate_pending", "duplicate_success", "retry_after_failure",
                 "uncertain_repeat", "stale_pending", "success", "failed", "unknown",
                 "unrecognized", "superseded_result", "pending", "repeated_result"}
