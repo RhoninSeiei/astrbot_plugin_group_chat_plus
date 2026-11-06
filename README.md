@@ -22,7 +22,7 @@
 
 [快速开始](#-快速开始) • [功能总览](#-功能总览) • [推荐配置](#-v121-完整推荐配置保守版) • [更新日志](#-更新日志)
 
-[深度指南与常见问题](docs/ARCHITECTURE.md) • [消息工作流程详解](docs/MESSAGE_WORKFLOW.md) • [配置项完整参考](docs/CONFIG_REFERENCE.md) • [项目结构说明](docs/PROJECT_STRUCTURE.md)
+[开发路线图与实验验收](docs/ROADMAP.md) • [深度指南与常见问题](docs/ARCHITECTURE.md) • [消息工作流程详解](docs/MESSAGE_WORKFLOW.md) • [配置项完整参考](docs/CONFIG_REFERENCE.md) • [项目结构说明](docs/PROJECT_STRUCTURE.md)
 
 </div>
 
