@@ -6,18 +6,21 @@ metadata/results remain observational. Completion returns a plain response to
 the native runner, which owns final messages, DONE state and agent hooks.
 """
 import asyncio
+import copy
 import hashlib
 import importlib
 import inspect
 import json
 import weakref
+import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 _STATE_ATTR = '_gcp_tool_loop_limiter_state_v1'
 _MISSING = object()
+_NOTE_OWNER = '_gcp_tool_finalization_owner_v1'
 FINALIZATION_NOTE = (
     '同一只读查询连续返回相同的未完成状态，本轮停止重复调用工具。'
     '请依据已保留的实际工具返回，按当前人格自然回复已确认的信息和未完成部分。'
@@ -125,9 +128,117 @@ def _inactive_response():
 
 def _final_note():
     from astrbot.core.agent.message import Message, TextPart
-    message = Message(role='user', content=[TextPart(text=FINALIZATION_NOTE).mark_as_temp()])
+    owner = uuid.uuid4().hex
+    text = _note_text(owner)
+    part = TextPart(text=text).mark_as_temp()
+    setattr(part, _NOTE_OWNER, owner)
+    message = Message(role='user', content=[part])
+    setattr(message, _NOTE_OWNER, owner)
     message._no_save = True
     return message
+
+
+def _note_text(owner):
+    return f'<gcp-finalization-note id="{owner}">\n{FINALIZATION_NOTE}\n</gcp-finalization-note id="{owner}">'
+
+
+def _field(value, name, default=None):
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def _clean_note_container(messages, owner):
+    """Remove only this random ownership marker, including reconstructed parts."""
+    if not isinstance(messages, list):
+        return
+    envelope = _note_text(owner)
+    retained = []
+    for message in messages:
+        if _field(message, 'role') != 'user':
+            retained.append(message)
+            continue
+        content = _field(message, 'content')
+        message_owned = _field(message, _NOTE_OWNER) == owner
+        changed = False
+        if isinstance(content, str):
+            cleaned = content.replace(envelope, '')
+            changed = cleaned != content
+            if not changed and message_owned:
+                cleaned, changed = '', True
+        elif isinstance(content, list):
+            cleaned = []
+            for part in content:
+                text = _field(part, 'text')
+                part_owned = _field(part, _NOTE_OWNER) == owner
+                if not isinstance(text, str):
+                    cleaned.append(part)
+                    continue
+                remaining = text.replace(envelope, '')
+                if remaining != text:
+                    changed = True
+                    if remaining:
+                        replacement = copy.copy(part)
+                        if isinstance(replacement, dict):replacement['text'] = remaining
+                        else:replacement.text = remaining
+                        cleaned.append(replacement)
+                elif part_owned:
+                    changed = True
+                else:
+                    cleaned.append(part)
+        else:
+            retained.append(message)
+            continue
+        if not changed:
+            retained.append(message)
+        elif cleaned:
+            replacement = copy.copy(message)
+            if isinstance(replacement, dict):
+                replacement['content'] = cleaned
+                replacement.pop(_NOTE_OWNER, None)
+                if message_owned:replacement.pop('_no_save', None)
+            else:
+                replacement.content = cleaned
+                if message_owned:
+                    replacement._no_save = False
+                    if hasattr(replacement, _NOTE_OWNER):delattr(replacement, _NOTE_OWNER)
+            retained.append(replacement)
+    messages[:] = retained
+
+
+def _clean_final_note(runner, state, original_messages, note):
+    owner = getattr(note, _NOTE_OWNER)
+    # Candidate preparation may replace the entire message list. Clean both
+    # lists by provenance without restoring history the core legally removed.
+    for messages in (original_messages, runner.run_context.messages,
+                     getattr(state.request, 'contexts', None)):
+        _clean_note_container(messages, owner)
+
+
+def _final_prepare(runner, handle, state, note, original):
+    async def prepare(messages, *, model, func_tool, process=True):
+        if not process:
+            return await original(messages, model=model, func_tool=func_tool, process=False)
+        if not handle._owns(state):
+            return None
+        # Resolve the real candidate allowance but never expose this control
+        # note to an LLM/custom compressor or add an unmetered summary request.
+        configured = await original(messages, model=model, func_tool=func_tool, process=False)
+        if not configured or not handle._owns(state):
+            return configured if handle._owns(state) else None
+        from astrbot.core.agent.context.manager import ContextManager
+        config = replace(runner.request_context_manager.config,
+                         llm_compress_provider=None, custom_compressor=None)
+        local_manager = ContextManager(config)
+        processed = await local_manager.process(list(configured))
+        if not processed or not handle._owns(state):
+            return processed if handle._owns(state) else None
+        candidate = [*processed, note]
+        tokens = local_manager.token_counter.count_tokens(candidate) + max(0, config.reserved_context_tokens)
+        # Check the same native allowance *including* the control note. Never
+        # silently append beyond the budget, retry, or call a summary model.
+        if type(tokens) is not int or config.max_context_tokens <= 0 or tokens > config.max_context_tokens:
+            return []
+        return candidate
+    return prepare
 
 
 @contextmanager
@@ -386,13 +497,18 @@ async def _final_responses(runner, handle, state, original):
     state.final_attempted = True
     handle._emit(state.event, 'finalizing')
     note = _final_note()
-    runner.run_context.messages.append(note)
+    original_messages = runner.run_context.messages
+    prepare = getattr(runner, '_prepare_context_for_provider', None)
+    overrides = {'_func_tool_for_provider': lambda: None,
+                 'streaming': False, 'request_max_retries': 0,
+                 'EMPTY_OUTPUT_RETRY_ATTEMPTS': 1, 'fallback_providers': []}
+    if callable(prepare):
+        overrides['_prepare_context_for_provider'] = _final_prepare(runner, handle, state, note, prepare)
+    else:
+        original_messages.append(note)
     response = None
-    no_tools = lambda: None
     try:
-        with _owned_overrides(runner, {'_func_tool_for_provider': no_tools,
-                'streaming': False, 'request_max_retries': 0,
-                'EMPTY_OUTPUT_RETRY_ATTEMPTS': 1, 'fallback_providers': []}):
+        with _owned_overrides(runner, overrides):
             stream = original(runner)
             try:
                 async for candidate in stream:
@@ -406,7 +522,7 @@ async def _final_responses(runner, handle, state, original):
     except Exception:
         response = None
     finally:
-        runner.run_context.messages[:] = [message for message in runner.run_context.messages if message is not note]
+        _clean_final_note(runner, state, original_messages, note)
     stop_requested = getattr(runner, '_is_stop_requested', None)
     if callable(stop_requested) and stop_requested():
         # Native abort can end the generator normally without an exception.
@@ -434,6 +550,14 @@ def install_tool_loop_limiter(*, authorize, emit=None, runner_cls=None,
     if runner_cls is None:
         runner_cls = importlib.import_module('astrbot.core.agent.runners.tool_loop_agent_runner').ToolLoopAgentRunner
     bridge = runner_cls.__dict__.get(_STATE_ATTR)
+    if bridge is not None:
+        # An outer plugin can retain our inert v1 bridge across reload. Its
+        # saved wrapper must dispatch new requests to this generation's fix,
+        # without replacing the outer plugin's class method.
+        wrapper = bridge.get('wrappers', {}).get('_iter_llm_responses_with_fallback')
+        namespace = getattr(wrapper, '__globals__', {})
+        if namespace.get('_STATE_ATTR') == _STATE_ATTR and '_final_responses' in namespace:
+            namespace['_final_responses'] = _final_responses
     if bridge is None:
         names = ('_handle_function_tools', '_iter_llm_responses_with_fallback')
         originals = {name: getattr(runner_cls, name, None) for name in names}

@@ -1,5 +1,6 @@
 """Request policy regressions; native runner lifecycle is separately integrated."""
 import asyncio
+import copy
 import importlib.util
 import json
 import sys
@@ -8,8 +9,16 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from astrbot.core.agent.tool import FunctionTool
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.agent.hooks import BaseAgentRunHooks
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+from astrbot.core.agent.context.config import ContextConfig
+from astrbot.core.agent.context.manager import ContextManager
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import InternalAgentSubStage
+from dataclasses import replace
 
 SPEC = importlib.util.spec_from_file_location('gcp_tool_loop_limiter_tests',
     Path(__file__).parents[1]/'utils/tool_loop_limiter.py')
@@ -241,6 +250,144 @@ class ToolLoopLimiterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runner.run_context.messages,[])
         self.assertTrue(self.runner.streaming)
 
+    async def test_r4_candidate_deepcopy_keeps_model_note_but_cleans_retained_copy(self):
+        await self.arm()
+        user=Message(role='user',content=limiter.FINALIZATION_NOTE)
+        self.runner.run_context.messages=[user]
+        async def commit_copy():
+            self.runner.run_context.messages=copy.deepcopy(self.runner.run_context.messages)
+        self.runner.on_provider=commit_copy
+        await self.runner.final_step()
+        self.assertTrue(any(limiter.FINALIZATION_NOTE in str(message) and message._no_save
+                            for message in self.runner.provider_calls[0]['messages']))
+        self.assertEqual(len(self.runner.run_context.messages),1)
+        self.assertEqual(self.runner.run_context.messages[0].content,limiter.FINALIZATION_NOTE)
+        saved=[message.model_dump() for message in self.runner.run_context.messages if not message._no_save]
+        self.assertEqual(saved,[user.model_dump()])
+
+    async def test_reconstructed_message_and_part_keep_user_data_and_remove_only_owned_note(self):
+        await self.arm()
+        kept=Message(role='user',content='SYNTHETIC_USER_KEEP '+limiter.FINALIZATION_NOTE)
+        self.runner.run_context.messages=[kept]
+        async def reconstruct():
+            original=self.runner.run_context.messages
+            rebuilt=[Message.model_validate(message.model_dump()) for message in original]
+            self.runner.run_context.messages=rebuilt
+            self.req.contexts=copy.deepcopy(rebuilt)
+        self.runner.on_provider=reconstruct
+        await self.runner.final_step()
+        self.assertEqual([m.content for m in self.runner.run_context.messages],[kept.content])
+        self.assertEqual([m.content for m in self.req.contexts],[kept.content])
+
+    async def test_cleanup_does_not_restore_truncated_history_or_delete_mixed_user_part(self):
+        await self.arm()
+        self.runner.run_context.messages=[Message(role='user',content='HISTORY_LEGITIMATELY_DROPPED')]
+        async def mixed_candidate():
+            note=copy.deepcopy(self.runner.run_context.messages[-1])
+            note.content=[TextPart(text='SYNTHETIC_USER_KEEP'),*note.content]
+            self.runner.run_context.messages=[note]
+        self.runner.on_provider=mixed_candidate
+        await self.runner.final_step()
+        remaining=self.runner.run_context.messages
+        self.assertEqual(len(remaining),1)
+        self.assertEqual([part.text for part in remaining[0].content],['SYNTHETIC_USER_KEEP'])
+        self.assertNotIn('HISTORY_LEGITIMATELY_DROPPED',str(remaining))
+
+    async def test_copied_note_cleanup_also_runs_on_failure_cancel_and_generator_exit(self):
+        for failure in [RuntimeError('synthetic'),asyncio.CancelledError(),GeneratorExit()]:
+            with self.subTest(failure=type(failure).__name__):
+                self.handle.release(self.event,self.req)
+                self.runner=self.Runner(self.event,self.req);await self.arm()
+                async def commit_copy():
+                    self.runner.run_context.messages=copy.deepcopy(self.runner.run_context.messages)
+                self.runner.on_provider=commit_copy;self.runner.provider_error=failure
+                if isinstance(failure,(asyncio.CancelledError,GeneratorExit)):
+                    with self.assertRaises(type(failure)):await self.runner.final_step()
+                else:await self.runner.final_step()
+                self.assertEqual(self.runner.run_context.messages,[])
+
+    async def test_reload_during_finalization_cleans_old_request_copy(self):
+        await self.arm()
+        created=[]
+        async def reload_copy():
+            self.runner.run_context.messages=copy.deepcopy(self.runner.run_context.messages)
+            self.handle.close()
+            created.append(limiter.install_tool_loop_limiter(runner_cls=self.Runner,
+                authorize=lambda *args:None))
+        self.runner.on_provider=reload_copy
+        try:await self.runner.final_step()
+        finally:
+            for handle in created:handle.close()
+        self.assertEqual(self.runner.run_context.messages,[])
+
+    async def test_inert_bridge_cross_module_reload_uses_new_finalizer(self):
+        def load(name):
+            spec=importlib.util.spec_from_file_location(name,SPEC.origin)
+            module=importlib.util.module_from_spec(spec);sys.modules[name]=module
+            spec.loader.exec_module(module);return module
+        old=load('limiter_prior_generation');Runner=runner_class()
+        first=old.install_tool_loop_limiter(runner_cls=Runner,authorize=lambda *args:self.token)
+        prior=Runner._handle_function_tools
+        async def foreign(runner,req,response):
+            async for item in prior(runner,req,response):yield item
+        Runner._handle_function_tools=foreign;first.close()
+        new=load('limiter_new_generation');used=[];actual=new._final_responses
+        async def tagged(*args):
+            used.append(True)
+            async for item in actual(*args):yield item
+        new._final_responses=tagged
+        latest=new.install_tool_loop_limiter(runner_cls=Runner,authorize=lambda *args:self.token)
+        runner=Runner(self.event,self.req)
+        try:
+            await calls(runner,[{'job_id':'C1'}]*3)
+            await runner.final_step()
+            self.assertEqual(used,[True])
+            self.assertIs(Runner._handle_function_tools,foreign)
+            self.assertEqual(runner.run_context.messages,[])
+        finally:latest.close()
+
+    async def test_owned_note_cleanup_survives_dict_serialization_without_text_matching(self):
+        note=limiter._final_note();same=Message(role='user',content=limiter.FINALIZATION_NOTE)
+        messages=[same.model_dump(),note.model_dump()]
+        owner=getattr(note,limiter._NOTE_OWNER)
+        limiter._clean_note_container(messages,owner)
+        self.assertEqual(messages,[same.model_dump()])
+
+    async def test_final_prepare_has_note_in_counted_payload_without_llm_compression(self):
+        await self.arm();state=next(iter(self.handle.requests.values()));note=limiter._final_note()
+        counter={'compressor':0,'configured':[]}
+        class ForbiddenCompressor:
+            async def __call__(self,messages):
+                counter['compressor']+=1;raise AssertionError('extra compression is forbidden')
+            def should_compress(self,*args):return True
+        config=ContextConfig(max_context_tokens=5000,reserved_context_tokens=0,
+            custom_compressor=ForbiddenCompressor())
+        original_manager=ContextManager(config)
+        async def original(messages,*,model,func_tool,process=True):
+            counter['configured'].append(process)
+            self.runner.request_context_manager=original_manager
+            return messages
+        prepare=limiter._final_prepare(self.runner,self.handle,state,note,original)
+        messages=[Message(role='user',content='SYNTHETIC_KEEP')]
+        initial=await prepare(messages,model=None,func_tool=None,process=False)
+        self.assertIs(initial,messages)
+        self.assertNotIn(limiter.FINALIZATION_NOTE,str(initial))
+        candidate=await prepare(messages,model=None,func_tool=None)
+        self.assertIn(limiter.FINALIZATION_NOTE,str(candidate))
+        self.assertEqual(counter['configured'],[False,False]);self.assertEqual(counter['compressor'],0)
+        self.assertLessEqual(original_manager.token_counter.count_tokens(candidate),config.max_context_tokens)
+        self.assertIs(self.runner.request_context_manager,original_manager)
+
+    async def test_final_prepare_over_budget_returns_empty_without_hidden_compression(self):
+        await self.arm();state=next(iter(self.handle.requests.values()));note=limiter._final_note()
+        config=ContextConfig(max_context_tokens=1,reserved_context_tokens=0)
+        async def original(messages,*,model,func_tool,process=True):
+            self.assertFalse(process)
+            self.runner.request_context_manager=ContextManager(config)
+            return messages
+        prepare=limiter._final_prepare(self.runner,self.handle,state,note,original)
+        self.assertEqual(await prepare([Message(role='user',content='x')],model=None,func_tool=None),[])
+
     async def test_new_request_and_follow_up_generation_start_independently(self):
         await self.arm();self.runner._follow_up_seq+=1
         await calls(self.runner)
@@ -338,6 +485,125 @@ class ToolLoopLimiterTests(unittest.IsolatedAsyncioTestCase):
             def _handle_function_tools(self):pass
         with self.assertRaises(TypeError):limiter.install_tool_loop_limiter(authorize=lambda *args:None,runner_cls=Unsupported)
         self.assertFalse(hasattr(Unsupported,limiter._STATE_ATTR))
+
+
+class R4NativeFinalizationTests(unittest.IsolatedAsyncioTestCase):
+    """Actual r4 candidate processing, tool loop and history-save boundary."""
+
+    async def run_native(self,mode):
+        class Event:
+            unified_msg_origin='synthetic:GroupMessage:r4-note';session_id='synthetic-session'
+            message_obj=NS(message_id='synthetic-only')
+            def __init__(self):self.extras={}
+            def get_extra(self,key,default=None):return self.extras.get(key,default)
+            def set_extra(self,key,value):self.extras[key]=value
+            def get_sender_id(self):return 'synthetic-user'
+            def get_platform_name(self):return 'synthetic'
+        event=Event();token=object();runner=ToolLoopAgentRunner();executions=[];signals=[];new_handles=[]
+        prompt=limiter.FINALIZATION_NOTE if mode=='same_text' else '持续查询合成任务，直到结束。'
+        req=ProviderRequest(prompt=prompt,contexts=[],system_prompt='SYNTHETIC_PERSONA_KEEP')
+        class Script:
+            provider_config={'id':'controlled-r4-finalization','max_context_tokens':100000}
+            def __init__(self):self.calls=[]
+            def get_model(self):return 'controlled-offline-model'
+            def meta(self):return NS(id='controlled-r4-finalization',model=self.get_model())
+            async def text_chat(self,**kwargs):
+                visible=kwargs.get('func_tool')
+                self.calls.append({'tools':bool(visible),'contexts':copy.deepcopy(kwargs.get('contexts',[]))})
+                if not visible:
+                    if mode=='failure':raise RuntimeError('synthetic final failure')
+                    if mode=='abort':runner.request_stop()
+                    if mode=='reload':
+                        handle.close()
+                        new_handles.append(limiter.install_tool_loop_limiter(runner_cls=ToolLoopAgentRunner,
+                            authorize=lambda *args:None))
+                    return LLMResponse(role='assistant',completion_text='合成查询仍未完成，没有新的信息。')
+                return LLMResponse(role='assistant',tools_call_name=['controlled_status'],
+                    tools_call_args=[{'job_id':'SYN-ONLY'}],tools_call_ids=[f'synthetic-{len(self.calls)}'])
+        provider=Script()
+        async def handler(job_id):
+            executions.append(job_id)
+            return pending()
+        controlled=FunctionTool(name='controlled_status',description='只读合成状态',
+            parameters={'type':'object','properties':{'job_id':{'type':'string'}},'required':['job_id']},handler=handler)
+        controlled.annotations=ToolAnnotations(readOnlyHint=True)
+        req.func_tool=ToolSet(tools=[controlled])
+        class NativeExecutor:
+            async def execute(self,tool,run_context,**args):yield await tool.handler(**args)
+        handle=limiter.install_tool_loop_limiter(runner_cls=ToolLoopAgentRunner,
+            authorize=lambda e,r:token if e is event and r is req else None,
+            emit=lambda e,s:signals.append(s))
+        await runner.reset(provider=provider,request=req,run_context=ContextWrapper(context=NS(event=event)),
+            tool_executor=NativeExecutor(),agent_hooks=BaseAgentRunHooks(),streaming=False,
+            fallback_providers=[],request_max_retries=0,
+            tool_schema_mode='skills_like' if mode=='skills_like' else 'full')
+        compression_calls=[]
+        try:
+            for _ in range(3):
+                async for _item in runner.step():pass
+            self.assertEqual(len(executions),3)
+            self.assertIn('armed',signals)
+            if mode=='budget':provider.provider_config['max_context_tokens']=1
+            if mode=='truncate':
+                class ForbiddenCompressor:
+                    def should_compress(self,*args):return True
+                    async def __call__(self,messages):
+                        compression_calls.append(True);raise AssertionError('No hidden summary request')
+                runner._context_policy=replace(runner._context_policy,enforce_max_turns=1,
+                    custom_compressor=ForbiddenCompressor())
+                runner.run_context.messages[1:1]=[
+                    Message(role='user',content='合成旧轮次'),
+                    Message(role='assistant',content='LEGITIMATELY_TRUNCATED_OLD_BODY')]
+            async for _item in runner.step():pass
+            self.assertTrue(runner.done())
+            self.assertEqual(len(executions),3)
+            self.assertEqual(compression_calls,[])
+            if mode=='budget':
+                self.assertEqual(len(provider.calls),3)
+                self.assertIn('fallback',signals)
+            else:
+                self.assertEqual(len(provider.calls),7 if mode=='skills_like' else 4)
+                final_input=provider.calls[-1]['contexts']
+                self.assertTrue(any(limiter.FINALIZATION_NOTE in str(m) and m._no_save for m in final_input))
+                self.assertFalse(provider.calls[-1]['tools'])
+                if mode=='truncate':self.assertNotIn('LEGITIMATELY_TRUNCATED_OLD_BODY',str(runner.run_context.messages))
+            if mode=='abort':self.assertNotIn('fallback',signals)
+            # Exercise the real serializer/save method with a synthetic sink,
+            # rather than approximating it by filtering messages in this test.
+            saved=[]
+            class HistorySink:
+                async def update_conversation(self,*args,**kwargs):saved.append(kwargs['history'])
+            req.conversation=NS(cid='synthetic-conversation',token_usage=0)
+            await InternalAgentSubStage._save_to_history(NS(conv_manager=HistorySink()),event,req,
+                runner.get_final_llm_resp(),runner.run_context.messages,runner.stats,user_aborted=runner.was_aborted())
+            self.assertEqual(len(saved),1)
+            persisted=json.dumps(saved,ensure_ascii=False)
+            self.assertNotIn('<gcp-finalization-note id=',persisted)
+            self.assertNotIn('<gcp-finalization-note id=',str(runner.run_context.messages))
+            if mode=='same_text':self.assertIn(limiter.FINALIZATION_NOTE,persisted)
+            else:
+                self.assertNotIn(limiter.FINALIZATION_NOTE,persisted)
+                self.assertNotIn(limiter.FINALIZATION_NOTE,str(runner.run_context.messages))
+            return {'mode':mode,'actual_tools':len(executions),'provider_calls':len(provider.calls),
+                    'saved_messages':len(saved[0]),'signals':signals}
+        finally:
+            handle.close()
+            for new_handle in new_handles:new_handle.close()
+
+    async def test_actual_r4_input_and_real_history_save_have_no_control_note(self):
+        await self.run_native('normal')
+    async def test_actual_r4_same_literal_user_text_remains_in_saved_history(self):
+        await self.run_native('same_text')
+    async def test_actual_r4_local_truncation_avoids_custom_summary_and_restoration(self):
+        await self.run_native('truncate')
+    async def test_actual_r4_note_over_budget_falls_back_without_final_provider_call(self):
+        await self.run_native('budget')
+    async def test_actual_r4_skills_like_and_abort_cleanup(self):
+        for mode in ['skills_like','abort']:
+            with self.subTest(mode=mode):await self.run_native(mode)
+    async def test_actual_r4_failure_and_reload_cleanup(self):
+        for mode in ['failure','reload']:
+            with self.subTest(mode=mode):await self.run_native(mode)
 
 
 if __name__=='__main__':unittest.main()
