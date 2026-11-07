@@ -98,6 +98,8 @@ from .utils.request_compatibility import (
     split_static_instructions,
 )
 from .utils.flow_control import FlowController, PROGRESS_INSTRUCTION
+from .utils.request_lifecycle import RequestLifecycle, LEASE_KEY, resolve_request_owner
+from .utils.native_queue import detect_native_queue_capability, can_delegate_native, RequestHistoryRecipe
 
 
 from astrbot.api.all import *
@@ -1807,6 +1809,12 @@ class ChatPlus(Star):
         self._idle_flush_meta = {}
 
         self.runtime_state = RuntimeState()
+        self.request_lifecycle = RequestLifecycle(self, self.runtime_state)
+        self.request_lifecycle.attach(context)
+        self._termination_complete = False
+        self._request_message_owners = {}
+        self._native_history_locks = {}
+        self._native_queue_capability = detect_native_queue_capability()
 
         # 标记本插件正在处理的消息（用于after_message_sent筛选）
         # 🔧 修复：使用message_id作为键，避免同一会话中多条消息并发时标记冲突
@@ -2656,61 +2664,85 @@ class ChatPlus(Star):
                     exc.__class__.__name__,
                 )
 
+        lifecycle = getattr(self, "request_lifecycle", None)
+        if lifecycle:
+            lifecycle.mark_ready()
+
     async def terminate(self):
-        """
-        🆕 v1.1.0: 插件禁用/重载时调用
-
-        停止主动对话功能的后台任务并保存状态
-        """
-        identity = getattr(self, "member_identity_bridge", None)
-        if identity:
-            await identity.aclose()
-        flow = getattr(self, "flow_control", None)
-        if flow:
-            flow.close()
-        self._image_tools_terminated = True
-        planner_handle = getattr(self, "_image_planner_context_handle", None)
-        if planner_handle is not None:
-            planner_handle.close()
-            self._image_planner_context_handle = None
-        limiter = getattr(self, '_tool_loop_limiter_handle', None)
-        if limiter is not None:
-            limiter.close()
-            self._tool_loop_limiter_handle = None
-        image_tasks = tuple(getattr(self, "_image_operation_tasks", ()))
-        for task in image_tasks:
-            task.cancel()
-        if image_tasks:
-            await asyncio.gather(*image_tasks, return_exceptions=True)
-
-        timeout_override_handle = getattr(
-            self, "_group_image_tool_timeout_override_handle", None
-        )
-        if timeout_override_handle is not None:
+        # Keep terminal hooks and request resources alive until genuine completion.
+        if getattr(self, "_termination_complete", False):
+            return
+        lifecycle = getattr(self, "request_lifecycle", None)
+        if lifecycle:
+            lifecycle.stop_intake()
+            if lifecycle.active:
+                logger.info("GCP_RELOAD_DRAIN active=%s", len(lifecycle.active))
             try:
-                remove_group_image_tool_timeout_override(timeout_override_handle)
-            except Exception as exc:
-                logger.warning(
-                    "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED error_type=%s",
-                    exc.__class__.__name__,
-                )
-            finally:
-                self._group_image_tool_timeout_override_handle = None
+                await lifecycle.drain()
+            except asyncio.CancelledError:
+                # No request resources have been closed yet. Restore the old
+                # intake and wake arrivals waiting for a reload that was aborted.
+                lifecycle.resume_intake()
+                raise
+        try:
+            """
+            🆕 v1.1.0: 插件禁用/重载时调用
 
-        if self.proactive_enabled:
-            try:
-                await ProactiveChatManager.stop_background_task()
-                logger.info("⏹️ [主动对话] 后台任务已停止，状态已保存")
-            except Exception as e:
-                logger.error(f"[主动对话] 停止后台任务失败: {e}", exc_info=True)
-        if hasattr(self, "dashboard_http_session"):
-            await self.dashboard_http_session.close()
-
-        for task in list(getattr(self, "_idle_flush_tasks", {}).values()):
-            if task and not task.done():
+            停止主动对话功能的后台任务并保存状态
+            """
+            identity = getattr(self, "member_identity_bridge", None)
+            if identity:
+                await identity.aclose()
+            flow = getattr(self, "flow_control", None)
+            if flow:
+                flow.close()
+            self._image_tools_terminated = True
+            planner_handle = getattr(self, "_image_planner_context_handle", None)
+            if planner_handle is not None:
+                planner_handle.close()
+                self._image_planner_context_handle = None
+            limiter = getattr(self, '_tool_loop_limiter_handle', None)
+            if limiter is not None:
+                limiter.close()
+                self._tool_loop_limiter_handle = None
+            image_tasks = tuple(getattr(self, "_image_operation_tasks", ()))
+            for task in image_tasks:
                 task.cancel()
-        self._idle_flush_tasks.clear()
-        self._idle_flush_meta.clear()
+            if image_tasks:
+                await asyncio.gather(*image_tasks, return_exceptions=True)
+
+            timeout_override_handle = getattr(
+                self, "_group_image_tool_timeout_override_handle", None
+            )
+            if timeout_override_handle is not None:
+                try:
+                    remove_group_image_tool_timeout_override(timeout_override_handle)
+                except Exception as exc:
+                    logger.warning(
+                        "GCP_IMAGE_TOOL_TIMEOUT_OVERRIDE_REMOVE_FAILED error_type=%s",
+                        exc.__class__.__name__,
+                    )
+                finally:
+                    self._group_image_tool_timeout_override_handle = None
+
+            if self.proactive_enabled:
+                try:
+                    await ProactiveChatManager.stop_background_task()
+                    logger.info("⏹️ [主动对话] 后台任务已停止，状态已保存")
+                except Exception as e:
+                    logger.error(f"[主动对话] 停止后台任务失败: {e}", exc_info=True)
+            if hasattr(self, "dashboard_http_session"):
+                await self.dashboard_http_session.close()
+
+            for task in list(getattr(self, "_idle_flush_tasks", {}).values()):
+                if task and not task.done():
+                    task.cancel()
+            self._idle_flush_tasks.clear()
+            self._idle_flush_meta.clear()
+            self._termination_complete = True
+        finally:
+            if lifecycle:
+                lifecycle.mark_retired()
 
     @filter.on_platform_loaded()
     async def on_platform_loaded(self):
@@ -2869,6 +2901,10 @@ class ChatPlus(Star):
         """
         # 🔧 用于 finally 安全清理，防止 processing_sessions 泄漏导致后续消息卡住
         _cleanup_message_id = None
+        _request_key = None
+        _request_owners = {}
+        _lease = None
+        _lifecycle = getattr(self, "request_lifecycle", None)
         _flow = getattr(self, "flow_control", None)
         _flow_trace = None
         _flow_outcome = None
@@ -2889,7 +2925,6 @@ class ChatPlus(Star):
 
             # 检查是否被高优先级处理器标记为指令消息
             msg_id = self._get_message_id(event)
-            _cleanup_message_id = msg_id  # 保存用于 finally 清理
 
             # 🔧 消息去重：检查是否已经在处理相同的消息
             # 防止平台重复推送同一条消息（网络重连、WebSocket断线等）导致重复AI回复
@@ -2901,17 +2936,38 @@ class ChatPlus(Star):
                     for k, v in self._seen_message_ids.items()
                     if current_time - v < 60
                 }
-            if msg_id in self._seen_message_ids:
+            _request_key = (str(getattr(event, "unified_msg_origin", "")), msg_id)
+            _request_owners = getattr(self, "_request_message_owners", {})
+            if (msg_id in self._seen_message_ids or msg_id in self.processing_sessions
+                    or _request_key in _request_owners):
                 if self.debug_mode:
                     logger.info(
                         f"[消息去重] 检测到重复消息 {msg_id[:30]}...，跳过处理"
-                        f"（距首次处理 {current_time - self._seen_message_ids[msg_id]:.1f}秒）"
+                        f"（距首次处理 {current_time - self._seen_message_ids.get(msg_id, current_time):.1f}秒）"
                     )
                 # 🔧 阻止框架的默认LLM调用（仅阻止默认链路，不影响其他插件）
                 # 因为第一份消息已经处理过，重复消息不应再触发框架的默认LLM回复
                 event.call_llm = True
                 return
+            if _lifecycle:
+                _lease = _lifecycle.acquire(event)
+                if _lease is None:
+                    if _lifecycle.accepting:
+                        # An existing/stale event lease is not a reload handoff.
+                        event.call_llm = True
+                        return
+                    # New arrivals wait outside the old drain set, then enter
+                    # the fully initialized successor's normal message handler.
+                    successor = await _lifecycle.wait_successor()
+                    if successor is not None:
+                        async for result in successor.on_group_message(event):
+                            yield result
+                    else:
+                        event.call_llm = True
+                    return
             self._seen_message_ids[msg_id] = current_time
+            _cleanup_message_id = msg_id
+            _request_owners[_request_key] = event
 
             if msg_id in self.command_messages:
                 # 这条消息已被识别为指令，跳过处理
@@ -3034,32 +3090,44 @@ class ChatPlus(Star):
             _flow_outcome = "failed"
             logger.error(f"处理群消息时发生错误: {e}", exc_info=True)
         finally:
-            if _identity and _identity_scope:
-                _identity.end(event, _identity_scope)
-            if _flow_trace:
-                _flow.finish(event, _flow_trace, _flow_outcome)
-            # 🔧 安全网：确保 processing_sessions 条目不会泄漏
-            # 当 after_message_sent 未被框架调用时（如 on_decorating_result 清空了 result，
-            # 或 _generate_and_send_reply 未 yield 就提前返回，或管线中途异常），
-            # 此处作为最终保障进行清理，防止后续消息卡在并发等待循环中
-            if _cleanup_message_id:
-                self.processing_sessions.pop(_cleanup_message_id, None)
-                self._message_cache_snapshots.pop(_cleanup_message_id, None)
-                self._smart_batch_snapshots.pop(_cleanup_message_id, None)
-                if self.concurrent_mode == "smart":
-                    try:
-                        smart_chat_id = (
-                            event.get_extra("_gcp_smart_chat_id", "")
-                            if hasattr(event, "get_extra")
-                            else ""
-                        )
-                        await self.smart_concurrent.remove_self(
-                            smart_chat_id,
-                            _cleanup_message_id,
-                        )
-                    except Exception:
-                        pass
-                self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
+            try:
+                if _identity and _identity_scope:
+                    _identity.end(event, _identity_scope)
+                if _flow_trace:
+                    if event.get_extra("_gcp_native_queue_delegated", False) and event.get_extra("_follow_up_captured", False):
+                        _flow_outcome = "merged"
+                    _flow.finish(event, _flow_trace, _flow_outcome)
+                # 🔧 安全网：确保 processing_sessions 条目不会泄漏
+                # 当 after_message_sent 未被框架调用时（如 on_decorating_result 清空了 result，
+                # 或 _generate_and_send_reply 未 yield 就提前返回，或管线中途异常），
+                # 此处作为最终保障进行清理，防止后续消息卡在并发等待循环中
+                if _cleanup_message_id and _request_owners.get(_request_key) is event:
+                    self.processing_sessions.pop(_cleanup_message_id, None)
+                    self._message_cache_snapshots.pop(_cleanup_message_id, None)
+                    self._smart_batch_snapshots.pop(_cleanup_message_id, None)
+                    if self.concurrent_mode == "smart":
+                        try:
+                            smart_chat_id = (
+                                event.get_extra("_gcp_smart_chat_id", "")
+                                if hasattr(event, "get_extra")
+                                else ""
+                            )
+                            await self.smart_concurrent.remove_self(
+                                smart_chat_id,
+                                _cleanup_message_id,
+                            )
+                        except Exception:
+                            pass
+                    self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
+            finally:
+                if _cleanup_message_id and _request_owners.get(_request_key) is event:
+                    _request_owners.pop(_request_key, None)
+                    for key in ("_gcp_pending_official_user_row", "_gcp_native_history_recipe",
+                                "_gcp_native_history_fragment", "_gcp_native_history_candidate",
+                                "_gcp_native_queue_delegated", "_gcp_native_history_lock"):
+                        event.set_extra(key, None)
+                if _lifecycle and _lease:
+                    _lifecycle.release(event, _lease)
 
     def _is_vacuum_message(self, event: AstrMessageEvent) -> bool:
         """识别没有文本、提及、图片、戳一戳、转发等有效载荷的空事件。"""
@@ -5912,6 +5980,23 @@ class ChatPlus(Star):
             except Exception:
                 pass
 
+        # Native delegation is restricted to payloads the core text follow-up
+        # protocol can carry in full. All richer payloads retain the legacy path.
+        if (getattr(self, "_native_queue_capability", None) is not None
+                and not image_urls and not window_buffered_msgs
+                and all(str(getattr(m, "message_id", "")).startswith("official_") for m in history_messages)
+                and all(type(part).__name__ in {"Plain", "At"} for part in (event.get_messages() or []))):
+            recipe = RequestHistoryRecipe.capture(
+                event, history_messages=history_messages, current_message=message_text_for_ai,
+                bot_id=bot_id, rendered_fragment=formatted_context,
+                formatter=ContextManager.format_context_for_ai,
+                reset_token=ContextManager.get_history_cutoff(chat_id),
+                window_buffered_messages=window_buffered_msgs,
+                include_timestamp=self.include_timestamp, include_sender_info=self.include_sender_info,
+            )
+            event.set_extra("_gcp_native_history_recipe", recipe)
+            event.set_extra("_gcp_native_history_fragment", formatted_context)
+
         # 返回：原始消息文本、处理后的消息（不含元数据，用于保存）、格式化的上下文、图片URL列表、历史消息列表、待缓存数据、表情包标记状态
         return (
             True,
@@ -8217,66 +8302,11 @@ class ChatPlus(Star):
 
         # 🔧 并发保护：使用锁保护检查-标记流程，避免竞态条件
         # 如果有其他消息在处理，循环等待直到前一个消息完成或达到最大等待次数
-        max_wait_loops = self.concurrent_wait_max_loops  # 最大等待循环次数
-        wait_interval = self.concurrent_wait_interval  # 每次循环等待秒数
-
-        for loop_count in range(max_wait_loops):
-            # 🔒 获取锁进行原子性检查和标记
-            async with self.concurrent_lock:
-                # 🔧 修复：检查相同message_id是否已在处理中（防止平台重复推送同一消息）
-                if message_id in self.processing_sessions:
-                    if flow:
-                        flow.exit(event, "duplicate")
-                    logger.info(
-                        f"🚫 [并发去重] 消息 {message_id[:30]}... 已在处理中，跳过重复处理"
-                    )
-                    # 🔧 阻止框架的默认LLM调用（仅阻止默认链路，不影响其他插件）
-                    event.call_llm = True
-                    return
-
-                existing_processing = [
-                    msg_id
-                    for msg_id, cid in self.processing_sessions.items()
-                    if cid == chat_id and msg_id != message_id
-                ]
-
-                if not existing_processing:
-                    # 没有其他消息在处理，立即标记并退出
-                    self.processing_sessions[message_id] = chat_id
-                    if self.debug_mode:
-                        logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
-                    break
-
-            # 🔓 释放锁后再进行等待（避免阻塞其他消息）
-            if loop_count == 0:
-                logger.warning(
-                    f"⚠️ [并发检测] 会话 {chat_id} 中有 {len(existing_processing)} 条消息正在处理中，"
-                    f"开始等待（最多 {max_wait_loops} 次，每次 {wait_interval} 秒）..."
-                )
-
-            await asyncio.sleep(wait_interval)
-
-            if self.debug_mode:
-                logger.info(
-                    f"  [并发等待] 第 {loop_count + 1}/{max_wait_loops} 次检测..."
-                )
-        else:
-            # 循环结束仍有消息在处理，强制标记并继续
-            async with self.concurrent_lock:
-                still_processing = [
-                    msg_id
-                    for msg_id, cid in self.processing_sessions.items()
-                    if cid == chat_id and msg_id != message_id
-                ]
-                if still_processing:
-                    logger.warning(
-                        f"⚠️ [并发警告] 等待 {max_wait_loops * wait_interval:.1f} 秒后仍有 "
-                        f"{len(still_processing)} 条消息在处理，强制继续执行（可能产生竞争）"
-                    )
-                # 即使有竞争也要标记，否则这条消息无法被清理
-                self.processing_sessions[message_id] = chat_id
-                if self.debug_mode:
-                    logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
+        event.set_extra("_gcp_native_history_candidate", bool(
+            event.get_extra("_gcp_native_history_fragment") == formatted_context
+            and not merged_image_urls and not merged_reference_image_urls and not smart_batch_messages))
+        if not await self._claim_processing_slot(event, chat_id, message_id):
+            return
 
         # 🔧 成功回复相关的主动对话/回复密度状态已后移到 after_message_sent，
         # 避免“判定通过但最终空回复”时提前污染状态。
@@ -8440,6 +8470,149 @@ class ChatPlus(Star):
             "- 默认一句短句即可，除非对方明确要求详细解释。\n"
             "- 直接自然回应当前发送者，不要解释你为什么会回复。\n"
         )
+
+    async def _read_native_committed_history(self, event, umo, original):
+        # Serialize only the local row write/ID publication and the corresponding
+        # snapshot read, never a model request or the native session wait.
+        async with event.get_extra("_gcp_native_history_lock"):
+            if umo != event.unified_msg_origin:
+                raise ValueError("request binding changed")
+            limit = self.max_context_messages
+            if limit == 0:
+                return []
+            limit = min(500, limit) if limit > 0 else 500
+            cutoff = ContextManager.get_history_cutoff(event.get_group_id())
+            marker = event.get_extra("_gcp_pending_official_user_row")
+            if (not isinstance(marker, dict) or marker.get("event") is not event
+                    or marker.get("umo") != umo
+                    or marker.get("platform_id") != str(event.get_platform_id())
+                    or marker.get("group_id") != str(event.get_group_id())
+                    or type(marker.get("row_id")) is not int):
+                raise ValueError("current storage row identity unavailable")
+            excluded_ids = set()
+            lifecycle = getattr(self, "request_lifecycle", None)
+            pending_events = [lease.event for lease in lifecycle.active] if lifecycle else [event]
+            for pending in pending_events:
+                row = pending.get_extra("_gcp_pending_official_user_row")
+                if (isinstance(row, dict) and row.get("event") is pending
+                        and row.get("umo") == umo
+                        and row.get("platform_id") == str(event.get_platform_id())
+                        and row.get("group_id") == str(event.get_group_id())
+                        and type(row.get("row_id")) is int
+                        and self._get_message_id(pending) in self.processing_sessions):
+                    excluded_ids.add(row["row_id"])
+            read_limit = limit + len(excluded_ids)
+            if read_limit > 1000:
+                raise ValueError("pending history window too large")
+            records = await self.context.message_history_manager.get(
+                platform_id=event.get_platform_id(), user_id=event.get_group_id(), page=1, page_size=read_limit)
+            if not records and original:
+                raise ValueError("committed history unavailable")
+            result = []
+            for record in records or []:
+                if getattr(record, "id", None) in excluded_ids:
+                    continue
+                message = ContextManager._official_history_to_message(
+                    record, event.get_platform_name(), False, event.get_group_id(), event.get_self_id())
+                if message and (getattr(message, "timestamp", 0) or 0) >= cutoff:
+                    result.append(message)
+            return sorted(result, key=lambda message: getattr(message, "timestamp", 0) or 0)[-limit:]
+
+    def _request_callback_owner(self, event):
+        if event.get_extra(LEASE_KEY) is None:
+            return self  # Existing proactive/direct paths do not own group leases.
+        return resolve_request_owner(event)
+
+    def _can_delegate_native_queue(self, event):
+        recipe = event.get_extra("_gcp_native_history_recipe")
+        if not recipe or not event.get_extra("_gcp_native_history_candidate", False):
+            return False
+        try:
+            cfg = self.context.get_config(umo=event.unified_msg_origin)
+            native = cfg.get("provider_settings", {}).get("agent_runner_type") == "local"
+            return can_delegate_native(self._native_queue_capability, native_provider_request=native)
+        except Exception:
+            return False
+
+    async def _claim_processing_slot(self, event, chat_id, message_id):
+        flow = getattr(self, "flow_control", None)
+        history_locks = getattr(self, "_native_history_locks", None)
+        if history_locks is not None:
+            event.set_extra("_gcp_native_history_lock", history_locks.setdefault(event.unified_msg_origin, asyncio.Lock()))
+        if self._can_delegate_native_queue(event):
+            async with self.concurrent_lock:
+                if message_id in self.processing_sessions:
+                    if flow:
+                        flow.exit(event, "duplicate")
+                    event.call_llm = True
+                    return False
+                self.processing_sessions[message_id] = chat_id
+            event.set_extra("_gcp_native_queue_delegated", True)
+            trace = flow.trace(event) if flow else None
+            if trace:
+                trace.point("queue_handoff", "native")
+            return True
+        max_wait_loops = self.concurrent_wait_max_loops  # 最大等待循环次数
+        wait_interval = self.concurrent_wait_interval  # 每次循环等待秒数
+
+        for loop_count in range(max_wait_loops):
+            # 🔒 获取锁进行原子性检查和标记
+            async with self.concurrent_lock:
+                # 🔧 修复：检查相同message_id是否已在处理中（防止平台重复推送同一消息）
+                if message_id in self.processing_sessions:
+                    if flow:
+                        flow.exit(event, "duplicate")
+                    logger.info(
+                        f"🚫 [并发去重] 消息 {message_id[:30]}... 已在处理中，跳过重复处理"
+                    )
+                    # 🔧 阻止框架的默认LLM调用（仅阻止默认链路，不影响其他插件）
+                    event.call_llm = True
+                    return False
+
+                existing_processing = [
+                    msg_id
+                    for msg_id, cid in self.processing_sessions.items()
+                    if cid == chat_id and msg_id != message_id
+                ]
+
+                if not existing_processing:
+                    # 没有其他消息在处理，立即标记并退出
+                    self.processing_sessions[message_id] = chat_id
+                    if self.debug_mode:
+                        logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
+                    break
+
+            # 🔓 释放锁后再进行等待（避免阻塞其他消息）
+            if loop_count == 0:
+                logger.warning(
+                    f"⚠️ [并发检测] 会话 {chat_id} 中有 {len(existing_processing)} 条消息正在处理中，"
+                    f"开始等待（最多 {max_wait_loops} 次，每次 {wait_interval} 秒）..."
+                )
+
+            await asyncio.sleep(wait_interval)
+
+            if self.debug_mode:
+                logger.info(
+                    f"  [并发等待] 第 {loop_count + 1}/{max_wait_loops} 次检测..."
+                )
+        else:
+            # 循环结束仍有消息在处理，强制标记并继续
+            async with self.concurrent_lock:
+                still_processing = [
+                    msg_id
+                    for msg_id, cid in self.processing_sessions.items()
+                    if cid == chat_id and msg_id != message_id
+                ]
+                if still_processing:
+                    logger.warning(
+                        f"⚠️ [并发警告] 等待 {max_wait_loops * wait_interval:.1f} 秒后仍有 "
+                        f"{len(still_processing)} 条消息在处理，强制继续执行（可能产生竞争）"
+                    )
+                # 即使有竞争也要标记，否则这条消息无法被清理
+                self.processing_sessions[message_id] = chat_id
+                if self.debug_mode:
+                    logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
+        return True
 
     def _mark_reply_generation_failed(self, event, message_id):
         event.set_extra(PLUGIN_PENDING_MAIN_MODEL_DECISION, None)
@@ -9711,6 +9884,11 @@ class ChatPlus(Star):
 
     @filter.on_llm_request(priority=1000001)
     async def snapshot_request_compatibility(self, event: AstrMessageEvent, req: ProviderRequest):
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.snapshot_request_compatibility(event, req)
         from .utils.reply_handler import PLUGIN_REQUEST_MARKER, PLUGIN_CUSTOM_CONTEXTS, PLUGIN_IMAGE_URLS
         if event.get_extra(PLUGIN_REQUEST_MARKER, False) and enabled_for(event, self.config):
             capture_baseline(event, req, event.get_extra(PLUGIN_CUSTOM_CONTEXTS, []), event.get_extra(PLUGIN_IMAGE_URLS, []))
@@ -9723,6 +9901,11 @@ class ChatPlus(Star):
 
     @filter.on_llm_request(priority=-1)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.on_llm_request(event, req)
         try:
             return await self._on_llm_request_impl(event, req)
         finally:
@@ -9789,6 +9972,14 @@ class ChatPlus(Star):
         plugin_contexts = event.get_extra(PLUGIN_CUSTOM_CONTEXTS, [])
         plugin_system_prompt = event.get_extra(PLUGIN_CUSTOM_SYSTEM_PROMPT, "")
         plugin_prompt = event.get_extra(PLUGIN_CUSTOM_PROMPT, "")
+        if event.get_extra("_gcp_native_queue_delegated", False):
+            recipe = event.get_extra("_gcp_native_history_recipe")
+            if recipe and recipe.bind(event, req):
+                refreshed = await recipe.refresh(event, req, plugin_prompt, reader=self._read_native_committed_history,
+                    get_reset_token=lambda umo: ContextManager.get_history_cutoff(event.get_group_id()))
+                plugin_prompt = refreshed.payload
+                event.set_extra(PLUGIN_CUSTOM_PROMPT, plugin_prompt)
+                logger.info("GCP_NATIVE_HISTORY_REFRESH status=%s", refreshed.status)
         plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])
         static_instructions = ''
         if enabled_for(event, self.config, 'static_prompt_groups'):
@@ -10041,6 +10232,11 @@ class ChatPlus(Star):
         对于agent最终没有文本输出的情况（如工具直接返回结果），
         此处还负责将之前累积的中间文本保存到历史。
         """
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.on_llm_response(event, response)
         try:
             message_id = self._get_message_id(event)
 
@@ -10086,12 +10282,22 @@ class ChatPlus(Star):
 
     @filter.on_using_llm_tool(priority=-1)
     async def on_flow_tool_start(self, event: AstrMessageEvent, tool, tool_args):
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.on_flow_tool_start(event, tool, tool_args)
         flow = getattr(self, "flow_control", None)
         if flow:
             flow.tool_start(event, tool, tool_args)
 
     @filter.on_llm_tool_respond(priority=-1)
     async def on_flow_tool_end(self, event: AstrMessageEvent, tool, tool_args, tool_result):
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.on_flow_tool_end(event, tool, tool_args, tool_result)
         flow = getattr(self, "flow_control", None)
         if flow:
             flow.tool_end(event, tool, tool_result)
@@ -10232,6 +10438,11 @@ class ChatPlus(Star):
         - 应用延迟模拟（模拟打字时间）
         - 检查重复消息（若与最近回复重复，清空结果以跳过发送）
         """
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.on_decorating_result(event)
         try:
             platform_name = event.get_platform_name()
             is_private = event.is_private_chat()
@@ -10551,6 +10762,11 @@ class ChatPlus(Star):
 
         注意：所有消息发送都会触发，需要检查是否本插件的回复
         """
+        callback_owner = getattr(self, "_request_callback_owner", lambda current: self)(event)
+        if callback_owner is None:
+            return
+        if callback_owner is not self:
+            return await callback_owner.after_message_sent(event)
         try:
             # 获取会话信息（用于检查标记）
             platform_name = event.get_platform_name()

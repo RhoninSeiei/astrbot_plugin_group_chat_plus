@@ -1880,13 +1880,36 @@ class ContextManager:
                         ]
 
                     # 调用官方历史管理器保存
-                    await context.message_history_manager.insert(
-                        platform_id=event.get_platform_id(),
-                        user_id=chat_id,
-                        content=message_chain_dict,
-                        sender_id=event.get_sender_id(),
-                        sender_name=event.get_sender_name() or "未知用户",
-                    )
+                    async def store_history_row():
+                        inserted_history = await context.message_history_manager.insert(
+                            platform_id=event.get_platform_id(),
+                            user_id=chat_id,
+                            content=message_chain_dict,
+                            sender_id=event.get_sender_id(),
+                            sender_name=event.get_sender_name() or "未知用户",
+                        )
+                        # This exact row is written before yielding the native request.
+                        # Keep its storage identity request-local so the lock-time
+                        # refresh can exclude pending users without text deduplication.
+                        request_lease = getattr(event, "get_extra", lambda *_: None)("_gcp_request_lease", None)
+                        owns_request = (getattr(request_lease, "protocol", None) == "gcp.request-lease.v1"
+                                        and getattr(request_lease, "event", None) is event
+                                        and not request_lease.released)
+                        if ((owns_request or getattr(event, "get_extra", lambda *_: False)("_gcp_native_queue_delegated", False))
+                                and type(getattr(inserted_history, "id", None)) is int):
+                            event.set_extra("_gcp_pending_official_user_row", {
+                                "event": event,
+                                "umo": str(event.unified_msg_origin),
+                                "platform_id": str(event.get_platform_id()),
+                                "group_id": str(chat_id),
+                                "row_id": inserted_history.id,
+                            })
+                    history_lock = getattr(event, "get_extra", lambda *_: None)("_gcp_native_history_lock", None)
+                    if history_lock is not None:
+                        async with history_lock:
+                            await store_history_row()
+                    else:
+                        await store_history_row()
 
                     if DEBUG_MODE:
                         logger.info(
