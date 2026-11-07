@@ -1,0 +1,353 @@
+diff --git a/core/event_handler_modules/memory_reflection.py b/core/event_handler_modules/memory_reflection.py
+index d366cbb..6ac66bc 100644
+--- a/core/event_handler_modules/memory_reflection.py
++++ b/core/event_handler_modules/memory_reflection.py
+@@ -459,11 +459,13 @@ class MemoryReflection:
+         history_messages = candidate_messages[:messages_to_summarize]
+         if retry_count >= 3:
+             logger.warning(
+-                f"[{session_id}] Abandoning failed summary segment [{start_index}:{end_index}]"
+-            )
+-            await self.conversation_manager.commit_summary_cursor(
+-                session_id, history_messages[-1], expected_revision
++                f"[{session_id}] Summary retries exhausted; preserving pending segment "
++                f"and cursor. Automatic reflection paused; use /lmem summarize "
++                f"for explicit recovery."
+             )
++            # retry_count is persisted in pending_summary: later messages and plugin
++            # reloads must not turn exhaustion into silent data loss or more calls.
++            # The manual command clears pending only after a successful write.
+             return None
+ 
+         logger.info(f"[{session_id}] 获取到 {len(history_messages)} 条消息用于总结")
+diff --git a/tests/test_event_handler_context.py b/tests/test_event_handler_context.py
+index 1439a33..e9c0144 100644
+--- a/tests/test_event_handler_context.py
++++ b/tests/test_event_handler_context.py
+@@ -274,10 +274,10 @@ async def test_context_expansion_skips_when_empty(
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_pending_summary_retry_max_abandons(
++async def test_pending_summary_retry_max_preserves_pending(
+     handler, conversation_manager, memory_engine
+ ):
+-    """retry_count >= 3 时应放弃该范围，更新 last_summarized_index 并跳过总结。"""
++    """retry_count >= 3 时保留游标与待处理范围，暂停自动总结。"""
+     conversation_manager.get_session_metadata = AsyncMock(
+         side_effect=lambda sid, key, default=None: {
+             "last_summarized_index": 0,
+@@ -296,20 +296,8 @@ async def test_pending_summary_retry_max_abandons(
+         get_persona.return_value = "persona_1"
+         await handler.handle_memory_reflection(event, resp)
+ 
+-    # 验证 pending_summary 被清除
+-    clear_calls = [
+-        c
+-        for c in conversation_manager.update_session_metadata.await_args_list
+-        if c.args[1] == "pending_summary"
+-    ]
+-    assert len(clear_calls) >= 1
+-    # 验证 last_summarized_index 被更新到 end_index
+-    skip_calls = [
+-        c
+-        for c in conversation_manager.update_session_metadata.await_args_list
+-        if c.args[1] == "last_summarized_index"
+-    ]
+-    assert any(c.args[2] == 12 for c in skip_calls)
++    conversation_manager.update_session_metadata.assert_not_awaited()
++    conversation_manager.commit_summary_cursor.assert_not_awaited()
+     # 不应触发记忆总结
+     memory_engine.add_memory.assert_not_awaited()
+ 
+diff --git a/tests/test_event_handler_recall.py b/tests/test_event_handler_recall.py
+index 9010927..069ca29 100644
+--- a/tests/test_event_handler_recall.py
++++ b/tests/test_event_handler_recall.py
+@@ -516,7 +516,7 @@ async def test_handle_memory_reflection_skips_empty_response(
+ async def test_handle_memory_reflection_pending_retry_exceeds_max(
+     handler, conversation_manager, memory_engine
+ ):
+-    """待处理失败总结重试次数 >= 3 时，应放弃并清除 pending_summary。"""
++    """待处理失败总结重试次数 >= 3 时，保留 pending_summary 和游标。"""
+     event = _make_event(group=False)
+     resp = _make_resp("assistant answer")
+ 
+@@ -555,7 +555,10 @@ async def test_handle_memory_reflection_pending_retry_exceeds_max(
+         get_persona.return_value = "p1"
+         await handler.handle_memory_reflection(event, resp)
+ 
+-    # pending_summary 应被清除
+-    assert session_metadata.get("pending_summary") is None
+-    # add_memory 不应被调用（放弃了该范围）
++    assert session_metadata["pending_summary"] == {
++        "start_index": 0, "end_index": 2, "retry_count": 3
++    }
++    assert session_metadata["last_summarized_index"] == 0
++    conversation_manager.commit_summary_cursor.assert_not_awaited()
++    # 自动暂停，不再调用存储。
+     memory_engine.add_memory.assert_not_awaited()
+diff --git a/tests/test_issue385_regressions.py b/tests/test_issue385_regressions.py
+index 2851230..2725788 100644
+--- a/tests/test_issue385_regressions.py
++++ b/tests/test_issue385_regressions.py
+@@ -160,12 +160,14 @@ async def test_pending_retry_never_skips_later_unsummarized_chunks(tmp_path, ret
+     )
+     sid = "test:group:pending-range"
+     await _seed_messages(manager, sid, [1_780_000_000.0 + i for i in range(10)])
++    pending = {"start_index": 6, "end_index": 10, "retry_count": retries}
++    await manager.update_session_metadata(sid, "pending_summary", pending)
+     try:
+         plan = await handler._memory_reflection._build_reflection_plan_for_cursor(
+             sid,
+             10,
+             0,
+-            {"start_index": 6, "end_index": 10, "retry_count": retries},
++            pending,
+             None,
+             None,
+             sid,
+@@ -175,8 +177,9 @@ async def test_pending_retry_never_skips_later_unsummarized_chunks(tmp_path, ret
+         else:
+             assert plan is None
+             assert (
+-                await manager.get_session_metadata(sid, "last_summarized_index", 0) == 4
++                await manager.get_session_metadata(sid, "last_summarized_index", 0) == 0
+             )
++            assert await manager.get_session_metadata(sid, "pending_summary") == pending
+     finally:
+         await handler.shutdown()
+         await store.close()
+diff --git a/tests/test_recall_reliability.py b/tests/test_recall_reliability.py
+index 1a6e65a..9342c07 100644
+--- a/tests/test_recall_reliability.py
++++ b/tests/test_recall_reliability.py
+@@ -98,6 +98,19 @@ async def test_long_memory_roundtrips_full_text_and_rolls_back_failed_vector(
+     assert await engine.faiss_db.document_storage.count_documents({}) == before
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("content", ["synthetic summary", "synthetic " * 600])
++async def test_embedding_timeout_precedes_document_write(engine, monkeypatch, content):
++    """Both short native insertion and bounded long insertion embed before SQL."""
++    before = await engine.faiss_db.document_storage.count_documents({})
++    embedding = AsyncMock(side_effect=TimeoutError("synthetic embedding timeout"))
++    monkeypatch.setattr(engine.faiss_db.embedding_provider, "get_embedding", embedding)
++    with pytest.raises(TimeoutError, match="synthetic embedding timeout"):
++        await engine.add_memory(content)
++    embedding.assert_awaited_once()
++    assert await engine.faiss_db.document_storage.count_documents({}) == before
++
++
+ @pytest.mark.asyncio
+ async def test_bm25_filters_before_limit(tmp_path):
+     path = tmp_path / "bm25.db"
+diff --git a/tests/test_reflection_exhaustion.py b/tests/test_reflection_exhaustion.py
+new file mode 100644
+index 0000000..bee82dc
+--- /dev/null
++++ b/tests/test_reflection_exhaustion.py
+@@ -0,0 +1,203 @@
++"""Failed reflection segments must remain recoverable without automatic retries."""
++
++import asyncio
++from unittest.mock import AsyncMock, Mock, patch
++
++import pytest
++
++from astrbot_plugin_livingmemory.core.command_handler import CommandHandler
++from tests.event_handler_support import _make_real_handler
++
++
++SESSION = "test:GroupMessage:reflection-recovery"
++PENDING = {"start_index": 0, "end_index": 4, "retry_count": 3}
++
++
++async def _setup(tmp_path):
++    handler, manager, store = await _make_real_handler(tmp_path)
++    for index in range(4):
++        await manager.add_message(
++            session_id=SESSION,
++            role="user" if index % 2 == 0 else "assistant",
++            content=f"synthetic-{index}",
++            sender_id="tester" if index % 2 == 0 else "bot",
++            group_id="reflection-recovery",
++        )
++    handler.memory_processor.process_conversation = AsyncMock(
++        return_value=("synthetic summary", {"topics": ["synthetic"]}, 0.6)
++    )
++    handler.memory_processor.classify_atoms_from_metadata = Mock(return_value=[])
++    handler.memory_engine.find_similar_memory = AsyncMock(return_value=None)
++    handler.memory_engine.add_memory = AsyncMock(return_value=1)
++    return handler, manager, store
++
++
++async def _plan(handler, manager):
++    return await handler._memory_reflection._build_reflection_plan_for_cursor(
++        SESSION,
++        await manager.store.get_message_count(SESSION),
++        await manager.get_session_metadata(SESSION, "last_summarized_index", 0),
++        await manager.get_session_metadata(SESSION, "pending_summary", None),
++        await manager.get_session_revision(SESSION),
++        "persona-synthetic",
++        SESSION,
++    )
++
++
++async def _run(handler, plan):
++    await handler._memory_reflection._schedule_reflection(plan)
++    await asyncio.gather(*list(handler._storage_tasks))
++
++
++@pytest.mark.asyncio
++async def test_exhausted_segment_survives_new_messages_and_cold_reopen(tmp_path):
++    handler, manager, store = await _setup(tmp_path)
++    try:
++        await manager.update_session_metadata(SESSION, "pending_summary", dict(PENDING))
++        for _ in range(2):
++            assert await _plan(handler, manager) is None
++        await manager.add_message(SESSION, "user", "new synthetic request", "tester")
++        assert await _plan(handler, manager) is None
++        assert await manager.get_session_metadata(SESSION, "pending_summary") == PENDING
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++        handler.memory_processor.process_conversation.assert_not_awaited()
++        handler.memory_engine.add_memory.assert_not_awaited()
++    finally:
++        await handler.shutdown()
++        await store.close()
++
++    # A new manager/handler reads the pause from SQLite, with no in-memory flag.
++    from astrbot_plugin_livingmemory.storage.conversation_store import ConversationStore
++    from astrbot_plugin_livingmemory.core.managers.conversation_manager import ConversationManager
++
++    reopened = ConversationStore(str(tmp_path / "conv-history.db"))
++    await reopened.initialize()
++    manager2 = ConversationManager(store=reopened)
++    handler.conversation_manager = manager2
++    handler._memory_reflection.conversation_manager = manager2
++    try:
++        assert await _plan(handler, manager2) is None
++        assert await manager2.get_session_metadata(SESSION, "pending_summary") == PENDING
++        assert await manager2.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++    finally:
++        await reopened.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("prior_failures", [0, 2])
++async def test_storage_failure_retains_segment_and_stops_at_limit(tmp_path, prior_failures):
++    handler, manager, store = await _setup(tmp_path)
++    try:
++        if prior_failures:
++            await manager.update_session_metadata(
++                SESSION, "pending_summary", {**PENDING, "retry_count": prior_failures}
++            )
++        handler.memory_engine.add_memory.side_effect = TimeoutError("synthetic embedding timeout")
++        await _run(handler, await _plan(handler, manager))
++        assert await manager.get_session_metadata(SESSION, "pending_summary") == {
++            **PENDING, "retry_count": prior_failures + 1
++        }
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++        if prior_failures == 2:
++            assert await _plan(handler, manager) is None
++            assert await manager.get_session_metadata(SESSION, "pending_summary") == PENDING
++            assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++            assert handler.memory_processor.process_conversation.await_count == 1
++            assert handler.memory_engine.add_memory.await_count == 1
++    finally:
++        await handler.shutdown()
++        await store.close()
++
++
++@pytest.mark.asyncio
++async def test_success_advances_cursor_and_clears_prior_failure(tmp_path):
++    handler, manager, store = await _setup(tmp_path)
++    try:
++        await manager.update_session_metadata(SESSION, "pending_summary", {**PENDING, "retry_count": 1})
++        await _run(handler, await _plan(handler, manager))
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 4
++        assert await manager.get_session_metadata(SESSION, "pending_summary") is None
++    finally:
++        await handler.shutdown()
++        await store.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failed", [False, True])
++async def test_explicit_summarize_recovers_only_after_success(tmp_path, failed):
++    handler, manager, store = await _setup(tmp_path)
++    try:
++        await manager.update_session_metadata(SESSION, "pending_summary", dict(PENDING))
++        # Manual recovery must pass the complete backlog, even beyond the normal
++        # automatic 120-message segment size, before advancing its cursor.
++        for index in range(124):
++            await manager.add_message(SESSION, "user", f"backlog-{index}", "tester")
++        if failed:
++            handler.memory_engine.add_memory.side_effect = TimeoutError("synthetic embedding timeout")
++        command = CommandHandler(
++            handler.context, handler.config_manager, handler.memory_engine,
++            manager, None, memory_processor=handler.memory_processor,
++        )
++        event = Mock(unified_msg_origin=SESSION)
++        event.plain_result.side_effect = lambda text: text
++        with patch("astrbot_plugin_livingmemory.core.command_handler.is_event_memory_allowed", return_value=True), patch(
++            "astrbot_plugin_livingmemory.core.utils.get_persona_id", AsyncMock(return_value="persona-synthetic")
++        ):
++            results = [value async for value in command.handle_summarize(event)]
++        assert results
++        source = handler.memory_processor.process_conversation.await_args.kwargs["messages"]
++        assert len(source) == 128
++        assert source[0].content == "synthetic-0"
++        assert source[-1].content == "backlog-123"
++        handler.memory_engine.add_memory.assert_awaited_once()
++        assert handler.memory_engine.add_memory.await_args.kwargs["metadata"]["source_window"] == {
++            "session_id": SESSION, "start_index": 0, "end_index": 128,
++            "message_count": 128, "triggered_by": "manual",
++        }
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == (0 if failed else 128)
++        assert await manager.get_session_metadata(SESSION, "pending_summary") == (PENDING if failed else None)
++    finally:
++        await handler.shutdown()
++        await store.close()
++
++
++@pytest.mark.asyncio
++async def test_stale_failure_cannot_restore_exhausted_segment_after_reset(tmp_path):
++    handler, manager, store = await _setup(tmp_path)
++    try:
++        old_revision = await manager.get_session_revision(SESSION)
++        await manager.bump_session_revision(SESSION)
++        await handler._memory_reflection._record_pending_summary(
++            SESSION, 0, 4, 2, old_revision
++        )
++        assert await manager.get_session_metadata(SESSION, "pending_summary") is None
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++    finally:
++        await handler.shutdown()
++        await store.close()
++
++
++@pytest.mark.asyncio
++async def test_cancellation_preserves_previous_pending_segment(tmp_path):
++    handler, manager, store = await _setup(tmp_path)
++    started = asyncio.Event()
++
++    async def waiting_summary(**kwargs):
++        started.set()
++        await asyncio.Event().wait()
++
++    try:
++        previous = {**PENDING, "retry_count": 1}
++        await manager.update_session_metadata(SESSION, "pending_summary", previous)
++        handler.memory_processor.process_conversation.side_effect = waiting_summary
++        await handler._memory_reflection._schedule_reflection(await _plan(handler, manager))
++        await asyncio.wait_for(started.wait(), timeout=2)
++        # The real lifecycle shutdown cancels and awaits the in-flight task.
++        await handler.shutdown()
++        assert not handler._storage_tasks
++        assert await manager.get_session_metadata(SESSION, "pending_summary") == previous
++        assert await manager.get_session_metadata(SESSION, "last_summarized_index", 0) == 0
++        handler.memory_engine.add_memory.assert_not_awaited()
++    finally:
++        await handler.shutdown()
++        await store.close()
