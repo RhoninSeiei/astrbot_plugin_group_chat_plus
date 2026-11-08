@@ -237,6 +237,7 @@ class MessageCacheManager:
         history_messages: Optional[List[AstrBotMessage]],
         event: AstrMessageEvent,
         exclude_current: bool = True,
+        context=None,
     ) -> Tuple[List[AstrBotMessage], int, int]:
         """
         将缓存消息合并到历史消息
@@ -273,6 +274,9 @@ class MessageCacheManager:
         cached_candidates_count = len(cached_messages)
         dedup_skipped = 0
         cached_messages_to_merge = []
+        from .native_queue import native_message_source, native_cached_source, native_history_row_id
+        native_sources = {native_cached_source(m, event) for m in history_messages}
+        native_rows = {str(getattr(m, 'message_id', '')) for m in history_messages}
 
         # 🔧 去重处理：防止缓存消息与官方历史存储重复
         # 注意：这里的去重与消息钩子的去重目的不同：
@@ -305,6 +309,14 @@ class MessageCacheManager:
             for cached_msg in cached_messages:
                 if isinstance(cached_msg, dict):
                     cached_msg_id = cached_msg.get("message_id")
+                    source = native_message_source(event.get_platform_name(), str(event.get_platform_id()),
+                        str(event.unified_msg_origin), cached_msg_id, cached_msg.get('sender_id'))
+                    if source:
+                        row_id = native_history_row_id(context, source) if context else None
+                        if source in native_sources or 'official_' + str(row_id) in native_rows:
+                            dedup_skipped += 1
+                            continue
+                        native_sources.add(source)
 
                     # 只使用 message_id 判断是否重复
                     if cached_msg_id and not str(cached_msg_id).startswith("cached_"):
@@ -360,6 +372,9 @@ class MessageCacheManager:
                     msg_obj.message_id = (
                         f"cached_{cached_msg.get('timestamp', time.time())}"
                     )
+
+                    from .native_queue import bind_native_cached_message
+                    bind_native_cached_message(msg_obj, cached_msg, event)
 
                     # 设置发送者信息
                     sender_id = cached_msg.get("sender_id", "")

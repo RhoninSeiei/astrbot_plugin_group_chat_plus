@@ -99,7 +99,10 @@ from .utils.request_compatibility import (
 )
 from .utils.flow_control import FlowController, PROGRESS_INSTRUCTION
 from .utils.request_lifecycle import RequestLifecycle, LEASE_KEY, resolve_request_owner
-from .utils.native_queue import detect_native_queue_capability, can_delegate_native, RequestHistoryRecipe
+from .utils.native_queue import (detect_native_queue_capability, can_delegate_native, RequestHistoryRecipe,
+    bind_native_cached_message, native_text_qualification, pin_native_history_snapshot,
+    merge_native_cached_history, native_history_lock)
+from .utils.native_capture_guard import install_native_capture_guard
 
 
 from astrbot.api.all import *
@@ -1815,6 +1818,7 @@ class ChatPlus(Star):
         self._request_message_owners = {}
         self._native_history_locks = {}
         self._native_queue_capability = detect_native_queue_capability()
+        self._native_capture_guard = None
 
         # 标记本插件正在处理的消息（用于after_message_sent筛选）
         # 🔧 修复：使用message_id作为键，避免同一会话中多条消息并发时标记冲突
@@ -2664,6 +2668,10 @@ class ChatPlus(Star):
                     exc.__class__.__name__,
                 )
 
+        if self.enable_group_chat and getattr(self, '_native_capture_guard', None) is None:
+            self._native_capture_guard = install_native_capture_guard(authorize=self._owns_enriched_native_request)
+            if not self._native_capture_guard.supported:
+                logger.warning('GCP_NATIVE_CAPTURE_GUARD unsupported=true')
         lifecycle = getattr(self, "request_lifecycle", None)
         if lifecycle:
             lifecycle.mark_ready()
@@ -2690,6 +2698,10 @@ class ChatPlus(Star):
 
             停止主动对话功能的后台任务并保存状态
             """
+            guard = getattr(self, '_native_capture_guard', None)
+            if guard is not None:
+                guard.close()
+                self._native_capture_guard = None
             identity = getattr(self, "member_identity_bridge", None)
             if identity:
                 await identity.aclose()
@@ -3124,7 +3136,8 @@ class ChatPlus(Star):
                     _request_owners.pop(_request_key, None)
                     for key in ("_gcp_pending_official_user_row", "_gcp_native_history_recipe",
                                 "_gcp_native_history_fragment", "_gcp_native_history_candidate",
-                                "_gcp_native_queue_delegated", "_gcp_native_history_lock"):
+                                "_gcp_native_queue_delegated", "_gcp_native_history_lock",
+                                "_gcp_native_qualification"):
                         event.set_extra(key, None)
                 if _lifecycle and _lease:
                     _lifecycle.release(event, _lease)
@@ -5633,6 +5646,7 @@ class ChatPlus(Star):
                             msg_obj.message_id = (
                                 f"cached_{cached_msg.get('timestamp', time.time())}"
                             )
+                            bind_native_cached_message(msg_obj, cached_msg, event)
                             sender_id = cached_msg.get("sender_id", "")
                             sender_name = cached_msg.get("sender_name", "未知用户")
                             if sender_id:
@@ -5907,6 +5921,7 @@ class ChatPlus(Star):
                     history_messages=history_messages,
                     event=event,
                     exclude_current=True,  # 排除当前消息（最后一条）
+                    context=self.context,
                 )
             )
 
@@ -5980,22 +5995,8 @@ class ChatPlus(Star):
             except Exception:
                 pass
 
-        # Native delegation is restricted to payloads the core text follow-up
-        # protocol can carry in full. All richer payloads retain the legacy path.
-        if (getattr(self, "_native_queue_capability", None) is not None
-                and not image_urls and not window_buffered_msgs
-                and all(str(getattr(m, "message_id", "")).startswith("official_") for m in history_messages)
-                and all(type(part).__name__ in {"Plain", "At"} for part in (event.get_messages() or []))):
-            recipe = RequestHistoryRecipe.capture(
-                event, history_messages=history_messages, current_message=message_text_for_ai,
-                bot_id=bot_id, rendered_fragment=formatted_context,
-                formatter=ContextManager.format_context_for_ai,
-                reset_token=ContextManager.get_history_cutoff(chat_id),
-                window_buffered_messages=window_buffered_msgs,
-                include_timestamp=self.include_timestamp, include_sender_info=self.include_sender_info,
-            )
-            event.set_extra("_gcp_native_history_recipe", recipe)
-            event.set_extra("_gcp_native_history_fragment", formatted_context)
+        self._prepare_native_queue_recipe(event, history_messages, message_text_for_ai,
+            bot_id, formatted_context, image_urls, window_buffered_msgs)
 
         # 返回：原始消息文本、处理后的消息（不含元数据，用于保存）、格式化的上下文、图片URL列表、历史消息列表、待缓存数据、表情包标记状态
         return (
@@ -8471,6 +8472,35 @@ class ChatPlus(Star):
             "- 直接自然回应当前发送者，不要解释你为什么会回复。\n"
         )
 
+    def _prepare_native_queue_recipe(self, event, history, current, bot_id, fragment, images=(), windows=()):
+        qualification = native_text_qualification(event, history, image_urls=images, window_messages=windows)
+        event.set_extra('_gcp_native_qualification', qualification)
+        if qualification not in {'plain', 'enriched'} or getattr(self, '_native_queue_capability', None) is None:
+            return
+        if qualification == 'enriched' and not getattr(getattr(self, '_native_capture_guard', None), 'supported', False):
+            event.set_extra('_gcp_native_qualification', 'capture_guard_unavailable')
+            return
+        recipe = RequestHistoryRecipe.capture(event, history_messages=history, current_message=current,
+            bot_id=bot_id, rendered_fragment=fragment, formatter=ContextManager.format_context_for_ai,
+            reset_token=ContextManager.get_history_cutoff(event.get_group_id()),
+            window_buffered_messages=windows, include_timestamp=self.include_timestamp,
+            include_sender_info=self.include_sender_info, enriched=qualification == 'enriched')
+        if not recipe.owns_event(event):
+            event.set_extra('_gcp_native_qualification','snapshot_unavailable')
+            return
+        if not pin_native_history_snapshot(self.context,recipe,event,history):
+            event.set_extra('_gcp_native_qualification','cache_snapshot_capacity')
+            return
+        event.set_extra('_gcp_native_history_recipe', recipe)
+        event.set_extra('_gcp_native_history_fragment', fragment)
+
+    def _owns_enriched_native_request(self, event):
+        recipe = event.get_extra('_gcp_native_history_recipe')
+        return bool(event.get_extra(LEASE_KEY) is not None
+            and event.get_extra('_gcp_native_queue_delegated', False)
+            and recipe and getattr(recipe, 'enriched', False) and recipe.owns_event(event)
+            and self._request_callback_owner(event) is self)
+
     async def _read_native_committed_history(self, event, umo, original):
         # Serialize only the local row write/ID publication and the corresponding
         # snapshot read, never a model request or the native session wait.
@@ -8516,7 +8546,8 @@ class ChatPlus(Star):
                     record, event.get_platform_name(), False, event.get_group_id(), event.get_self_id())
                 if message and (getattr(message, "timestamp", 0) or 0) >= cutoff:
                     result.append(message)
-            return sorted(result, key=lambda message: getattr(message, "timestamp", 0) or 0)[-limit:]
+            return merge_native_cached_history(event, original, result, context=self.context,
+                excluded_ids=excluded_ids, cutoff=cutoff, limit=limit)
 
     def _request_callback_owner(self, event):
         if event.get_extra(LEASE_KEY) is None:
@@ -8525,7 +8556,9 @@ class ChatPlus(Star):
 
     def _can_delegate_native_queue(self, event):
         recipe = event.get_extra("_gcp_native_history_recipe")
-        if not recipe or not event.get_extra("_gcp_native_history_candidate", False):
+        if not recipe or not recipe.owns_event(event) or not event.get_extra("_gcp_native_history_candidate", False):
+            return False
+        if getattr(recipe, 'enriched', False) and not getattr(getattr(self, '_native_capture_guard', None), 'supported', False):
             return False
         try:
             cfg = self.context.get_config(umo=event.unified_msg_origin)
@@ -8538,7 +8571,7 @@ class ChatPlus(Star):
         flow = getattr(self, "flow_control", None)
         history_locks = getattr(self, "_native_history_locks", None)
         if history_locks is not None:
-            event.set_extra("_gcp_native_history_lock", history_locks.setdefault(event.unified_msg_origin, asyncio.Lock()))
+            event.set_extra("_gcp_native_history_lock", native_history_lock(self.context, event.unified_msg_origin))
         if self._can_delegate_native_queue(event):
             async with self.concurrent_lock:
                 if message_id in self.processing_sessions:
@@ -8552,6 +8585,9 @@ class ChatPlus(Star):
             if trace:
                 trace.point("queue_handoff", "native")
             return True
+        trace = flow.trace(event) if flow else None
+        if trace:
+            trace.point('queue_handoff', event.get_extra('_gcp_native_qualification', 'compatibility'))
         max_wait_loops = self.concurrent_wait_max_loops  # 最大等待循环次数
         wait_interval = self.concurrent_wait_interval  # 每次循环等待秒数
 

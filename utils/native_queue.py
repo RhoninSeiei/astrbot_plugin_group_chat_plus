@@ -12,6 +12,9 @@ import copy
 from dataclasses import dataclass, field
 import importlib
 import inspect
+import hashlib
+import json
+import weakref
 import textwrap
 from typing import Callable
 
@@ -82,6 +85,158 @@ def can_delegate_native(capability: NativeQueueCapability, *, native_provider_re
             and native_provider_request is True and direct_provider is False)
 
 
+def native_message_source(platform_name, platform_id, umo, message_id, sender_id):
+    """Hash an explicit platform message identity, never text or a timestamp."""
+    values = (platform_name, platform_id, umo, message_id, sender_id)
+    if any(not isinstance(v, str) or not v or len(v) > 1024 for v in values):
+        return None
+    prefix = platform_name + "_"
+    if not message_id.startswith(prefix) or message_id[len(prefix):].strip() in {"", "None", "null"}:
+        return None
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf8")).hexdigest()
+
+
+def native_event_source(event):
+    raw_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+    if raw_id is None:
+        return None
+    return native_message_source(event.get_platform_name(), str(event.get_platform_id()),
+        str(event.unified_msg_origin), event.get_platform_name() + "_" + str(raw_id),
+        str(event.get_sender_id()))
+
+
+def bind_native_cached_message(message, cached, event):
+    source = native_message_source(event.get_platform_name(), str(event.get_platform_id()),
+        str(event.unified_msg_origin), cached.get("message_id"), cached.get("sender_id"))
+    message._gcp_native_cache = {
+        "source": source, "umo": event.unified_msg_origin,
+        "text_only": not cached.get("image_urls") and not cached.get("reference_image_urls"),
+    }
+
+
+def native_cached_source(message, event):
+    marker = getattr(message, "_gcp_native_cache", None)
+    if (not isinstance(marker, dict) or marker.get("umo") != event.unified_msg_origin
+            or marker.get("text_only") is not True):
+        return None
+    source = marker.get("source")
+    return source if (isinstance(source, str) and len(source) == 64
+                      and all(c in "0123456789abcdef" for c in source)) else None
+
+
+def native_text_qualification(event, history, *, image_urls=(), window_messages=()):
+    """Return a content-free reason; unresolved/rich quotes stay compatible."""
+    if image_urls or window_messages:
+        return "media_or_window"
+    seen = set()
+    for message in history:
+        mid = str(getattr(message, "message_id", ""))
+        if mid.startswith("official_") and mid[9:].isdigit():
+            continue
+        source = native_cached_source(message, event)
+        if not source or source in seen:
+            return "unbound_or_duplicate_cache"
+        seen.add(source)
+    stack = [(part, 0) for part in (event.get_messages() or [])]
+    count = 0
+    while stack:
+        part, depth = stack.pop()
+        count += 1
+        if depth > 4 or count > 128:
+            return "complex_quote"
+        kind = type(part).__name__
+        if kind in {"Plain", "At"}:
+            continue
+        if kind != "Reply":
+            return "unsupported_component"
+        chain = getattr(part, "chain", None)
+        if chain:
+            stack.extend((child, depth + 1) for child in chain)
+        elif not isinstance(getattr(part, "message_str", None), str) or not part.message_str.strip():
+            return "unresolved_quote"
+    return "enriched" if seen or any(type(p).__name__ == "Reply" for p in event.get_messages() or []) else "plain"
+
+
+def _history_receipts(context):
+    # Context outlives plugin generations. No text, persona, or durable DB data.
+    attr = "_gcp_native_history_receipts_v1"
+    state = getattr(context, attr, None)
+    if not isinstance(state, dict) or state.get("protocol") != "gcp.history-receipts.v1":
+        state = {"protocol": "gcp.history-receipts.v1", "rows": {}, "pins": {}, "conflicts": set()}
+        setattr(context, attr, state)
+    return state
+
+
+def pin_native_history_snapshot(context, recipe, event, history):
+    """Keep only identities used by live snapshots; no global invalidation."""
+    state = _history_receipts(context)
+    pins = state['pins']
+    for source in list(pins):
+        if not pins[source]:
+            pins.pop(source)
+    sources = {native_cached_source(message,event) for message in history
+               if hasattr(message,'_gcp_native_cache')}
+    if None in sources or len(set(pins) | sources) > 2048:
+        return False
+    for source in sources:
+        pins.setdefault(source,weakref.WeakSet()).add(recipe)
+    return True
+
+
+def native_history_row_id(context, source):
+    return _history_receipts(context)['rows'].get(source)
+
+
+def native_history_lock(context, umo):
+    locks = getattr(context, '_gcp_native_history_locks_v1', None)
+    if not isinstance(locks, dict):
+        locks = {}
+        setattr(context, '_gcp_native_history_locks_v1', locks)
+    return locks.setdefault(umo, asyncio.Lock())
+
+
+def publish_native_history_row(context, source, row_id):
+    if (not isinstance(source, str) or len(source) != 64
+            or type(row_id) is not int or row_id <= 0):
+        return
+    state = _history_receipts(context)
+    rows = state["rows"]
+    previous = rows.get(source)
+    if previous is not None and previous != row_id:
+        # Multiple rows for one identity are unsafe for exact overlay merging.
+        state['conflicts'].add(source)
+    rows[source] = row_id
+    while len(rows) > 2048:
+        discard = next((key for key in rows if not state['pins'].get(key)), None)
+        if discard is None:
+            # Pins are capped at 2048 when a snapshot is admitted.
+            raise ValueError('cache receipt pin bound violated')
+        rows.pop(discard)
+        state['conflicts'].discard(discard)
+
+
+def merge_native_cached_history(event, original, fresh, *, context, excluded_ids, cutoff, limit):
+    overlays, sources = [], set()
+    fresh_ids = {str(getattr(m, "message_id", "")) for m in fresh}
+    state = _history_receipts(context)
+    receipts = state["rows"]
+    for message in original:
+        if not hasattr(message, "_gcp_native_cache"):
+            continue
+        source = native_cached_source(message, event)
+        if not source or source in sources:
+            raise ValueError("cache source is ambiguous")
+        if source in state['conflicts']:
+            raise ValueError('cache receipt is ambiguous')
+        sources.add(source)
+        row_id = receipts.get(source)
+        if row_id in excluded_ids or "official_" + str(row_id) in fresh_ids:
+            continue
+        overlays.append(message)
+    merged = [m for m in [*fresh, *overlays] if (getattr(m, "timestamp", 0) or 0) >= cutoff]
+    return sorted(merged, key=lambda m: getattr(m, "timestamp", 0) or 0)[-limit:]
+
+
 @dataclass(frozen=True)
 class HistoryRefreshResult:
     status: str
@@ -107,7 +262,7 @@ No content-based deduplication is performed here.
     def capture(cls, event, *, history_messages, current_message, bot_id,
                 rendered_fragment, formatter, reset_token,
                 window_buffered_messages=None, include_timestamp=True,
-                include_sender_info=True):
+                include_sender_info=True, enriched=False):
         recipe = cls()
         recipe._event = event
         recipe._request = None
@@ -117,6 +272,7 @@ No content-based deduplication is performed here.
         recipe._capture_error = None
         recipe._refreshing = False
         recipe._finished = False
+        recipe.enriched = bool(enriched)
         try:
             recipe._inputs = copy.deepcopy({
                 "history_messages": history_messages,
@@ -138,6 +294,9 @@ No content-based deduplication is performed here.
     def _matches_event(self, event):
         return (event is self._event
                 and getattr(event, "unified_msg_origin", None) == self._umo)
+
+    def owns_event(self, event):
+        return not self._capture_error and self._matches_event(event)
 
     def bind(self, event, req) -> bool:
         if self._capture_error or req is None or not self._matches_event(event):

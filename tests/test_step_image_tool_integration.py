@@ -279,6 +279,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
         plugin = SimpleNamespace(
             context=object(),
             enable_group_chat=enable_group_chat,
+            _native_capture_guard=SimpleNamespace(supported=True,close=lambda:None),
             proactive_enabled=proactive_enabled,
             step_image_config={"image_tool_backend": "codex_oauth"},
             _group_image_tool_timeout_override_handle=None,
@@ -889,6 +890,7 @@ class StepImageToolIntegrationTest(unittest.TestCase):
             context=object(),
             enable_group_chat=True,
             proactive_enabled=True,
+            _native_capture_guard=SimpleNamespace(supported=True,close=lambda:None),
             step_image_config={"image_tool_backend": "codex_oauth"},
             _group_image_tool_timeout_override_handle=None,
             _image_planner_context_handle=None,

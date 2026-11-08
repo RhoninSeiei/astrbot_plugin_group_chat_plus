@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
+import importlib.util, sys
+_spec=importlib.util.spec_from_file_location('claim_native_queue',ROOT/'utils/native_queue.py')
+_queue=importlib.util.module_from_spec(_spec);sys.modules[_spec.name]=_queue;_spec.loader.exec_module(_queue)
 
 def method(name, namespace):
     tree=ast.parse((ROOT/'main.py').read_text(encoding='utf-8'))
@@ -23,7 +26,10 @@ def method(name, namespace):
         node=ast.AsyncFunctionDef(name=name,args=ast.arguments(posonlyargs=[],args=[ast.arg(arg=x) for x in ['self','event','chat_id','message_id']],kwonlyargs=[],kw_defaults=[],defaults=[]),body=body+[ast.Return(value=ast.Constant(True))],decorator_list=[])
     if node is None:raise AssertionError(name)
     node.decorator_list=[]
-    ns={'AstrMessageEvent':object,'asyncio':asyncio,'time':time,'flow':None,'logger':SimpleNamespace(info=lambda *a,**k:None,warning=lambda *a,**k:None,error=lambda *a,**k:None),**namespace}
+    ns={'AstrMessageEvent':object,'asyncio':asyncio,'time':time,'flow':None,
+        'merge_native_cached_history':_queue.merge_native_cached_history,
+        'native_history_lock':_queue.native_history_lock,
+        'logger':SimpleNamespace(info=lambda *a,**k:None,warning=lambda *a,**k:None,error=lambda *a,**k:None),**namespace}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'main.py','exec'),ns)
     return ns[name]
 

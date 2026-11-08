@@ -81,6 +81,7 @@ utilities = types.ModuleType(PACKAGE + ".utils")
 utilities.__path__ = [str(ROOT / "utils")]
 sys.modules[utilities.__name__] = utilities
 queue = load(PACKAGE + ".utils.native_queue", "utils/native_queue.py")
+capture_guard = load(PACKAGE + '.utils.native_capture_guard', 'utils/native_capture_guard.py')
 lifecycle = load(PACKAGE + ".utils.request_lifecycle", "utils/request_lifecycle.py")
 flow_module = load(PACKAGE + ".utils.flow_control", "utils/flow_control.py")
 context_module = load(PACKAGE + ".utils.context_manager", "utils/context_manager.py")
@@ -89,6 +90,8 @@ processor = load(PACKAGE + ".utils.message_processor", "utils/message_processor.
 rewriter = load(PACKAGE + ".utils.system_prompt_rewriter", "utils/system_prompt_rewriter.py")
 compat = load(PACKAGE + ".utils.request_compatibility", "utils/request_compatibility.py")
 policy = load(PACKAGE + ".utils.tool_policy", "utils/tool_policy.py")
+image_handler = load(PACKAGE + '.utils.image_handler', 'utils/image_handler.py')
+cache_manager = load(PACKAGE + '.utils.message_cache_manager', 'utils/message_cache_manager.py')
 
 # Import only literal real constants; importing reply_handler would broaden the
 # harness into unrelated provider/tool integration. No tested method is edited.
@@ -107,6 +110,7 @@ sys.modules[reply.__name__] = reply
 
 def extract_class(name, namespace):
     names = {"on_group_message", "_claim_processing_slot", "_can_delegate_native_queue",
+             "_prepare_native_queue_recipe", "_owns_enriched_native_request",
              "_read_native_committed_history",
              "_request_callback_owner", "on_llm_request", "_on_llm_request_impl",
              "on_llm_response", "after_message_sent", "terminate",
@@ -208,19 +212,9 @@ class HistorySink:
 
 
 def native_recipe_block(plugin, event, *, images=None, windows=None, history=None):
-    """Execute actual rich-payload exclusion gate from ChatPlus preparation."""
-    block = next(n for n in ast.walk(CHATPLUS) if isinstance(n, ast.If)
-                 and "getattr(self, '_native_queue_capability'" in ast.unparse(n.test)
-                 and any(isinstance(c, ast.Call) and ast.unparse(c.func) == "RequestHistoryRecipe.capture"
-                         for c in ast.walk(n)))
-    fragment = "fixture-fragment"
-    namespace = {"self": plugin, "event": event, "image_urls": images or [],
-                 "window_buffered_msgs": windows or [], "history_messages": history or [],
-                 "message_text_for_ai": event.message_str, "bot_id": event.get_self_id(),
-                 "formatted_context": fragment, "chat_id": event.get_group_id(),
-                 "RequestHistoryRecipe": queue.RequestHistoryRecipe, "ContextManager": plugin.sink}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(block)], type_ignores=[])),
-                 str(ROOT / "main.py"), "exec"), namespace)
+    """Execute the actual production qualification and snapshot method."""
+    plugin._prepare_native_queue_recipe(event, history or [], event.message_str,
+        event.get_self_id(), 'fixture-fragment', images or [], windows or [])
     return event.get_extra("_gcp_native_history_recipe")
 
 
@@ -244,6 +238,7 @@ class Harness:
         self.native_hooks = MainAgentHooks()
         self.core_saves = []
         self.save_entered, self.save_release = {}, {}
+        self.prepared = {}
         self.stage = internal.InternalAgentSubStage()
         self.stage.streaming_response = False
         self.stage.show_reasoning = False
@@ -271,6 +266,11 @@ class Harness:
                      "LEASE_KEY": lease_module.LEASE_KEY,
                      "resolve_request_owner": lease_module.resolve_request_owner,
                      "can_delegate_native": queue.can_delegate_native,
+                     'RequestHistoryRecipe': queue.RequestHistoryRecipe,
+                     'native_text_qualification': queue.native_text_qualification,
+                     'pin_native_history_snapshot': queue.pin_native_history_snapshot,
+                     'native_history_lock': queue.native_history_lock,
+                     'merge_native_cached_history': queue.merge_native_cached_history,
                      "ContextManager": self.sink, "MessageCleaner": cleaner.MessageCleaner,
                      "MessageProcessor": processor.MessageProcessor,
                      "SystemPromptRewriter": rewriter.SystemPromptRewriter,
@@ -288,6 +288,9 @@ class Harness:
         p.runtime_state = NS(generation=generation)
         p.request_lifecycle = lease_module.RequestLifecycle(p, p.runtime_state)
         p.request_lifecycle.attach(self.context)
+        p._native_capture_guard = capture_guard.install_native_capture_guard(
+            authorize=p._owns_enriched_native_request, stage_module=internal)
+        assert p._native_capture_guard.supported
         p.flow_control = flow_module.FlowController(p.config, self.metrics.append, part_factory=TextPart)
         p._termination_lock = asyncio.Lock()
         p._termination_complete = False
@@ -343,15 +346,36 @@ class Harness:
             history = [self.sink._official_history_to_message(record, event.get_platform_name(), False,
                         event.get_group_id(), event.get_self_id())
                        for record in records]
-            fragment = await self.sink.format_context_for_ai(history, event.message_str, event.get_self_id(),
+            current = ''.join(part.text if isinstance(part,Plain) else
+                image_handler.ImageHandler._format_special_component(part)
+                for part in event.get_messages())
+            # Use the real cache converter and official/cache merge path.
+            if getattr(event, 'cached_inputs', None):
+                manager = cache_manager.MessageCacheManager(cache_ttl_seconds=10000000000,
+                    include_timestamp=False, include_sender_info=True)
+                manager.pending_messages_cache[event.get_group_id()] = copy.deepcopy(event.cached_inputs)
+                # Run the production fallback-cache conversion block too; its
+                # provenance must survive the second cache-manager merge.
+                convert = next(n for n in ast.walk(CHATPLUS) if isinstance(n,ast.Try)
+                    and any(isinstance(c,ast.Call) and ast.unparse(c.func)=='bind_native_cached_message'
+                        for s in n.body for c in ast.walk(s)))
+                converted=[]
+                for cached in event.cached_inputs:
+                    ns=dict(vars(context_module),self=p,event=event,cached_msg=copy.deepcopy(cached),
+                        cached_astrbot_messages_for_fallback=converted,
+                        bind_native_cached_message=queue.bind_native_cached_message)
+                    exec(compile(ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(convert)],type_ignores=[])),str(ROOT/'main.py'),'exec'),ns)
+                with patch.object(context_module.ContextManager,'get_history_messages',lambda *a:[]):
+                    history=await context_module.ContextManager.get_history_messages_with_fallback(
+                        event, p.max_context_messages, self.context, converted)
+                history,_,_ = manager.merge_cache_to_history(event.get_group_id(),history,event,
+                    exclude_current=False,context=self.context)
+            fragment = await self.sink.format_context_for_ai(history, current, event.get_self_id(),
                                                            include_timestamp=False, include_sender_info=True)
-            recipe = queue.RequestHistoryRecipe.capture(event, history_messages=history,
-                current_message=event.message_str, bot_id=event.get_self_id(), rendered_fragment=fragment,
-                formatter=self.sink.format_context_for_ai, reset_token=0,
-                include_timestamp=False, include_sender_info=True)
-            event.set_extra("_gcp_native_history_recipe", recipe)
-            event.set_extra("_gcp_native_history_fragment", fragment)
-            event.set_extra("_gcp_native_history_candidate", True)
+            p._prepare_native_queue_recipe(event,history,current,event.get_self_id(),fragment)
+            self.prepared[event.key]={'qualification':event.get_extra('_gcp_native_qualification'),
+                'history_size':len(history),'fragment':fragment}
+            event.set_extra('_gcp_native_history_candidate',event.get_extra('_gcp_native_history_fragment')==fragment)
             sleep_calls = []
             async def forbidden_sleep(delay):
                 sleep_calls.append(delay)
@@ -462,6 +486,20 @@ async def settled():
     for _ in range(5): await asyncio.sleep(0)
 
 
+def enriched_event(key, *, sender=None, quote=True, cached=True):
+    parts=[]
+    if quote:
+        parts.append(Reply(id='quote-'+key,chain=[Plain('QUOTED_BODY_'+key)],
+            sender_id='quoted-user',sender_nickname='QuotedMember'))
+    parts.append(Plain('RAW_REQUEST_'+key))
+    event=Event(key,sender=sender,components=parts)
+    if cached:
+        event.cached_inputs=[{'message_id':'controlled_CACHE_'+key,'content':'CACHE_BODY_'+key,
+            'sender_id':'cached-user','sender_name':'CachedMember','timestamp':time.time()-100,
+            'message_timestamp':time.time()-100}]
+    return event
+
+
 def counts(harness, key):
     # Request IDs are generated; route per event is independently counted.
     return {"key": key, "provider_calls": sum(c["key"] == key for c in harness.provider_calls),
@@ -471,7 +509,7 @@ def counts(harness, key):
             "after_send_hooks": sum(row["key"] == key and row["hook"] == "after_message_sent" and row["owner"] is not None for row in harness.routes)}
 
 
-async def queue_cases(size):
+async def queue_cases(size, enriched=False):
     h = Harness()
     p = h.plugin("queue")
     h.install_registry(p)
@@ -479,7 +517,7 @@ async def queue_cases(size):
         await h.sink.insert("controlled", "queue-g1", [{"type": "text", "data": {"text": "SAME_TEXT_DISTINCT_ROW"}}],
                             "historical-user", "historical-user")
     keys = [f"QUEUE{size}_{i}" for i in range(size)]
-    events = [Event(key) for key in keys]
+    events = [enriched_event(key) if enriched else Event(key) for key in keys]
     h.release[keys[0]] = asyncio.Event()
     tasks = [asyncio.create_task(h.invoke(p, events[0]))]
     await h.wait_entered(keys[0])
@@ -508,23 +546,27 @@ async def queue_cases(size):
         for later in keys[index + 1:]:
             assert f"RAW_REQUEST_{later}" not in provider_text, provider_text
         assert provider_text.count("SAME_TEXT_DISTINCT_ROW") == 2, provider_text
+        if enriched:
+            for token in ['CACHE_BODY_'+key,'QUOTED_BODY_'+key,'QuotedMember','quoted-user']:
+                assert provider_text.count(token)==1,(key,token,provider_text)
+            assert h.prepared[key]['qualification']=='enriched'
     assert not p.processing_sessions and not p.request_lifecycle.active
     await h.cleanup()
-    return {"case": f"same_group_{size}", "max_formal_concurrency": h.maximum[SCOPE],
+    return {"case": f"same_group_{size}"+('_cache_quote' if enriched else ''), "max_formal_concurrency": h.maximum[SCOPE],
             "plugin_admission_sleeps": 0, "cross_group_completed_while_blocked": True,
             "future_pending_users_excluded": True, "same_text_distinct_rows_retained": 2,
             "requests": [counts(h, key) for key in keys], "provider_inputs": h.provider_calls}
 
 
-async def reload_case():
+async def reload_case(enriched=False):
     h = Harness()
     old, new, newest = [h.plugin(name) for name in ["generation1", "generation2", "generation3"]]
     h.install_registry(old)
-    event = Event("RELOAD_OLD")
+    event = enriched_event('RELOAD_OLD') if enriched else Event("RELOAD_OLD")
     h.release[event.key] = asyncio.Event()
     request = asyncio.create_task(h.invoke(old, event))
     await h.wait_entered(event.key)
-    queued = Event("RELOAD_QUEUED")
+    queued = enriched_event('RELOAD_QUEUED') if enriched else Event("RELOAD_QUEUED")
     queued_request = asyncio.create_task(h.invoke(old, queued))
     await settled()
     assert queued.key in h.claims and queued.key not in h.runners
@@ -580,9 +622,13 @@ async def reload_case():
     generation2_late = [r for r in h.routes if r["key"] == replacement.key and r["hook"] in {"on_llm_response", "after_message_sent"}]
     assert len(generation2_late) == 2 and all(r["registry"] == "generation3" and r["owner"] == "generation2" for r in generation2_late)
     assert all(counts(h, e.key)["official_saves"] == 1 for e in [event, queued, replacement, fresh])
+    if enriched:
+        for e in [event,queued]:
+            text=json.dumps(next(c for c in h.provider_calls if c['key']==e.key),ensure_ascii=False)
+            assert text.count('CACHE_BODY_'+e.key)==1 and text.count('QUOTED_BODY_'+e.key)==1,text
     assert not old.request_lifecycle.active and event.get_extra(lifecycle.LEASE_KEY) is None
     await h.cleanup()
-    return {"case": "reload_two_generations", "drain_blocked_while_active": True,
+    return {"case": "reload_two_generations"+('_cache_quote' if enriched else ''), "drain_blocked_while_active": True,
             "resources_closed_after_request_finally": True, "duplicate_snapshots_preserved": True,
             "expired_dedup_active_owner_preserved": True, "unrelated_task_hook_rejected": True,
             "queued_request_hook_routes_to_original_owner": True,
@@ -643,9 +689,10 @@ async def one_message_history_window_case():
             "provider_inputs": h.provider_calls}
 
 
-async def incoming_during_reload_case():
+async def incoming_during_reload_case(enriched=False):
     h = Harness(); old = h.plugin("intake_old"); h.install_registry(old)
     first, incoming = Event("INTAKE_ACTIVE"), Event("INTAKE_DURING_DRAIN")
+    if enriched: incoming=enriched_event('INTAKE_DURING_DRAIN')
     h.release[first.key] = asyncio.Event()
     a = asyncio.create_task(h.invoke(old, first)); await h.wait_entered(first.key)
     retiring = asyncio.create_task(old.terminate()); await settled()
@@ -671,15 +718,19 @@ async def incoming_during_reload_case():
     assert all(row["owner"] == "intake_successor" for row in incoming_routes)
     assert incoming.get_extra(lifecycle.LEASE_KEY) is None
     assert not old.request_lifecycle.active and not successor.request_lifecycle.active
+    if enriched:
+        text=json.dumps(next(c for c in h.provider_calls if c['key']==incoming.key),ensure_ascii=False)
+        assert text.count('CACHE_BODY_'+incoming.key)==1 and text.count('QUOTED_BODY_'+incoming.key)==1,text
     await h.cleanup()
-    return {"case": "incoming_during_reload_waits_for_ready_successor",
+    return {"case": "incoming_during_reload_waits_for_ready_successor"+('_cache_quote' if enriched else ''),
             "old_drain_does_not_wait_for_new_arrival": True, "unready_successor_not_called": True,
             "new_arrival_processed_once": True, "request": counts(h, incoming.key), "routes": h.routes}
 
 
-async def cancelled_reload_case():
+async def cancelled_reload_case(enriched=False):
     h = Harness(); old = h.plugin("cancel_reload"); h.install_registry(old)
     first, incoming = Event("CANCEL_RELOAD_ACTIVE"), Event("CANCEL_RELOAD_INCOMING")
+    if enriched: incoming=enriched_event('CANCEL_RELOAD_INCOMING')
     h.release[first.key] = asyncio.Event()
     a = asyncio.create_task(h.invoke(old, first)); await h.wait_entered(first.key)
     retiring = asyncio.create_task(old.terminate()); await settled()
@@ -706,7 +757,10 @@ async def cancelled_reload_case():
     assert all(row["owner"] == "cancel_reload" for row in h.routes)
     assert not old.flow_control.closed and not old.request_lifecycle.active
     await h.cleanup()
-    return {"case": "cancelled_reload_restores_original_owner_intake",
+    if enriched:
+        text=json.dumps(next(c for c in h.provider_calls if c['key']==incoming.key),ensure_ascii=False)
+        assert text.count('CACHE_BODY_'+incoming.key)==1 and text.count('QUOTED_BODY_'+incoming.key)==1,text
+    return {"case": "cancelled_reload_restores_original_owner_intake"+('_cache_quote' if enriched else ''),
             "active_request_not_cancelled": True, "resources_remain_open_until_later_termination": True,
             "waiting_input_resumed_without_successor": True, "original_owner_remains_usable": True,
             "requests": [counts(h, e.key) for e in [first, incoming, post_cancel]], "routes": h.routes}
@@ -778,6 +832,58 @@ async def follow_up_case():
             "outcomes": complete, "provider_inputs": h.provider_calls, "routes": h.routes}
 
 
+async def enriched_tool_wait_case():
+    h=Harness();p=h.plugin('enriched_tool');h.install_registry(p)
+    first=Event('ENRICHED_TOOL_MAIN',sender='same-controlled-user')
+    follow=enriched_event('ENRICHED_TOOL_FOLLOW',sender='same-controlled-user')
+    h.follow_tool.add(first.key);h.tool_release[first.key]=asyncio.Event()
+    a=asyncio.create_task(h.invoke(p,first));await h.wait_entered(first.key,tools=True)
+    b=asyncio.create_task(h.invoke(p,follow));await settled()
+    assert follow.key in h.claims and follow.key not in h.runners
+    assert not h.runners[first.key]._pending_follow_ups,'Enriched follow-up must retain full native request'
+    assert follow.get_message_str()=='RAW_REQUEST_'+follow.key
+    h.tool_release[first.key].set()
+    await asyncio.wait_for(asyncio.gather(a,b),15)
+    assert not follow.get_extra('_follow_up_captured')
+    text=json.dumps(next(c for c in h.provider_calls if c['key']==follow.key),ensure_ascii=False)
+    for token in ['QUOTED_BODY_'+follow.key,'quoted-user','QuotedMember','CACHE_BODY_'+follow.key]:
+        assert text.count(token)==1,(token,text)
+    for event in [first,follow]:
+        assert counts(h,event.key)['official_saves']==1 and counts(h,event.key)['terminal_hooks']==1
+    await h.cleanup()
+    return {'case':'tool_wait_cache_quote_keeps_full_native_request','raw_event_unchanged':True,
+        'lossy_capture_skipped':True,'provider_inputs':h.provider_calls,'routes':h.routes}
+
+
+async def cache_promotion_case():
+    h=Harness();p=h.plugin('cache_promotion');h.install_registry(p)
+    first=Event('CACHE_PROMOTION_MAIN')
+    second=enriched_event('CACHE_PROMOTION_QUEUED',quote=False)
+    h.release[first.key]=asyncio.Event()
+    a=asyncio.create_task(h.invoke(p,first));await h.wait_entered(first.key)
+    b=asyncio.create_task(h.invoke(p,second));await settled()
+    assert second.key in h.claims and second.key not in h.runners
+    # Actual cold-cache flush writes platform history and publishes the exact ID.
+    class Conversations:
+        async def get_curr_conversation_id(self,umo):return 'isolated'
+        async def get_conversation(self,**kwargs):return NS(history='[]')
+        async def update_conversation(self,**kwargs):return True
+    h.context.conversation_manager=Conversations()
+    async def save(*args):return True
+    with patch.object(context_module.ContextManager,'_is_custom_storage_enabled',lambda:False), \
+         patch.object(context_module.ContextManager,'_try_official_save',save):
+        assert await context_module.ContextManager.flush_cached_messages_by_params(
+            platform_name=second.get_platform_name(),platform_id=second.get_platform_id(),
+            is_private=False,chat_id=second.get_group_id(),self_id=second.get_self_id(),
+            unified_msg_origin=second.unified_msg_origin,cached_messages=second.cached_inputs,context=h.context)
+    h.release[first.key].set();await asyncio.wait_for(asyncio.gather(a,b),15)
+    text=json.dumps(next(c for c in h.provider_calls if c['key']==second.key),ensure_ascii=False)
+    assert text.count('CACHE_BODY_'+second.key)==1,text
+    assert text.count('SDK_REPLY_'+first.key)==1,text
+    await h.cleanup()
+    return {'case':'queued_cache_promoted_before_lock_exactly_once','provider_inputs':h.provider_calls}
+
+
 async def payload_case():
     h = Harness(); p = h.plugin("payload")
     rows = []
@@ -785,14 +891,16 @@ async def payload_case():
         ("plain", [Plain("plain")], [], [], []),
         ("image", [Image.fromURL("https://invalid.test/never-fetch")], ["https://invalid.test/never-fetch"], [], []),
         ("reply", [Reply(id="controlled-reference", chain=[Plain("quoted")])], [], [], []),
+        ('reply_image',[Reply(id='media-reference',chain=[Image.fromURL('https://invalid.test/no-fetch')])],[],[],[]),
+        ('reply_unresolved',[Reply(id='unresolved-reference')],[],[],[]),
         ("window", [Plain("plain")], [], [{"content": "pending window"}], []),
         ("custom_history", [Plain("plain")], [], [], [NS(message_id="custom_storage_1")]),
     ]:
         event = Event("PAYLOAD_" + name, components=parts)
         recipe = native_recipe_block(p, event, images=images, windows=windows, history=history)
-        assert bool(recipe) == (name == "plain"), name
+        assert bool(recipe) == (name in {"plain", "reply"}), name
         if recipe: event.set_extra("_gcp_native_history_candidate", True)
-        assert p._can_delegate_native_queue(event) == (name == "plain"), name
+        assert p._can_delegate_native_queue(event) == (name in {"plain", "reply"}), name
         rows.append({"payload": name, "delegates": bool(recipe)})
     # Run actual legacy branch to establish its original bounded fallback.
     event = Event("LEGACY_RICH")
@@ -813,6 +921,7 @@ async def run(output):
               "boundaries": ["scripted provider", "local SDK", "isolated HistorySink", "build_main_agent selection"],
               "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in [ROOT / "main.py", ROOT / "utils/native_queue.py", ROOT / "utils/request_lifecycle.py",
+                            ROOT / 'utils/native_capture_guard.py',ROOT/'utils/message_cache_manager.py',
                             ROOT / "utils/flow_control.py", ROOT / "utils/context_manager.py", Path(__file__)]},
               "core_source_sha256": {inspect.getsourcefile(cls): hashlib.sha256(Path(inspect.getsourcefile(cls)).read_bytes()).hexdigest()
                   for cls in [internal.InternalAgentSubStage, SessionLockManager, ToolLoopAgentRunner,
@@ -821,6 +930,7 @@ async def run(output):
     saved_handlers = list(star_handlers_registry)
     saved_stars = dict(star_map)
     original_lock = internal.session_lock_manager
+    original_capture = internal.try_capture_follow_up
     async def enabled(event): return True
     async def no_images(*a, **kw): pass
     async def no_metrics(*a, **kw): pass
@@ -838,10 +948,18 @@ async def run(output):
                 for case in [lambda: queue_cases(2), lambda: queue_cases(3), reload_case,
                              cancellation_case, incomplete_case, follow_up_case, payload_case,
                              missing_row_identity_case, one_message_history_window_case,
-                             incoming_during_reload_case, cancelled_reload_case]:
+                             incoming_during_reload_case, cancelled_reload_case,
+                             lambda:queue_cases(2,True),lambda:queue_cases(3,True),
+                             lambda:reload_case(True),lambda:incoming_during_reload_case(True),
+                             lambda:cancelled_reload_case(True),enriched_tool_wait_case,cache_promotion_case]:
                     name = getattr(case, "__name__", "queue_case")
                     print("RUN", name, flush=True)
                     row = await case()
+                    assert internal.try_capture_follow_up is original_capture,'Capture bridge leaked after cleanup'
+                    receipt_state=getattr(CURRENT[0].context,'_gcp_native_history_receipts_v1',{})
+                    assert not any(receipt_state.get('pins',{}).values()),'Completed snapshot remained pinned'
+                    row['capture_bridge_restored']=True
+                    row['cache_snapshot_pins_released']=True
                     report["cases"].append(row)
                     (output / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
                     print("PASS", row["case"], flush=True)

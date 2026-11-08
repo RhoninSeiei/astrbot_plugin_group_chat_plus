@@ -3,9 +3,9 @@ import unittest
 from types import SimpleNamespace as NS
 
 try:
-    from tests.test_native_processing_claim import method, Event
+    from tests.test_native_processing_claim import method, Event, _queue as queue
 except ModuleNotFoundError:
-    from test_native_processing_claim import method, Event
+    from test_native_processing_claim import method, Event, _queue as queue
 
 
 class HistoryEvent(Event):
@@ -61,5 +61,33 @@ class NativeHistoryReaderTests(unittest.IsolatedAsyncioTestCase):
         current=HistoryEvent('current');p,store,read=self.setup_reader(0,[],[current])
         self.assertEqual(await read(p,current,current.unified_msg_origin,[]),[])
         self.assertEqual(store.calls,[])
+
+    def cache(self,event,key='aiocqhttp_10',text='pending-cache'):
+        message=NS(message_id='cached_1',message_str=text,timestamp=1,sender=NS(user_id='u'))
+        queue.bind_native_cached_message(message,{'message_id':key,'sender_id':'u'},event)
+        return message
+
+    async def test_uncommitted_cache_is_preserved_with_new_reply(self):
+        current=self.pending('current',3)
+        p,store,read=self.setup_reader(20,[NS(id=2,text='prior-reply'),NS(id=3,text='current')],[current])
+        got=await read(p,current,current.unified_msg_origin,[self.cache(current)])
+        self.assertEqual([m.message_str for m in got],['pending-cache','prior-reply'])
+
+    async def test_exact_receipt_deduplicates_cache_without_dropping_distinct_text_ids(self):
+        current=self.pending('current',4)
+        p,store,read=self.setup_reader(20,[NS(id=2,text='committed-cache'),NS(id=3,text='same'),NS(id=4,text='current')],[current])
+        cache=self.cache(current)
+        queue.publish_native_history_row(p.context,queue.native_cached_source(cache,current),2)
+        got=await read(p,current,current.unified_msg_origin,[cache,self.cache(current,'aiocqhttp_11','same')])
+        self.assertEqual([m.message_str for m in got],['same','committed-cache','same'])
+
+    async def test_conflicting_exact_receipt_retains_recipe_fallback(self):
+        current=self.pending('current',3)
+        p,store,read=self.setup_reader(20,[NS(id=2,text='prior')],[current])
+        cached=self.cache(current);source=queue.native_cached_source(cached,current)
+        queue.publish_native_history_row(p.context,source,1)
+        queue.publish_native_history_row(p.context,source,2)
+        with self.assertRaisesRegex(ValueError,'ambiguous'):
+            await read(p,current,current.unified_msg_origin,[cached])
 
 if __name__=='__main__':unittest.main()

@@ -24,6 +24,8 @@ import re
 import time
 from datetime import datetime, timezone
 from ._session_guard import guard_session
+from .native_queue import (native_message_source, native_event_source, publish_native_history_row,
+    native_cached_source, native_history_row_id, native_history_lock)
 
 # 导入 MessageCleaner（延迟导入以避免循环依赖）
 from typing import TYPE_CHECKING
@@ -1095,7 +1097,18 @@ class ContextManager:
                 # 过滤掉已经在历史中的缓存消息
                 new_cached = []
                 skipped_count = 0
+                native_sources = set()
+                native_rows = {str(getattr(m, 'message_id', '')) for m in history}
                 for cached_msg in cached_messages:
+                    source = native_cached_source(cached_msg, event)
+                    if source:
+                        row_id = native_history_row_id(context, source) if context else None
+                        if source in native_sources or 'official_' + str(row_id) in native_rows:
+                            skipped_count += 1
+                        else:
+                            new_cached.append(cached_msg)
+                            native_sources.add(source)
+                        continue
                     is_duplicate = False
 
                     # 检查 message_id 是否重复
@@ -1888,6 +1901,7 @@ class ContextManager:
                             sender_id=event.get_sender_id(),
                             sender_name=event.get_sender_name() or "未知用户",
                         )
+                        publish_native_history_row(context, native_event_source(event), getattr(inserted_history, 'id', None))
                         # This exact row is written before yielding the native request.
                         # Keep its storage identity request-local so the lock-time
                         # refresh can exclude pending users without text deduplication.
@@ -2736,13 +2750,17 @@ class ContextManager:
                         msg_content = cached_msg.get("content", "")
                         if not msg_content:
                             continue
-                        await history_mgr.insert(
-                            platform_id=platform_id,
-                            user_id=chat_id,
-                            content=[{"type": "text", "data": {"text": msg_content}}],
-                            sender_id=cached_msg.get("sender_id", "unknown"),
-                            sender_name=cached_msg.get("sender_name", "未知用户"),
-                        )
+                        async with native_history_lock(context, unified_msg_origin):
+                            inserted_history = await history_mgr.insert(
+                                platform_id=platform_id,
+                                user_id=chat_id,
+                                content=[{"type": "text", "data": {"text": msg_content}}],
+                                sender_id=cached_msg.get("sender_id", "unknown"),
+                                sender_name=cached_msg.get("sender_name", "未知用户"),
+                            )
+                            source = native_message_source(platform_name, str(platform_id), unified_msg_origin,
+                                cached_msg.get('message_id'), cached_msg.get('sender_id'))
+                            publish_native_history_row(context, source, getattr(inserted_history, 'id', None))
                     except Exception as e:
                         logger.warning(f"[冷群转正] platform_message_history 写入失败: {e}")
 
